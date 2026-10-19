@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "forkreduce"
+version = "0.1.0"
+description = "Share one frozen prompt prefix across many LLM queries, MapReduce style, on Pydantic AI."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "forkreduce contributors" }]
+keywords = ["llm", "pydantic-ai", "mapreduce", "prompt-cache", "context"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic>=2.6",
+    "pydantic-ai>=2.57,<3",
+]
+
+[project.optional-dependencies]
+temporal = ["temporalio>=1.9"]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "temporalio>=1.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/426ai/forkreduce"
+Repository = "https://github.com/426ai/forkreduce"
+Issues = "https://github.com/426ai/forkreduce/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/forkreduce"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["src", "tests", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+packages = ["forkreduce"]
+warn_unused_ignores = true
+plugins = ["pydantic.mypy"]
