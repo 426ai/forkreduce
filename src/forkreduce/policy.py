@@ -121,6 +121,7 @@ class Policy:
     budget: Budget | None = None
     repair_failure: str = "needs_review"
     budget_policy: Callable[[BudgetReport], Action] | None = None
+    context_limit: int | None = None
 
     def __post_init__(self) -> None:
         if self.concurrency < 1:
@@ -131,6 +132,8 @@ class Policy:
             raise ValueError("backoff must be >= 0")
         if self.repair_failure not in {"needs_review", "drop", "fail"}:
             raise ValueError("repair_failure must be 'needs_review', 'drop', or 'fail'")
+        if self.context_limit is not None and self.context_limit < 0:
+            raise ValueError("context_limit must be >= 0")
 
 
 def action_name(action: Action) -> str:

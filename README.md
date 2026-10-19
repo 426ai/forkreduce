@@ -379,6 +379,7 @@ Policy(
     ),
     repair_failure="needs_review",
     budget_policy=None,        # callable(BudgetReport) -> Accept | Fail | ...
+    context_limit=None,        # per-call window in estimated tokens; None skips the local check
 )
 ```
 
@@ -388,7 +389,7 @@ Failure classes:
 | --- | --- | --- |
 | `validation` | Wrong tool, schema mismatch, `UnexpectedModelBehavior`, `UsageLimitExceeded` | Retried immediately, up to the bound. |
 | `transport` | HTTP 408, 409, 425, 429, and 5xx; timeouts; connection errors | Retried with exponential backoff. |
-| `permanent` | Other 4xx, `UserError`, anything unrecognized | Not retried. Returned on the result. |
+| `permanent` | Other 4xx, `UserError`, `context_overflow`, anything unrecognized | Not retried. Returned on the result. |
 | `budget` | A ceiling was already crossed | Not retried. |
 
 Each model call is built with pydantic-ai `retries=0` and `UsageLimits(request_limit=1)`. forkreduce owns the retry loop, so a validation error does not become a hidden inner retry. Failed calls are never removed from the run.
@@ -398,6 +399,19 @@ Each model call is built with pydantic-ai `retries=0` and `UsageLimits(request_l
 Token budgets are cumulative. When any token ceiling is set, model calls are serialized even if `concurrency` is greater than 1. A call is refused only when completed calls have already reached the ceiling. The one in-flight call that crosses a ceiling is allowed, because its size is known only after it returns, and nothing else starts until that usage is recorded. Overshoot is at most that one call, not one call per concurrent slot. Request-count budgets stay concurrent: each call reserves one request before it is sent. A call blocked before it is sent reports `attempts=0` and does not reserve a request.
 
 A response that fails validation is still billed. Its token usage is read from the captured model response and added to the budget and to `QueryResult.usage`. A transport failure that never produces a response has no tokens to recover; the reserved request still counts. `budget_policy` may return `Accept` to force a blocked call through, or `Fail` to block with your reason. The default blocks.
+
+### Context limit
+
+`Policy.context_limit` is the model context window in estimated tokens, separate from the cumulative budget above. The estimate is one token per four characters, rounded up, over the instructions, the tool schemas, the documents (or the continuation history), and the query tail. It is not the provider's tokenizer.
+
+When the estimate is above the limit, forkreduce stops before the model call:
+
+* at `build()`, the frozen prefix itself raises `ForkReduceError` with `code="context_overflow"`
+* at `ask` / `fork` / `map`, that query returns a `Failure` with the same code, `attempts=0`, and `detail["estimated_tokens"]` / `detail["limit"]`
+
+The message always states the size and the limit, for example `estimated 12000 tokens exceeds context limit 8000`. The prompt is not truncated, and it is not split into chunks. Chunked map-then-reduce is not part of v0.1; hard-fail stays the default.
+
+If `context_limit` is `None`, the local check is skipped. A provider that still rejects the prompt for context length (HTTP 400 whose body says the maximum context length was exceeded) is classified as the same non-retryable `context_overflow` failure. When the body includes the figures, the message reports those instead of the local estimate (`reported 9000 tokens exceeds context limit 8192`).
 
 `RunResult.usage` is a `UsageSummary`: request count, input and output tokens, cache-hit tokens, elapsed milliseconds, a per-round breakdown, and `cache_hit_rate` (`cache_hit_tokens / input_tokens`). Map calls and their repairs are folded onto the map `QueryResult` so tokens are counted once. Reduce calls are added from the individual calls, not from a second summed copy.
 
@@ -493,6 +507,7 @@ Not in this version, and reasonable later:
 * streaming partial results
 * explicit cache-warmup metrics separated from the first real query
 * a second workflow runtime behind the same `Executor` protocol
+* opt-in chunked map-then-reduce when a prompt is larger than the context window (hard-fail stays the default)
 
 ## Status and deviations
 

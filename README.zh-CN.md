@@ -379,6 +379,7 @@ Policy(
     ),
     repair_failure="needs_review",
     budget_policy=None,        # callable(BudgetReport) -> Accept | Fail | ...
+    context_limit=None,        # 单次调用的上下文窗口（估算 token）；None 表示不做本地检查
 )
 ```
 
@@ -388,7 +389,7 @@ Policy(
 | --- | --- | --- |
 | `validation` | 工具用错、schema 不符、`UnexpectedModelBehavior`、`UsageLimitExceeded` | 立即重试，直到上限。 |
 | `transport` | HTTP 408、409、425、429 和 5xx；超时；连接错误 | 指数退避后重试。 |
-| `permanent` | 其他 4xx、`UserError`、未识别的异常 | 不重试，挂在结果上返回。 |
+| `permanent` | 其他 4xx、`UserError`、`context_overflow`、未识别的异常 | 不重试，挂在结果上返回。 |
 | `budget` | 上限在这次调用之前已经用尽 | 不重试。 |
 
 每次模型调用都使用 pydantic-ai 的 `retries=0` 和 `UsageLimits(request_limit=1)`。重试循环由 forkreduce 掌握，校验错误不会变成一次看不见的内部重试。失败的调用不会从本次运行里消失。
@@ -398,6 +399,19 @@ Policy(
 token 预算按 session 累计。只要设置了任何 token 上限，模型调用就会串行，即使 `concurrency` 大于 1。只有已经完成的调用把上限用尽时，下一次才会被拒绝。正在飞的那一次如果跨过上限，会被放行，因为大小要等它返回才知道，而且在把这次用量记下来之前不会再开始别的调用。因此最多只超出这一次，而不是每个并发槽各超出一次。只限制请求次数时仍然并发：每次调用在发出之前占一个请求名额。在发出之前就被拦住的调用，`attempts` 为 0，也不占请求名额。
 
 校验失败的响应仍然会计费。token 用量从捕获到的模型响应里读出来，记入预算和 `QueryResult.usage`。传输失败如果根本没有响应，就没有 token 可记；已经占下的请求名额仍然算数。`budget_policy` 可以返回 `Accept` 强制放行，或返回 `Fail` 并带上你的原因。默认是拦住。
+
+### 上下文上限
+
+`Policy.context_limit` 是模型的上下文窗口，单位是估算 token，和上面按 session 累计的预算不是一回事。估算方法是每 4 个字符算 1 个 token，向上取整，计入说明、工具 schema、文档（或延续分支的历史）以及查询尾巴。这不是供应商自己的分词器。
+
+估算超过上限时，forkreduce 在调用模型之前就停：
+
+* 在 `build()`，冻结前缀本身会抛出 `ForkReduceError`，`code` 为 `"context_overflow"`
+* 在 `ask` / `fork` / `map`，该查询返回同名 `Failure`，`attempts` 为 0，`detail` 里有 `estimated_tokens` 和 `limit`
+
+消息里总会写明大小和上限，例如 `estimated 12000 tokens exceeds context limit 8000`。提示词不会被截断，也不会被拆成多块。按块 map 再 reduce 不是 v0.1 的行为；默认就是直接失败。
+
+`context_limit` 为 `None` 时跳过本地检查。如果供应商仍然因为上下文长度拒绝这次提示（HTTP 400，正文写明超过最大上下文），也会归成同一个不可重试的 `context_overflow`。正文里如果带了数字，消息用的是供应商报出的数字，而不是本地估算（`reported 9000 tokens exceeds context limit 8192`）。
 
 `RunResult.usage` 是 `UsageSummary`：请求数、输入和输出 token、缓存命中 token、耗时毫秒、按轮次的分解，以及 `cache_hit_rate`（`cache_hit_tokens / input_tokens`）。map 和它的修复会计在同一条 map `QueryResult` 上，避免算两次。归并按单次调用累加，不再把已经加总的结果加一遍。
 
@@ -493,6 +507,7 @@ v0.1.0 是第一次公开发布：一个 session、本地执行、引用检查�
 * 流式的部分结果
 * 把缓存预热从第一次真实查询里单独记一笔指标
 * 在同一个 `Executor` 协议后面接第二种工作流运行时
+* 可选的分块 map 再 reduce（提示词大于上下文窗口时）。默认仍然是直接失败
 
 ## 状态与相对设计稿的差异
 

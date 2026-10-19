@@ -8,6 +8,7 @@ bound, and permanent failures are returned to the caller.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -71,6 +72,9 @@ def classify_exception(exc: BaseException) -> Failure:
     """Map an exception from a model call onto a :class:`Failure`."""
     message = _short_message(exc)
     if isinstance(exc, ModelHTTPError):
+        overflow = _context_overflow_from_provider(exc)
+        if overflow is not None:
+            return overflow
         retryable = exc.status_code in _RETRYABLE_STATUS or exc.status_code >= 500
         kind = FailureKind.TRANSPORT if retryable else FailureKind.PERMANENT
         return Failure(
@@ -135,6 +139,38 @@ def wrong_output_failure(expected: str, actual: str) -> Failure:
     )
 
 
+def context_overflow_failure(
+    *,
+    estimated_tokens: int | None,
+    limit: int | None,
+    where: str,
+    reported_tokens: int | None = None,
+) -> Failure:
+    """Permanent failure when one prompt does not fit the context window.
+
+    The library does not truncate or split the prompt. ``where`` is ``prefix``
+    at build time and ``request`` for a single query.
+    """
+    size = reported_tokens if reported_tokens is not None else estimated_tokens
+    size_label = "reported" if reported_tokens is not None else "estimated"
+    size_text = "unknown" if size is None else str(size)
+    limit_text = "unknown" if limit is None else str(limit)
+    detail: dict[str, Any] = {"where": where}
+    if estimated_tokens is not None:
+        detail["estimated_tokens"] = estimated_tokens
+    if reported_tokens is not None:
+        detail["reported_tokens"] = reported_tokens
+    if limit is not None:
+        detail["limit"] = limit
+    return Failure(
+        kind=FailureKind.PERMANENT,
+        message=(f"context overflow: {size_label} {size_text} tokens exceeds context limit {limit_text} ({where})"),
+        retryable=False,
+        code="context_overflow",
+        detail=detail,
+    )
+
+
 def budget_failure(message: str) -> Failure:
     return Failure(
         kind=FailureKind.BUDGET,
@@ -142,6 +178,57 @@ def budget_failure(message: str) -> Failure:
         retryable=False,
         code="budget_exceeded",
     )
+
+
+_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "context_overflow",
+    "maximum context length",
+    "context window",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+    "exceeds the context",
+    "exceeds the model's maximum context",
+)
+
+
+def _context_overflow_from_provider(exc: ModelHTTPError) -> Failure | None:
+    text = _provider_error_text(exc)
+    if not any(marker in text.lower() for marker in _OVERFLOW_MARKERS):
+        return None
+    reported, reported_limit = _reported_context_sizes(text)
+    failure = context_overflow_failure(
+        estimated_tokens=None,
+        limit=reported_limit,
+        where="provider",
+        reported_tokens=reported,
+    )
+    failure.detail["status_code"] = exc.status_code
+    return failure
+
+
+def _provider_error_text(exc: ModelHTTPError) -> str:
+    body = exc.body
+    if isinstance(body, str):
+        rendered = body
+    elif body is None:
+        rendered = ""
+    else:
+        rendered = str(body)
+    return f"{exc} {rendered}"
+
+
+def _reported_context_sizes(text: str) -> tuple[int | None, int | None]:
+    """Pull ``(requested tokens, window)`` out of a provider error, when present."""
+    match = re.search(
+        r"maximum context length is (\d+).*?requested (\d+)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return None, None
+    return int(match.group(2)), int(match.group(1))
 
 
 def _short_message(exc: BaseException) -> str:

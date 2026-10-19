@@ -9,7 +9,17 @@ from __future__ import annotations
 
 
 class ForkReduceError(Exception):
-    """Base class for forkreduce caller errors."""
+    """Base class for forkreduce caller errors.
+
+    ``code`` is set for errors the caller may branch on. Context overflow uses
+    ``context_overflow``.
+    """
+
+    code: str
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class UnregisteredOutputError(ForkReduceError):

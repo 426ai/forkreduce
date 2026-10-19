@@ -15,6 +15,7 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage, UsageLimits
 
+from forkreduce.context import check_policy_context, estimate_tokens, prefix_text, request_text
 from forkreduce.documents import DocumentIndex, DocumentsInput, coerce_documents
 from forkreduce.errors import ForkReduceError, UnregisteredOutputError
 from forkreduce.executor import BudgetLedger, Executor, LocalExecutor, budget_action_failure
@@ -169,6 +170,13 @@ class Session:
         self.require_output(query.output)
         if not query.id:
             self.prepare_query(query)
+        overflow = check_policy_context(
+            self.policy,
+            estimated_tokens=self.estimate_tokens(query),
+            where="request",
+        )
+        if overflow is not None:
+            return self._empty_result(query, overflow, attempts=0)
         async with self._budget.token_turn():
             problem = await self._budget.try_reserve()
             if problem is not None:
@@ -238,6 +246,22 @@ class Session:
                 round=query.round,
                 elapsed_ms=elapsed,
             )
+
+    def estimate_tokens(self, query: Query[Any]) -> int:
+        """Estimated input tokens for one query, including the frozen prefix.
+
+        See :func:`forkreduce.context.estimate_tokens`. This does not call the model
+        and does not shorten the prompt.
+        """
+        return estimate_tokens(
+            request_text(
+                instructions=self.instructions,
+                rendered_documents=self.rendered_documents,
+                tool_specs=self.tool_specs,
+                tail=self.render_tail(query),
+                history=query.history,
+            )
+        )
 
     def starts_with_prefix(self, messages: Sequence[ModelMessage]) -> bool:
         """Whether a transcript still begins with this session's documents."""
@@ -357,6 +381,13 @@ def build(
         rendered_documents=index.rendered,
         tools=tool_specs,
     )
+    if chosen.context_limit is not None:
+        estimated = estimate_tokens(prefix_text(instructions, index.rendered, tool_specs))
+        if estimated > chosen.context_limit:
+            raise ForkReduceError(
+                f"context overflow: estimated {estimated} tokens exceeds context limit {chosen.context_limit} (prefix)",
+                code="context_overflow",
+            )
     return Session(
         model=model,
         instructions=instructions,

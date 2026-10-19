@@ -141,6 +141,36 @@ async def test_activity_stores_messages_and_rejects_unknown_sessions() -> None:
     assert caught.value.non_retryable is True
 
 
+def test_context_limit_changes_the_execution_fingerprint() -> None:
+    def handler(_messages, info, _n):  # type: ignore[no-untyped-def]
+        return tool_result(info, "Answer", {"text": "ok"})
+
+    model = Scripted(handler).model()
+    wide = build(
+        model,
+        documents="window-doc",
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0, context_limit=100_000),
+    )
+    narrow = build(
+        model,
+        documents="window-doc",
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0, context_limit=50_000),
+    )
+    assert wide.prefix_hash == narrow.prefix_hash
+    register_session(wide)
+    try:
+        with pytest.raises(ForkReduceError):
+            register_session(narrow)
+    finally:
+        unregister_session(wide.prefix_hash)
+
+
 def test_conflicting_registration_is_rejected() -> None:
     def handler(_messages, info, _n):  # type: ignore[no-untyped-def]
         return tool_result(info, "Answer", {"text": "ok"})
