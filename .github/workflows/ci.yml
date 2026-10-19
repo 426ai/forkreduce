@@ -28,4 +28,4 @@ jobs:
       - name: Tests
         env:
           PYDANTIC_AI_NO_BANNER: "1"
-        run: pytest
+        run: python -m pytest
