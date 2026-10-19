@@ -16,6 +16,7 @@ for tests and a bad idea for real histories.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Protocol
@@ -28,6 +29,7 @@ with workflow.unsafe.imports_passed_through():
     from pydantic import BaseModel
     from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 
+    from forkreduce.errors import ForkReduceError
     from forkreduce.failures import Failure
     from forkreduce.policy import Policy
     from forkreduce.query import Query
@@ -67,13 +69,66 @@ class InMemoryMessageStore:
 
 
 _SESSIONS: dict[str, Session] = {}
+_FINGERPRINTS: dict[str, str] = {}
 _STORE: MessageStore | None = None
 
 
+def execution_fingerprint(session: Session) -> str:
+    """Identity of how a session runs, beyond the frozen prompt prefix.
+
+    ``prefix_hash`` ignores the model and the retry/budget policy. Two sessions
+    can share a hash and still send calls to different places.
+    """
+    model = session.model
+    policy = session.policy
+    budget = policy.budget
+    payload = {
+        "model_type": type(model).__qualname__,
+        "model_name": getattr(model, "model_name", None),
+        "system": getattr(model, "system", None),
+        "output_mode": session.output_mode,
+        "warmup": session.warmup,
+        "concurrency": policy.concurrency,
+        "retries": policy.retries,
+        "retry_backoff": policy.retry_backoff,
+        "max_backoff": policy.max_backoff,
+        "repair_failure": policy.repair_failure,
+        "budget": None
+        if budget is None
+        else {
+            "max_requests": budget.max_requests,
+            "max_input_tokens": budget.max_input_tokens,
+            "max_output_tokens": budget.max_output_tokens,
+            "max_total_tokens": budget.max_total_tokens,
+        },
+    }
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
 def register_session(session: Session) -> str:
-    """Make ``session`` available to activities in this process. Returns its prefix hash."""
-    _SESSIONS[session.prefix_hash] = session
-    return session.prefix_hash
+    """Make ``session`` available to activities in this process. Returns its prefix hash.
+
+    A second registration with the same prefix and the same execution fingerprint
+    replaces the session. A different model or policy for that prefix raises
+    :class:`forkreduce.errors.ForkReduceError` instead of silently taking over.
+    """
+    key = session.prefix_hash
+    fingerprint = execution_fingerprint(session)
+    current = _FINGERPRINTS.get(key)
+    if current is not None and current != fingerprint:
+        raise ForkReduceError(
+            "A session with this prefix_hash is already registered with a different model or policy. "
+            "Call unregister_session before registering a different execution config."
+        )
+    _SESSIONS[key] = session
+    _FINGERPRINTS[key] = fingerprint
+    return key
+
+
+def unregister_session(prefix_hash: str) -> None:
+    """Drop a process-local registration. Unknown hashes are ignored."""
+    _SESSIONS.pop(prefix_hash, None)
+    _FINGERPRINTS.pop(prefix_hash, None)
 
 
 def set_message_store(store: MessageStore | None) -> None:
@@ -115,7 +170,13 @@ def temporal_retry_policy(policy: Policy) -> RetryPolicy:
 
 @dataclass
 class QueryActivityInput:
-    """Serializable query. The worker looks up the session by ``prefix_hash``."""
+    """Serializable query. The worker looks up the session by ``prefix_hash``.
+
+    ``max_attempts`` is ``Policy.retries + 1``. :class:`MapQueriesWorkflow` reads
+    it instead of assuming three attempts. ``history_json`` continues a branch
+    when no :class:`MessageStore` is configured; it is the previous activity's
+    ``messages_json``.
+    """
 
     prefix_hash: str
     query_id: str
@@ -123,7 +184,51 @@ class QueryActivityInput:
     output_name: str
     round: int = 0
     history_ref: str | None = None
+    history_json: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+    max_attempts: int = 1
+    retry_backoff_seconds: float = 0.0
+    max_backoff_seconds: float = 0.0
+
+
+def query_activity_input(
+    session: Session,
+    *,
+    query_id: str,
+    tail: str,
+    output_name: str,
+    round: int = 0,
+    history_ref: str | None = None,
+    history_json: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> QueryActivityInput:
+    """Build an activity payload that carries this session's retry policy."""
+    policy = session.policy
+    return QueryActivityInput(
+        prefix_hash=session.prefix_hash,
+        query_id=query_id,
+        tail=tail,
+        output_name=output_name,
+        round=round,
+        history_ref=history_ref,
+        history_json=history_json,
+        meta=dict(meta or {}),
+        max_attempts=policy.retries + 1,
+        retry_backoff_seconds=policy.retry_backoff,
+        max_backoff_seconds=policy.max_backoff,
+    )
+
+
+def activity_retry_policy(payload: QueryActivityInput) -> RetryPolicy:
+    """Retry policy for one activity, taken from its payload."""
+    initial = payload.retry_backoff_seconds if payload.retry_backoff_seconds > 0 else 0.001
+    maximum = payload.max_backoff_seconds if payload.max_backoff_seconds > 0 else initial
+    return RetryPolicy(
+        initial_interval=timedelta(seconds=initial),
+        backoff_coefficient=2.0,
+        maximum_interval=timedelta(seconds=maximum),
+        maximum_attempts=max(payload.max_attempts, 1),
+    )
 
 
 @dataclass
@@ -159,7 +264,16 @@ async def execute_query_activity(payload: QueryActivityInput) -> QueryActivityOu
             non_retryable=True,
         )
     history: list[ModelMessage] | None = None
-    if payload.history_ref is not None:
+    if payload.history_ref is not None and payload.history_json is not None:
+        raise ApplicationError(
+            "Set only one of history_ref and history_json",
+            "permanent",
+            type="permanent",
+            non_retryable=True,
+        )
+    if payload.history_json is not None:
+        history = list(ModelMessagesTypeAdapter.validate_json(payload.history_json))
+    elif payload.history_ref is not None:
         if _STORE is None:
             raise ApplicationError(
                 "history_ref was set but this worker has no message store",
@@ -227,7 +341,7 @@ class MapQueriesWorkflow:
                 payload,
                 start_to_close_timeout=timedelta(minutes=5),
                 activity_id=activity_id(payload.prefix_hash, payload.query_id),
-                retry_policy=RetryPolicy(maximum_attempts=3),
+                retry_policy=activity_retry_policy(payload),
             )
 
         return list(await asyncio.gather(*(one(payload) for payload in inputs)))

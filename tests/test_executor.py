@@ -202,6 +202,7 @@ async def test_budget_stops_later_calls_and_can_be_overridden() -> None:
     assert calls == 2
     assert sum(result.failure is None for result in results) == 2
     assert sum(result.failure is not None and result.failure.code == "budget_exceeded" for result in results) == 2
+    assert all(result.attempts == 0 for result in results if result.failure is not None)
 
     def allow(_report: BudgetReport):  # type: ignore[no-untyped-def]
         return Accept()
@@ -239,6 +240,7 @@ async def test_budget_stops_later_calls_and_can_be_overridden() -> None:
     blocked = await session.ask(Query(tail="x", output=Answer, id="z"))
     assert blocked.failure is not None
     assert blocked.failure.message.startswith("stop:")
+    assert blocked.attempts == 0
 
 
 @pytest.mark.asyncio
@@ -291,3 +293,66 @@ def forkreduce_summary(results):  # type: ignore[no-untyped-def]
     from forkreduce.stats import summarize
 
     return summarize(results)
+
+
+@pytest.mark.asyncio
+async def test_token_budget_serializes_in_flight_calls() -> None:
+    inflight = 0
+    peak = 0
+
+    async def handler(_messages, info, _n):  # type: ignore[no-untyped-def]
+        nonlocal inflight, peak
+        inflight += 1
+        peak = max(peak, inflight)
+        await asyncio.sleep(0.05)
+        inflight -= 1
+        return tool_result(info, "Answer", {"text": "ok"}, token_usage=usage(input_tokens=80, output_tokens=1))
+
+    session = build(
+        Scripted(handler).model(),
+        documents="doc",
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        policy=Policy(
+            concurrency=4,
+            retries=0,
+            retry_backoff=0,
+            budget=Budget(max_input_tokens=100),
+        ),
+    )
+    results = await session.fork([Query(tail=str(i), output=Answer, id=f"q{i}") for i in range(4)])
+    assert peak == 1
+    succeeded = [result for result in results if result.failure is None]
+    blocked = [result for result in results if result.failure is not None]
+    assert len(succeeded) == 2
+    assert sum(result.usage.input_tokens for result in succeeded) == 160
+    assert blocked
+    assert all(result.attempts == 0 for result in blocked)
+    assert all(result.failure is not None and result.failure.code == "budget_exceeded" for result in blocked)
+
+
+@pytest.mark.asyncio
+async def test_failed_validation_usage_is_billed() -> None:
+    def handler(_messages, info, n):  # type: ignore[no-untyped-def]
+        if n == 1:
+            return tool_result(info, "Answer", {"missing": True}, token_usage=usage(input_tokens=40, output_tokens=4))
+        return tool_result(info, "Answer", {"text": "ok"}, token_usage=usage(input_tokens=40, output_tokens=4))
+
+    session = build(
+        Scripted(handler).model(),
+        documents="doc",
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0, budget=Budget(max_input_tokens=40)),
+    )
+    failed = await session.ask(Query(tail="bad", output=Answer, id="bad"))
+    assert failed.failure is not None
+    assert failed.failure.kind == FailureKind.VALIDATION
+    assert failed.usage.input_tokens == 40
+    assert failed.usage.output_tokens == 4
+    blocked = await session.ask(Query(tail="later", output=Answer, id="later"))
+    assert blocked.attempts == 0
+    assert blocked.failure is not None
+    assert blocked.failure.code == "budget_exceeded"

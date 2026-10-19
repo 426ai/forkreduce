@@ -162,6 +162,7 @@ class Plan:
                 new_items.append(ReduceItem(id=result.query_id, value=result.output, round=round_index))
             report: ReduceReport | None = None
             reduce_calls: list[QueryResult[Any]] = []
+            reduce_failure: Failure | None = None
             if self._reduce_output is not None and (new_items or carried) and not stop:
                 outcome = await reduce_items(
                     self._session,
@@ -180,6 +181,7 @@ class Plan:
                 reduce_calls = list(outcome.calls)
                 if outcome.failure is not None:
                     all_failures.append(outcome.failure)
+                    reduce_failure = outcome.failure
                 if outcome.fatal:
                     fatal = True
                 carried = flatten_merged(merged, round_index=round_index)
@@ -192,7 +194,7 @@ class Plan:
                     outputs=[item.value for item in new_items],
                     merged=merged,
                     report=report,
-                    failures=list(round_failures),
+                    failures=[*round_failures, *([reduce_failure] if reduce_failure is not None else [])],
                     check_reports=check_reports,
                 )
             )

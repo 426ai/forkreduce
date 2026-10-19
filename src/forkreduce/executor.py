@@ -9,6 +9,8 @@ Temporal own the retry.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -38,6 +40,7 @@ class BudgetLedger:
     input_tokens: int = 0
     output_tokens: int = 0
     _lock: asyncio.Lock | None = None
+    _token_gate: asyncio.Lock | None = None
 
     def _lock_for(self) -> asyncio.Lock:
         if self._lock is None:
@@ -63,6 +66,34 @@ class BudgetLedger:
         async with self._lock_for():
             self.input_tokens += usage.input_tokens
             self.output_tokens += usage.output_tokens
+
+    def limits_tokens(self) -> bool:
+        """Whether a token ceiling requires calls to run one at a time."""
+        budget = self.policy.budget
+        if budget is None:
+            return False
+        return any(
+            value is not None for value in (budget.max_input_tokens, budget.max_output_tokens, budget.max_total_tokens)
+        )
+
+    @asynccontextmanager
+    async def token_turn(self) -> AsyncIterator[None]:
+        """Hold the token gate for one call when a token ceiling is set.
+
+        Request-only budgets do not take this gate, so they stay concurrent.
+        """
+        if not self.limits_tokens():
+            yield
+            return
+        async with self._lock_for():
+            if self._token_gate is None:
+                self._token_gate = asyncio.Lock()
+            gate = self._token_gate
+        await gate.acquire()
+        try:
+            yield
+        finally:
+            gate.release()
 
     def _problem(self) -> BudgetReport | None:
         budget = self.policy.budget
@@ -120,6 +151,9 @@ class LocalExecutor:
             cache += result.cache_hit_tokens
             elapsed += result.elapsed_ms
             last = result
+            # A budget rejection happens before any model call.
+            if result.attempts == 0:
+                return self._folded(result, usage, cache, elapsed, 0)
             if result.failure is None:
                 return self._folded(result, usage, cache, elapsed, attempts)
             if not result.failure.retryable or attempt >= self.policy.retries:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import subprocess
 import sys
@@ -10,19 +11,24 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 from temporalio.exceptions import ApplicationError
-from tests.support import Scripted, tool_result
+from tests.support import Scripted, tool_result, user_text
 
 from forkreduce import Query, build
 from forkreduce.contrib.temporal import (
     InMemoryMessageStore,
+    MapQueriesWorkflow,
     QueryActivityInput,
     activity_id,
+    activity_retry_policy,
     execute_query_activity,
+    query_activity_input,
     register_session,
     set_message_store,
     temporal_retry_policy,
     to_application_error,
+    unregister_session,
 )
+from forkreduce.errors import ForkReduceError
 from forkreduce.failures import Failure, FailureKind
 from forkreduce.policy import Policy
 
@@ -116,7 +122,7 @@ async def test_activity_stores_messages_and_rejects_unknown_sessions() -> None:
 
     denied_session = build(
         Scripted(denied).model(),
-        documents="doc",
+        documents="other-doc",
         instructions="rules",
         outputs=[Answer],
         warmup=False,
@@ -133,6 +139,117 @@ async def test_activity_stores_messages_and_rejects_unknown_sessions() -> None:
             )
         )
     assert caught.value.non_retryable is True
+
+
+def test_conflicting_registration_is_rejected() -> None:
+    def handler(_messages, info, _n):  # type: ignore[no-untyped-def]
+        return tool_result(info, "Answer", {"text": "ok"})
+
+    model = Scripted(handler).model()
+    first = build(
+        model,
+        documents="conflict-doc",
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0),
+    )
+    other = build(
+        model,
+        documents="conflict-doc",
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        policy=Policy(retries=4, retry_backoff=0),
+    )
+    register_session(first)
+    try:
+        register_session(first)
+        with pytest.raises(ForkReduceError):
+            register_session(other)
+    finally:
+        unregister_session(first.prefix_hash)
+
+
+def test_workflow_retry_policy_comes_from_the_session() -> None:
+    def handler(_messages, info, _n):  # type: ignore[no-untyped-def]
+        return tool_result(info, "Answer", {"text": "ok"})
+
+    quiet = build(
+        Scripted(handler).model(),
+        documents="retry-doc",
+        instructions="rules",
+        outputs=[Answer],
+        policy=Policy(retries=0, retry_backoff=0, max_backoff=0),
+    )
+    payload = query_activity_input(quiet, query_id="q", tail="t", output_name="Answer")
+    assert payload.max_attempts == 1
+    assert activity_retry_policy(payload).maximum_attempts == 1
+    wide = build(
+        Scripted(handler).model(),
+        documents="retry-doc-wide",
+        instructions="rules",
+        outputs=[Answer],
+        policy=Policy(retries=4, retry_backoff=0.5, max_backoff=3),
+    )
+    wide_payload = query_activity_input(wide, query_id="q", tail="t", output_name="Answer")
+    assert activity_retry_policy(wide_payload).maximum_attempts == 5
+    source = inspect.getsource(MapQueriesWorkflow.run)
+    assert "activity_retry_policy" in source
+    assert "maximum_attempts=3" not in source
+
+
+@pytest.mark.asyncio
+async def test_inline_history_can_continue_a_branch() -> None:
+    seen: list[str] = []
+
+    def handler(messages, info, _n):  # type: ignore[no-untyped-def]
+        seen.append(user_text(messages))
+        return tool_result(info, "Answer", {"text": "continued"})
+
+    session = build(
+        Scripted(handler).model(),
+        documents="inline-doc",
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0),
+    )
+    prefix = register_session(session)
+    set_message_store(None)
+    try:
+        first = await execute_query_activity(
+            QueryActivityInput(prefix_hash=prefix, query_id="q1", tail="hello", output_name="Answer")
+        )
+        assert first.messages_json is not None
+        assert first.messages_ref is None
+        second = await execute_query_activity(
+            QueryActivityInput(
+                prefix_hash=prefix,
+                query_id="q2",
+                tail="next",
+                output_name="Answer",
+                history_json=first.messages_json,
+            )
+        )
+        assert second.output_type == "Answer"
+        assert "hello" in seen[1]
+        assert "next" in seen[1]
+        with pytest.raises(ApplicationError) as caught:
+            await execute_query_activity(
+                QueryActivityInput(
+                    prefix_hash=prefix,
+                    query_id="q3",
+                    tail="x",
+                    output_name="Answer",
+                    history_ref="missing",
+                    history_json=first.messages_json,
+                )
+            )
+        assert caught.value.non_retryable is True
+    finally:
+        set_message_store(None)
+        unregister_session(prefix)
 
 
 def test_run_once_is_what_the_activity_uses_not_the_executor_loop() -> None:

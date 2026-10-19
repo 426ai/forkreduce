@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.usage import RequestUsage, RunUsage
 
 from forkreduce.query import QueryResult
@@ -67,5 +68,25 @@ def summarize(results: list[QueryResult[object]]) -> UsageSummary:
     return summary
 
 
-def add_usage(left: RunUsage, right: RunUsage) -> RunUsage:
+def add_usage(left: RunUsage, right: RunUsage | RequestUsage) -> RunUsage:
     return left + right
+
+
+def usage_from_messages(messages: list[ModelMessage]) -> RunUsage:
+    """Sum token usage recorded on captured model responses.
+
+    A validation failure raises before ``AgentRunResult.usage`` exists, but
+    pydantic-ai still stores the billed ``ModelResponse`` on the captured
+    transcript. Transport failures that never produce a response contribute
+    no tokens; the request slot is counted separately by the budget ledger.
+    """
+    usage = RunUsage()
+    responses = 0
+    for message in messages:
+        if not isinstance(message, ModelResponse):
+            continue
+        responses += 1
+        usage = add_usage(usage, message.usage)
+    if responses and usage.requests == 0:
+        usage.requests = responses
+    return usage

@@ -20,7 +20,7 @@ from forkreduce.coverage import (
 )
 from forkreduce.errors import ForkReduceError
 from forkreduce.failures import Failure, FailureKind
-from forkreduce.policy import Accept, Drop, Fail, RequireReason, Retry, action_name
+from forkreduce.policy import Accept, Fail, RequireReason, Retry, action_name
 from forkreduce.query import Query, QueryResult
 from forkreduce.schemas import DiscardExplanation, DiscardExplanations
 from forkreduce.session import Session
@@ -99,6 +99,9 @@ async def reduce_items(
     hint = ""
     merged: Any = None
     calls: list[QueryResult[Any]] = []
+    # Selective Retry keeps the previous merge and only re-asks for the named ids.
+    preserved_merge: Any = None
+    retry_ids: set[str] = set()
     report = ReduceReport(covered=[], uncovered=list(original_ids), invalid_refs=[])
 
     for attempt in range(max_rounds):
@@ -115,7 +118,7 @@ async def reduce_items(
             counter=counter,
             round_index=round_index,
         )
-        calls = level.calls
+        calls.extend(level.calls)
         if level.output is None:
             failure = level.failure or Failure(
                 kind=FailureKind.PERMANENT,
@@ -133,12 +136,14 @@ async def reduce_items(
                 action="Fail",
             )
         merged = rewrite_source_ids(level.output, alias)
+        if preserved_merge is not None:
+            merged = _preserve_covered(preserved_merge, merged, retry_ids)
         if round_index > 0:
             merged = annotate_round(merged, round_index)
         report = checker.evaluate(merged, original_ids)
         action = policy.decide(report)
         combined = _combine(calls)
-        if isinstance(action, (Accept, Drop)):
+        if isinstance(action, Accept):
             return ReduceOutcome(
                 output=merged,
                 report=report,
@@ -171,13 +176,14 @@ async def reduce_items(
             )
             calls = [*calls, *reason_calls]
             report.reasons = list(reasons)
+            incomplete = reason_failure is not None and reason_failure.code == "reasons_incomplete"
             return ReduceOutcome(
                 output=merged,
                 report=report,
                 result=_combine(calls),
                 calls=calls,
                 failure=reason_failure,
-                fatal=False,
+                fatal=incomplete,
                 reasons=reasons,
                 action="RequireReason",
             )
@@ -185,10 +191,18 @@ async def reduce_items(
             if attempt >= max_rounds - 1:
                 break
             hint = action.hint
+            preserved_merge = None
+            retry_ids = set()
             if action.items:
                 wanted = set(action.items)
                 filtered = [item for item in identified if item.id in wanted]
-                current = filtered or list(identified)
+                if filtered and _can_preserve(merged, wanted):
+                    preserved_merge = merged
+                    retry_ids = wanted
+                    current = filtered
+                else:
+                    # No list of traced rows to splice, so rerun every input.
+                    current = list(identified)
             else:
                 current = list(identified)
             continue
@@ -332,7 +346,9 @@ async def _reduce_tree(
             if level.output is None:
                 return _Level(output=None, calls=calls, failure=level.failure)
             nodes = iter_traced(level.output)
-            if not nodes:
+            # One parent per batch whenever the model did not already shrink the
+            # chunk. Otherwise a finding-per-input output recurses forever.
+            if not nodes or len(nodes) >= len(part):
                 new_id = counter.next("m")
                 alias[new_id] = [item.id for item in part]
                 flat.append(ReduceItem(id=new_id, value=level.output, round=round_index))
@@ -341,6 +357,20 @@ async def _reduce_tree(
                     new_id = counter.next("m")
                     alias[new_id] = list(node.source_ids)
                     flat.append(ReduceItem(id=new_id, value=node.value, round=round_index))
+        if len(flat) >= len(items):
+            return _Level(
+                output=None,
+                calls=calls,
+                failure=Failure(
+                    kind=FailureKind.PERMANENT,
+                    message=(
+                        f"tree reduce did not shrink ({len(items)} items in, {len(flat)} out); "
+                        "refusing to call the model again at the same size"
+                    ),
+                    retryable=False,
+                    code="reduce_did_not_shrink",
+                ),
+            )
         parent = await _reduce_tree(
             session,
             flat,
@@ -424,35 +454,107 @@ async def _ask_reasons(
                 code="reasons_unavailable",
             ),
         )
-    query: Query[DiscardExplanations] = Query(
-        tail=_render_reason_tail(item_ids),
-        output=DiscardExplanations,
-        id=f"reasons-r{round_index}-{counter.next('c')}",
-        history=list(merged_result.messages),
-        round=round_index,
-    )
-    try:
-        result = await session.ask(query)
-    except ForkReduceError as exc:
-        return (
-            [],
-            [],
-            Failure(
-                kind=FailureKind.PERMANENT,
-                message=str(exc),
+    requested = tuple(dict.fromkeys(item_ids))
+    calls: list[QueryResult[Any]] = []
+    correction = ""
+    attempts = session.policy.retries + 1
+    for attempt in range(attempts):
+        query: Query[DiscardExplanations] = Query(
+            tail=_render_reason_tail(requested) + correction,
+            output=DiscardExplanations,
+            id=f"reasons-r{round_index}-{counter.next('c')}",
+            history=list(merged_result.messages),
+            round=round_index,
+        )
+        try:
+            result = await session.ask(query)
+        except ForkReduceError as exc:
+            return (
+                [],
+                calls,
+                Failure(
+                    kind=FailureKind.PERMANENT,
+                    message=str(exc),
+                    retryable=False,
+                    code="unregistered_output",
+                ),
+            )
+        calls.append(result)
+        if result.failure is not None or not isinstance(result.output, DiscardExplanations):
+            failure = result.failure or Failure(
+                kind=FailureKind.VALIDATION,
+                message="discard-reason call did not return DiscardExplanations",
                 retryable=False,
-                code="unregistered_output",
-            ),
-        )
-    if result.failure is not None or not isinstance(result.output, DiscardExplanations):
-        failure = result.failure or Failure(
-            kind=FailureKind.VALIDATION,
-            message="discard-reason call did not return DiscardExplanations",
-            retryable=False,
-            code="reasons_failed",
-        )
-        return [], [result], failure
-    return list(result.output.explanations), [result], None
+                code="reasons_failed",
+            )
+            return [], calls, failure
+        problem = _explanation_problem(result.output.explanations, requested)
+        if problem is None:
+            return list(result.output.explanations), calls, None
+        if attempt >= attempts - 1:
+            return (
+                [],
+                calls,
+                Failure(
+                    kind=FailureKind.VALIDATION,
+                    message=problem,
+                    retryable=False,
+                    code="reasons_incomplete",
+                ),
+            )
+        correction = f"\n\nThe previous explanation was rejected: {problem}\nExplain every requested id exactly once."
+    return [], calls, None
+
+
+def _traced_list_field(value: Any) -> str | None:
+    """Name of the list field that holds traced rows, if there is one."""
+    if not isinstance(value, BaseModel):
+        return None
+    for name in type(value).model_fields:
+        child = getattr(value, name)
+        if isinstance(child, list) and any(iter_traced(item) for item in child):
+            return name
+    return None
+
+
+def _can_preserve(merged: Any, retry_ids: set[str]) -> bool:
+    """Whether ``merged`` has traced rows that can be kept while ``retry_ids`` are redone."""
+    if _traced_list_field(merged) is None:
+        return False
+    return any(not (set(node.source_ids) & retry_ids) for node in iter_traced(merged))
+
+
+def _preserve_covered(previous: Any, fresh: Any, retry_ids: set[str]) -> Any:
+    """Keep previous rows that do not cite ``retry_ids``, then append the new rows."""
+    field_name = _traced_list_field(previous)
+    if field_name is None or not isinstance(previous, BaseModel):
+        return fresh
+    kept = [node.value for node in iter_traced(previous) if not (set(node.source_ids) & retry_ids)]
+    added = [node.value for node in iter_traced(fresh)]
+    return previous.model_copy(update={field_name: [*kept, *added]})
+
+
+def _explanation_problem(explanations: Sequence[DiscardExplanation], requested: tuple[str, ...]) -> str | None:
+    """Return a reason to retry, or None when the explanations match ``requested`` exactly."""
+    if not requested:
+        return None
+    if not explanations:
+        return "DiscardExplanations was empty; explain every requested id."
+    seen: list[str] = []
+    for explanation in explanations:
+        item_id = explanation.item_id.strip()
+        reason = explanation.reason.strip()
+        if not item_id or not reason:
+            return "Every explanation needs a non-empty item_id and a non-empty reason."
+        if item_id not in requested:
+            return f"Unrelated id {item_id!r} is not one of the requested ids."
+        seen.append(item_id)
+    if len(seen) != len(set(seen)):
+        return "Duplicate explanations; explain each requested id once."
+    missing = [item_id for item_id in requested if item_id not in set(seen)]
+    if missing:
+        return "Missing explanations for: " + ", ".join(missing) + "."
+    return None
 
 
 def _render_reduce_tail(items: Sequence[ReduceItem], instructions: str, hint: str) -> str:

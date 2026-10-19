@@ -27,7 +27,7 @@ from forkreduce.prefix import (
     warn_if_prefix_mismatch,
 )
 from forkreduce.query import Query, QueryResult
-from forkreduce.stats import cache_hit_tokens
+from forkreduce.stats import cache_hit_tokens, usage_from_messages
 
 T = TypeVar("T")
 OutputMode = Literal["tools", "prompted"]
@@ -169,69 +169,75 @@ class Session:
         self.require_output(query.output)
         if not query.id:
             self.prepare_query(query)
-        problem = await self._budget.try_reserve()
-        if problem is not None:
-            allowed = budget_action_failure(problem, self.policy)
-            if allowed is not None:
-                return self._empty_result(query, allowed)
-            await self._budget.force_reserve()
-        started = time.perf_counter()
-        messages: list[ModelMessage] = self.history_for(query)
-        kwargs: dict[str, Any] = {}
-        if self.output_mode == "prompted":
-            kwargs["output_type"] = PromptedOutput(query.output, template=False)
-        try:
-            with capture_run_messages() as captured:
-                try:
-                    result = await self._agent.run(
-                        self.render_tail(query),
-                        message_history=messages,
-                        usage_limits=_REQUEST_LIMIT,
-                        **kwargs,
-                    )
-                except Exception as exc:
-                    elapsed = (time.perf_counter() - started) * 1000
-                    transcript = list(captured) or messages
-                    return self._empty_result(
-                        query,
-                        classify_exception(exc),
-                        messages=transcript,
-                        elapsed_ms=elapsed,
-                    )
-        except Exception as exc:
-            # capture_run_messages itself should not fail; treat it as permanent.
+        async with self._budget.token_turn():
+            problem = await self._budget.try_reserve()
+            if problem is not None:
+                allowed = budget_action_failure(problem, self.policy)
+                if allowed is not None:
+                    return self._empty_result(query, allowed, attempts=0)
+                await self._budget.force_reserve()
+            started = time.perf_counter()
+            messages: list[ModelMessage] = self.history_for(query)
+            kwargs: dict[str, Any] = {}
+            if self.output_mode == "prompted":
+                kwargs["output_type"] = PromptedOutput(query.output, template=False)
+            try:
+                with capture_run_messages() as captured:
+                    try:
+                        result = await self._agent.run(
+                            self.render_tail(query),
+                            message_history=messages,
+                            usage_limits=_REQUEST_LIMIT,
+                            **kwargs,
+                        )
+                    except Exception as exc:
+                        elapsed = (time.perf_counter() - started) * 1000
+                        transcript = list(captured) or messages
+                        # Validation failures still billed a response. Recover it
+                        # from the transcript; a transport error has none.
+                        billed = usage_from_messages(transcript)
+                        await self._budget.add_usage(billed)
+                        return self._empty_result(
+                            query,
+                            classify_exception(exc),
+                            messages=transcript,
+                            elapsed_ms=elapsed,
+                            usage=billed,
+                        )
+            except Exception as exc:
+                # capture_run_messages itself should not fail; treat it as permanent.
+                elapsed = (time.perf_counter() - started) * 1000
+                return self._empty_result(query, classify_exception(exc), elapsed_ms=elapsed)
             elapsed = (time.perf_counter() - started) * 1000
-            return self._empty_result(query, classify_exception(exc), elapsed_ms=elapsed)
-        elapsed = (time.perf_counter() - started) * 1000
-        await self._budget.add_usage(result.usage)
-        hits = cache_hit_tokens(result.usage)
-        transcript = list(result.all_messages())
-        output = result.output
-        if not isinstance(output, query.output):
+            await self._budget.add_usage(result.usage)
+            hits = cache_hit_tokens(result.usage)
+            transcript = list(result.all_messages())
+            output = result.output
+            if not isinstance(output, query.output):
+                return QueryResult(
+                    query_id=query.id or "",
+                    output=None,
+                    messages=transcript,
+                    prefix_hash=self.prefix_hash,
+                    usage=result.usage,
+                    cache_hit_tokens=hits,
+                    attempts=1,
+                    failure=wrong_output_failure(query.output.__name__, type(output).__name__),
+                    round=query.round,
+                    elapsed_ms=elapsed,
+                )
             return QueryResult(
                 query_id=query.id or "",
-                output=None,
+                output=output,
                 messages=transcript,
                 prefix_hash=self.prefix_hash,
                 usage=result.usage,
                 cache_hit_tokens=hits,
                 attempts=1,
-                failure=wrong_output_failure(query.output.__name__, type(output).__name__),
+                failure=None,
                 round=query.round,
                 elapsed_ms=elapsed,
             )
-        return QueryResult(
-            query_id=query.id or "",
-            output=output,
-            messages=transcript,
-            prefix_hash=self.prefix_hash,
-            usage=result.usage,
-            cache_hit_tokens=hits,
-            attempts=1,
-            failure=None,
-            round=query.round,
-            elapsed_ms=elapsed,
-        )
 
     def starts_with_prefix(self, messages: Sequence[ModelMessage]) -> bool:
         """Whether a transcript still begins with this session's documents."""
@@ -283,15 +289,18 @@ class Session:
         *,
         messages: list[ModelMessage] | None = None,
         elapsed_ms: float = 0.0,
+        usage: RunUsage | None = None,
+        attempts: int = 1,
     ) -> QueryResult[Any]:
+        recorded = usage if usage is not None else RunUsage()
         return QueryResult(
             query_id=query.id or "",
             output=None,
             messages=messages if messages is not None else self.history_for(query),
             prefix_hash=self.prefix_hash,
-            usage=RunUsage(),
-            cache_hit_tokens=0,
-            attempts=1,
+            usage=recorded,
+            cache_hit_tokens=cache_hit_tokens(recorded),
+            attempts=attempts,
             failure=failure,
             round=query.round,
             elapsed_ms=elapsed_ms,

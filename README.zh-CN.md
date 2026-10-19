@@ -395,7 +395,9 @@ Policy(
 
 `warmup=True`（默认）会让第一批 `fork` / `map` 的第一个查询先跑完，再启动其余查询，好让供应商写下前缀。没有额外的空请求。同一 session 之后的 fork 完全并发。单独的 `ask` 不会预热。
 
-token 预算按 session 累计。跨过 token 上限的那一次调用会被放行，因为大小要等它返回才知道。再往后的调用会被拦住。`budget_policy` 可以返回 `Accept` 强制放行，或返回 `Fail` 并带上你的原因。默认是拦住。
+token 预算按 session 累计。只要设置了任何 token 上限，模型调用就会串行，即使 `concurrency` 大于 1。只有已经完成的调用把上限用尽时，下一次才会被拒绝。正在飞的那一次如果跨过上限，会被放行，因为大小要等它返回才知道，而且在把这次用量记下来之前不会再开始别的调用。因此最多只超出这一次，而不是每个并发槽各超出一次。只限制请求次数时仍然并发：每次调用在发出之前占一个请求名额。在发出之前就被拦住的调用，`attempts` 为 0，也不占请求名额。
+
+校验失败的响应仍然会计费。token 用量从捕获到的模型响应里读出来，记入预算和 `QueryResult.usage`。传输失败如果根本没有响应，就没有 token 可记；已经占下的请求名额仍然算数。`budget_policy` 可以返回 `Accept` 强制放行，或返回 `Fail` 并带上你的原因。默认是拦住。
 
 `RunResult.usage` 是 `UsageSummary`：请求数、输入和输出 token、缓存命中 token、耗时毫秒、按轮次的分解，以及 `cache_hit_rate`（`cache_hit_tokens / input_tokens`）。map 和它的修复会计在同一条 map `QueryResult` 上，避免算两次。归并按单次调用累加，不再把已经加总的结果加一遍。
 
@@ -431,7 +433,7 @@ OpenAI 客户端以 `max_retries=0` 构造。重试由 forkreduce 做。
 
 每个查询是一个 activity。activity 调用 `Session.run_once`（只尝试一次），然后抛出 `ApplicationError`。`non_retryable` 跟随 `Failure.retryable`：校验和传输失败可以重试；永久失败和预算用尽不可以。`temporal_retry_policy(policy)` 把 `maximum_attempts` 设为 `policy.retries + 1`。
 
-幂等键是 `forkreduce:{prefix_hash}:{query_id}`，由 `activity_id` 生成。工作流启动前，在 worker 里用 `register_session(session)` 登记建好的 session。工作流载荷带的是前缀哈希、尾巴和输出类型名，不是模型对象。
+幂等键是 `forkreduce:{prefix_hash}:{query_id}`，由 `activity_id` 生成。工作流启动前，在 worker 里用 `register_session(session)` 登记建好的 session。同一个前缀哈希如果换成另一个模型或另一套策略，会抛出 `ForkReduceError`；先调用 `unregister_session`。执行指纹相同则可以替换。工作流载荷带的是前缀哈希、尾巴、输出类型名和重试预算（`max_attempts`、退避），不是模型对象。`MapQueriesWorkflow` 使用这份预算。`query_activity_input(session, ...)` 把 `Policy.retries + 1` 抄进 `max_attempts`。没有消息存储时，把上一个 activity 的 `messages_json` 作为 `history_json` 传回去，就能延续分支。
 
 很长的对话记录不适合作为 activity 的返回值。用 `set_message_store` 接一个 `MessageStore`。有存储时，activity 返回 `messages_ref`，`messages_json` 为空。没有存储时，消息会内联返回，测试方便，真实历史不合适。`InMemoryMessageStore` 只活在当前进程里。
 

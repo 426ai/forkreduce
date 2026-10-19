@@ -99,26 +99,53 @@ def _coerce_many(documents: DocumentsInput) -> list[Document]:
     if isinstance(documents, Block):
         return [_blocks_document("doc", [documents])]
     if isinstance(documents, Sequence):
-        strings: list[str] = []
+        # A homogeneous sequence keeps the historical single-document shape.
+        # A mixed sequence keeps the caller's order: consecutive loose blocks
+        # or strings become one generated document at that position.
+        if documents and all(isinstance(item, str) for item in documents):
+            return [_string_document("doc", [item for item in documents if isinstance(item, str)])]
+        if documents and all(isinstance(item, Block) for item in documents):
+            return [_blocks_document("doc", [item for item in documents if isinstance(item, Block)])]
         docs: list[Document] = []
-        loose_blocks: list[Block] = []
+        pending_blocks: list[Block] = []
+        pending_strings: list[str] = []
+
+        def flush() -> None:
+            nonlocal pending_blocks, pending_strings
+            if pending_blocks:
+                docs.append(_blocks_document(_generated_doc_id(docs), pending_blocks))
+                pending_blocks = []
+            if pending_strings:
+                docs.append(_string_document(_generated_doc_id(docs), pending_strings))
+                pending_strings = []
+
         for item in documents:
             if isinstance(item, str):
-                strings.append(item)
-            elif isinstance(item, Document):
-                docs.append(_clean_document(item))
+                if pending_blocks:
+                    flush()
+                pending_strings.append(item)
             elif isinstance(item, Block):
-                loose_blocks.append(item)
+                if pending_strings:
+                    flush()
+                pending_blocks.append(item)
+            elif isinstance(item, Document):
+                flush()
+                docs.append(_clean_document(item))
             else:
                 raise ForkReduceError("documents must be a string, Block, Document, or a sequence of those")
-        if strings and not docs and not loose_blocks:
-            return [_string_document("doc", strings)]
-        if loose_blocks:
-            docs.append(_blocks_document("doc", loose_blocks))
-        if strings:
-            docs.append(_string_document("doc-text", strings))
+        flush()
         return docs
     raise ForkReduceError("documents must be a string, Block, Document, or a sequence of those")
+
+
+def _generated_doc_id(existing: list[Document]) -> str:
+    used = {doc.doc_id for doc in existing}
+    if "doc" not in used:
+        return "doc"
+    number = 2
+    while f"doc-{number}" in used:
+        number += 1
+    return f"doc-{number}"
 
 
 def _string_document(doc_id: str, parts: list[str]) -> Document:

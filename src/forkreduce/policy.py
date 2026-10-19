@@ -65,9 +65,16 @@ Action = Accept | RequireReason | Retry | Fail | Drop
 class Budget:
     """Hard ceilings checked before each model call.
 
-    Token ceilings are cumulative across the session. A call that would start
-    after the ceiling was already crossed is not sent. The call that crosses a
-    token ceiling is itself allowed, because its size is only known afterwards.
+    Token ceilings are cumulative across the session. When any token ceiling is
+    set, calls are serialized, even if ``Policy.concurrency`` is greater than
+    one. A call is refused only when completed calls have already reached the
+    ceiling. The single in-flight call that crosses a ceiling is allowed,
+    because its size is known only after it returns, and no other call starts
+    until that usage is recorded. Overshoot is therefore at most one call.
+
+    Request-count ceilings stay concurrent. Each call reserves one request
+    before it is sent, so in-flight calls count. A call blocked before it is
+    sent reports ``attempts=0`` and does not reserve a request.
     """
 
     max_requests: int | None = None

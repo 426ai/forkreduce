@@ -240,3 +240,16 @@ async def test_testmodel_can_drive_a_single_registered_output() -> None:
     assert result.output is not None
     assert result.output.text == "from-test"
     assert result.prefix_hash == session.prefix_hash
+
+
+def test_mixed_document_input_keeps_caller_order() -> None:
+    index = coerce_documents(
+        [
+            Block(block_id="a", text="alpha"),
+            Document(doc_id="mid", title="Middle", blocks=[Block(block_id="b", text="beta")]),
+            "tail",
+        ]
+    )
+    rendered = index.rendered
+    assert rendered.index("[block a]") < rendered.index("id=mid") < rendered.index("tail")
+    assert [doc.doc_id for doc in index.documents] == ["doc", "mid", "doc-2"]
