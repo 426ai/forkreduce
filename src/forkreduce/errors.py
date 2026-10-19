@@ -11,8 +11,9 @@ from __future__ import annotations
 class ForkReduceError(Exception):
     """Base class for forkreduce caller errors.
 
-    ``code`` is set for errors the caller may branch on. Context overflow uses
-    ``context_overflow``.
+    ``code`` is an optional machine-readable label. A provider context-length
+    error is a :class:`forkreduce.failures.Failure` with code ``context_overflow``,
+    not an exception from this class.
     """
 
     code: str

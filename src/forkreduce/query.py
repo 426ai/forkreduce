@@ -8,6 +8,7 @@ from typing import Any, Generic, TypeVar
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.usage import RunUsage
 
+from forkreduce.context import ContextWarning
 from forkreduce.failures import Failure
 
 T = TypeVar("T")
@@ -54,6 +55,10 @@ class QueryResult(Generic[T]):
 
     ``needs_review`` and ``dropped`` are set by check/repair policy. A dropped
     result stays on the run; it is only left out of reduce inputs.
+
+    ``context_warning`` is set when the local token estimate exceeds
+    ``Policy.context_limit``. The call was still sent. A provider rejection is
+    ``failure`` with code ``context_overflow``, not this field.
     """
 
     query_id: str
@@ -69,3 +74,4 @@ class QueryResult(Generic[T]):
     needs_review: bool = False
     dropped: bool = False
     check_failures: list[CheckFailure] = field(default_factory=list)
+    context_warning: ContextWarning | None = None

@@ -10,6 +10,7 @@ from typing import Any
 from pydantic_ai.usage import RunUsage
 
 from forkreduce.checks import Check, CheckReport, Repair
+from forkreduce.context import ContextWarning
 from forkreduce.coverage import ReduceReport
 from forkreduce.failures import Failure, FailureKind
 from forkreduce.followup import FollowupFn, RoundState
@@ -49,10 +50,22 @@ class RunResult:
     usage: UsageSummary
     failures: list[Failure]
     reports: list[Any]
+    context_warning: ContextWarning | None = None
 
     @property
     def cache_hit_rate(self) -> float:
         return self.usage.cache_hit_rate
+
+    @property
+    def context_warnings(self) -> list[ContextWarning]:
+        """Prefix warning from the session, then each query warning, in run order."""
+        found: list[ContextWarning] = []
+        if self.context_warning is not None:
+            found.append(self.context_warning)
+        for result in self.results:
+            if result.context_warning is not None:
+                found.append(result.context_warning)
+        return found
 
 
 class Plan:
@@ -227,6 +240,7 @@ class Plan:
             usage=summarize(all_results),
             failures=all_failures,
             reports=reports,
+            context_warning=self._session.context_warning,
         )
 
     async def _apply_checks(
@@ -276,6 +290,12 @@ class Plan:
                 messages = repaired.messages
                 problems = self._check(output, documents=self._session.documents)
             usage, cache, attempts, elapsed = _fold_usage(parts)
+            notice = result.context_warning
+            if notice is None:
+                for part in parts:
+                    if part.context_warning is not None:
+                        notice = part.context_warning
+                        break
             current = replace(
                 result,
                 output=output,
@@ -286,6 +306,7 @@ class Plan:
                 elapsed_ms=elapsed,
                 failure=None,
                 check_failures=list(problems),
+                context_warning=notice,
             )
             if not problems:
                 action = "repaired" if repair_rounds else "ok"

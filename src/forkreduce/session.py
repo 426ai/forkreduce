@@ -15,7 +15,15 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage, UsageLimits
 
-from forkreduce.context import check_policy_context, estimate_tokens, prefix_text, request_text
+from forkreduce.context import (
+    ContextWarning,
+    emit_context_warning,
+    estimate_tokens,
+    prefix_context_warning,
+    prefix_text,
+    request_context_warning,
+    request_text,
+)
 from forkreduce.documents import DocumentIndex, DocumentsInput, coerce_documents
 from forkreduce.errors import ForkReduceError, UnregisteredOutputError
 from forkreduce.executor import BudgetLedger, Executor, LocalExecutor, budget_action_failure
@@ -72,6 +80,7 @@ class Session:
         self._budget = BudgetLedger(policy)
         self._warmed = False
         self._ids = 0
+        self.context_warning: ContextWarning | None = None
         self._agent: Agent[None, Any] = _build_agent(
             model,
             instructions=instructions,
@@ -170,19 +179,15 @@ class Session:
         self.require_output(query.output)
         if not query.id:
             self.prepare_query(query)
-        overflow = check_policy_context(
-            self.policy,
-            estimated_tokens=self.estimate_tokens(query),
-            where="request",
-        )
-        if overflow is not None:
-            return self._empty_result(query, overflow, attempts=0)
+        notice = request_context_warning(self.policy, self.estimate_tokens(query))
+        if notice is not None:
+            emit_context_warning(notice, stacklevel=3)
         async with self._budget.token_turn():
             problem = await self._budget.try_reserve()
             if problem is not None:
                 allowed = budget_action_failure(problem, self.policy)
                 if allowed is not None:
-                    return self._empty_result(query, allowed, attempts=0)
+                    return self._empty_result(query, allowed, attempts=0, context_warning=notice)
                 await self._budget.force_reserve()
             started = time.perf_counter()
             messages: list[ModelMessage] = self.history_for(query)
@@ -211,11 +216,17 @@ class Session:
                             messages=transcript,
                             elapsed_ms=elapsed,
                             usage=billed,
+                            context_warning=notice,
                         )
             except Exception as exc:
                 # capture_run_messages itself should not fail; treat it as permanent.
                 elapsed = (time.perf_counter() - started) * 1000
-                return self._empty_result(query, classify_exception(exc), elapsed_ms=elapsed)
+                return self._empty_result(
+                    query,
+                    classify_exception(exc),
+                    elapsed_ms=elapsed,
+                    context_warning=notice,
+                )
             elapsed = (time.perf_counter() - started) * 1000
             await self._budget.add_usage(result.usage)
             hits = cache_hit_tokens(result.usage)
@@ -233,6 +244,7 @@ class Session:
                     failure=wrong_output_failure(query.output.__name__, type(output).__name__),
                     round=query.round,
                     elapsed_ms=elapsed,
+                    context_warning=notice,
                 )
             return QueryResult(
                 query_id=query.id or "",
@@ -245,13 +257,14 @@ class Session:
                 failure=None,
                 round=query.round,
                 elapsed_ms=elapsed,
+                context_warning=notice,
             )
 
     def estimate_tokens(self, query: Query[Any]) -> int:
         """Estimated input tokens for one query, including the frozen prefix.
 
-        See :func:`forkreduce.context.estimate_tokens`. This does not call the model
-        and does not shorten the prompt.
+        See :func:`forkreduce.context.estimate_tokens`. This does not call the model,
+        does not shorten the prompt, and does not decide whether the call is sent.
         """
         return estimate_tokens(
             request_text(
@@ -315,6 +328,7 @@ class Session:
         elapsed_ms: float = 0.0,
         usage: RunUsage | None = None,
         attempts: int = 1,
+        context_warning: ContextWarning | None = None,
     ) -> QueryResult[Any]:
         recorded = usage if usage is not None else RunUsage()
         return QueryResult(
@@ -328,6 +342,7 @@ class Session:
             failure=failure,
             round=query.round,
             elapsed_ms=elapsed_ms,
+            context_warning=context_warning,
         )
 
 
@@ -381,14 +396,7 @@ def build(
         rendered_documents=index.rendered,
         tools=tool_specs,
     )
-    if chosen.context_limit is not None:
-        estimated = estimate_tokens(prefix_text(instructions, index.rendered, tool_specs))
-        if estimated > chosen.context_limit:
-            raise ForkReduceError(
-                f"context overflow: estimated {estimated} tokens exceeds context limit {chosen.context_limit} (prefix)",
-                code="context_overflow",
-            )
-    return Session(
+    session = Session(
         model=model,
         instructions=instructions,
         documents=index,
@@ -400,6 +408,14 @@ def build(
         tool_specs=tool_specs,
         executor=executor,
     )
+    notice = prefix_context_warning(
+        chosen,
+        estimate_tokens(prefix_text(instructions, index.rendered, tool_specs)),
+    )
+    if notice is not None:
+        session.context_warning = notice
+        emit_context_warning(notice, stacklevel=3)
+    return session
 
 
 def _build_agent(

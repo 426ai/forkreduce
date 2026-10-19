@@ -379,7 +379,8 @@ Policy(
     ),
     repair_failure="needs_review",
     budget_policy=None,        # callable(BudgetReport) -> Accept | Fail | ...
-    context_limit=None,        # per-call window in estimated tokens; None skips the local check
+    context_limit=None,        # per-call window in estimated tokens; None skips the local warning
+    context_reserve=None,      # prefix headroom; None means min(limit, max(4096, limit // 4))
 )
 ```
 
@@ -389,7 +390,7 @@ Failure classes:
 | --- | --- | --- |
 | `validation` | Wrong tool, schema mismatch, `UnexpectedModelBehavior`, `UsageLimitExceeded` | Retried immediately, up to the bound. |
 | `transport` | HTTP 408, 409, 425, 429, and 5xx; timeouts; connection errors | Retried with exponential backoff. |
-| `permanent` | Other 4xx, `UserError`, `context_overflow`, anything unrecognized | Not retried. Returned on the result. |
+| `permanent` | Other 4xx, `UserError`, provider `context_overflow`, anything unrecognized | Not retried. Returned on the result. |
 | `budget` | A ceiling was already crossed | Not retried. |
 
 Each model call is built with pydantic-ai `retries=0` and `UsageLimits(request_limit=1)`. forkreduce owns the retry loop, so a validation error does not become a hidden inner retry. Failed calls are never removed from the run.
@@ -402,16 +403,18 @@ A response that fails validation is still billed. Its token usage is read from t
 
 ### Context limit
 
-`Policy.context_limit` is the model context window in estimated tokens, separate from the cumulative budget above. The estimate is one token per four characters, rounded up, over the instructions, the tool schemas, the documents (or the continuation history), and the query tail. It is not the provider's tokenizer.
+`Policy.context_limit` is the model context window in estimated tokens, separate from the cumulative budget above. The estimate is one token per four characters, rounded up, over the instructions, the tool schemas, the documents (or the continuation history), and the query tail. It is not the provider's tokenizer. The provider is the source of truth: a local estimate never blocks `build()`, `ask`, `fork`, or `map`, and the prompt is not truncated or split into chunks.
 
-When the estimate is above the limit, forkreduce stops before the model call:
+When a limit is set and the estimate is over the usable window, forkreduce emits `ContextEstimateWarning` (a `UserWarning`) and logs the same message on the `forkreduce.context` logger, then sends the request anyway.
 
-* at `build()`, the frozen prefix itself raises `ForkReduceError` with `code="context_overflow"`
-* at `ask` / `fork` / `map`, that query returns a `Failure` with the same code, `attempts=0`, and `detail["estimated_tokens"]` / `detail["limit"]`
+* At `build()`, the frozen prefix warns when `prefix_estimate > context_limit - reserve`. The warning is stored on `Session.context_warning`.
+* At `ask` / `fork` / `map`, a query warns when the full estimate (prefix or history, plus the tail) is greater than `context_limit`. The warning is stored on `QueryResult.context_warning` and listed on `RunResult.context_warnings`. The prefix warning is also copied onto `RunResult.context_warning`.
 
-The message always states the size and the limit, for example `estimated 12000 tokens exceeds context limit 8000`. The prompt is not truncated, and it is not split into chunks. Chunked map-then-reduce is not part of v0.1; hard-fail stays the default.
+Each warning records `estimated_tokens`, `limit`, and `reserve`. Equality is inside the window. `context_limit=None` skips the local warning even if `context_reserve` is set.
 
-If `context_limit` is `None`, the local check is skipped. A provider that still rejects the prompt for context length (HTTP 400 whose body says the maximum context length was exceeded) is classified as the same non-retryable `context_overflow` failure. When the body includes the figures, the message reports those instead of the local estimate (`reported 9000 tokens exceeds context limit 8192`).
+`context_reserve` is prefix headroom, in the same estimated tokens. `None` (the default) means `min(context_limit, max(4096, context_limit // 4))`. 4096 tokens leaves room for a real tail and a structured reply on an 8k–16k window (half of 8k, a quarter of 16k). On a larger window, a quarter of `context_limit` is the larger of the two, so a prefix that crowds out the per-query work still warns. The value is capped at `context_limit`, so a window smaller than 4096 treats the whole window as headroom and warns on any non-empty prefix estimate without going negative. Set an integer, including `0`, to replace the formula. `0` warns on the prefix only when the prefix itself exceeds the full window. The reserve is not subtracted again for a request warning, because that estimate already includes the tail; it is still recorded on the warning.
+
+A provider that rejects the prompt for context length (HTTP 400 whose body says the maximum context length was exceeded) is a non-retryable `Failure` with code `context_overflow` and `detail["where"] == "provider"`. When the body includes the figures, the message reports those (`reported 9000 tokens exceeds context limit 8192`). Chunked map-then-reduce is not part of v0.1.
 
 `RunResult.usage` is a `UsageSummary`: request count, input and output tokens, cache-hit tokens, elapsed milliseconds, a per-round breakdown, and `cache_hit_rate` (`cache_hit_tokens / input_tokens`). Map calls and their repairs are folded onto the map `QueryResult` so tokens are counted once. Reduce calls are added from the individual calls, not from a second summed copy.
 
@@ -507,7 +510,7 @@ Not in this version, and reasonable later:
 * streaming partial results
 * explicit cache-warmup metrics separated from the first real query
 * a second workflow runtime behind the same `Executor` protocol
-* opt-in chunked map-then-reduce when a prompt is larger than the context window (hard-fail stays the default)
+* opt-in chunked map-then-reduce when a prompt is larger than the context window (the local estimate only warns; a provider context-length error still fails the call)
 
 ## Status and deviations
 

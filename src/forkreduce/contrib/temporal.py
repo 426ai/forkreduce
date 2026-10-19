@@ -94,6 +94,7 @@ def execution_fingerprint(session: Session) -> str:
         "max_backoff": policy.max_backoff,
         "repair_failure": policy.repair_failure,
         "context_limit": policy.context_limit,
+        "context_reserve": policy.context_reserve,
         "budget": None
         if budget is None
         else {

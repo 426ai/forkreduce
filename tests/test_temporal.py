@@ -171,6 +171,36 @@ def test_context_limit_changes_the_execution_fingerprint() -> None:
         unregister_session(wide.prefix_hash)
 
 
+def test_context_reserve_changes_the_execution_fingerprint() -> None:
+    def handler(_messages, info, _n):  # type: ignore[no-untyped-def]
+        return tool_result(info, "Answer", {"text": "ok"})
+
+    model = Scripted(handler).model()
+    automatic = build(
+        model,
+        documents="reserve-doc",
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0, context_limit=100_000),
+    )
+    explicit = build(
+        model,
+        documents="reserve-doc",
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0, context_limit=100_000, context_reserve=0),
+    )
+    assert automatic.prefix_hash == explicit.prefix_hash
+    register_session(automatic)
+    try:
+        with pytest.raises(ForkReduceError):
+            register_session(explicit)
+    finally:
+        unregister_session(automatic.prefix_hash)
+
+
 def test_conflicting_registration_is_rejected() -> None:
     def handler(_messages, info, _n):  # type: ignore[no-untyped-def]
         return tool_result(info, "Answer", {"text": "ok"})

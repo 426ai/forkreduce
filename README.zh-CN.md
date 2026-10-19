@@ -379,7 +379,8 @@ Policy(
     ),
     repair_failure="needs_review",
     budget_policy=None,        # callable(BudgetReport) -> Accept | Fail | ...
-    context_limit=None,        # 单次调用的上下文窗口（估算 token）；None 表示不做本地检查
+    context_limit=None,        # 单次调用的上下文窗口（估算 token）；None 表示不做本地警告
+    context_reserve=None,      # 前缀预留；None 表示 min(limit, max(4096, limit // 4))
 )
 ```
 
@@ -389,7 +390,7 @@ Policy(
 | --- | --- | --- |
 | `validation` | 工具用错、schema 不符、`UnexpectedModelBehavior`、`UsageLimitExceeded` | 立即重试，直到上限。 |
 | `transport` | HTTP 408、409、425、429 和 5xx；超时；连接错误 | 指数退避后重试。 |
-| `permanent` | 其他 4xx、`UserError`、`context_overflow`、未识别的异常 | 不重试，挂在结果上返回。 |
+| `permanent` | 其他 4xx、`UserError`、供应商报出的 `context_overflow`、未识别的异常 | 不重试，挂在结果上返回。 |
 | `budget` | 上限在这次调用之前已经用尽 | 不重试。 |
 
 每次模型调用都使用 pydantic-ai 的 `retries=0` 和 `UsageLimits(request_limit=1)`。重试循环由 forkreduce 掌握，校验错误不会变成一次看不见的内部重试。失败的调用不会从本次运行里消失。
@@ -402,16 +403,18 @@ token 预算按 session 累计。只要设置了任何 token 上限，模型调�
 
 ### 上下文上限
 
-`Policy.context_limit` 是模型的上下文窗口，单位是估算 token，和上面按 session 累计的预算不是一回事。估算方法是每 4 个字符算 1 个 token，向上取整，计入说明、工具 schema、文档（或延续分支的历史）以及查询尾巴。这不是供应商自己的分词器。
+`Policy.context_limit` 是模型的上下文窗口，单位是估算 token，和上面按 session 累计的预算不是一回事。估算方法是每 4 个字符算 1 个 token，向上取整，计入说明、工具 schema、文档（或延续分支的历史）以及查询尾巴。这不是供应商自己的分词器。供应商的判断才算数：本地估算不会拦住 `build()`、`ask`、`fork` 或 `map`，提示词也不会被截断或拆块。
 
-估算超过上限时，forkreduce 在调用模型之前就停：
+设置了上限且估算超过可用窗口时，forkreduce 发出 `ContextEstimateWarning`（一种 `UserWarning`），并在 `forkreduce.context` 日志器上写同一条消息，然后照常发送请求。
 
-* 在 `build()`，冻结前缀本身会抛出 `ForkReduceError`，`code` 为 `"context_overflow"`
-* 在 `ask` / `fork` / `map`，该查询返回同名 `Failure`，`attempts` 为 0，`detail` 里有 `estimated_tokens` 和 `limit`
+* 在 `build()`，冻结前缀在 `prefix_estimate > context_limit - reserve` 时警告。警告记在 `Session.context_warning`。
+* 在 `ask` / `fork` / `map`，整次估算（前缀或历史，加上尾巴）大于 `context_limit` 时，该查询警告。警告记在 `QueryResult.context_warning`，并列入 `RunResult.context_warnings`。前缀警告也会抄到 `RunResult.context_warning`。
 
-消息里总会写明大小和上限，例如 `estimated 12000 tokens exceeds context limit 8000`。提示词不会被截断，也不会被拆成多块。按块 map 再 reduce 不是 v0.1 的行为；默认就是直接失败。
+每条警告都带 `estimated_tokens`、`limit` 和 `reserve`。等于上限算在窗口内。`context_limit` 为 `None` 时不做本地警告，即使设置了 `context_reserve`。
 
-`context_limit` 为 `None` 时跳过本地检查。如果供应商仍然因为上下文长度拒绝这次提示（HTTP 400，正文写明超过最大上下文），也会归成同一个不可重试的 `context_overflow`。正文里如果带了数字，消息用的是供应商报出的数字，而不是本地估算（`reported 9000 tokens exceeds context limit 8192`）。
+`context_reserve` 是留给前缀之外的余量，单位同样是估算 token。默认 `None` 表示 `min(context_limit, max(4096, context_limit // 4))`。4096 个 token 够 8k 到 16k 窗口上的一条真实尾巴和一份结构化回答（8k 的一半，16k 的四分之一）。窗口更大时，上限的四分之一是两者里更大的那个，前缀挤掉单次查询的空间时仍会警告。这个值不会超过 `context_limit`，所以小于 4096 的窗口把整个窗口都当成余量，任何非空前缀估算都会警告，而且不会变成负数。设成整数（包括 `0`）就替换这个公式。`0` 表示只有前缀本身超过整个窗口时才警告前缀。请求警告不再减一次 reserve，因为那次估算已经包含尾巴；reserve 仍会记在警告上。
+
+供应商因为上下文长度拒绝这次提示时（HTTP 400，正文写明超过最大上下文），才是不可重试的 `Failure`，`code` 为 `context_overflow`，`detail["where"]` 为 `"provider"`。正文里如果带了数字，消息用的是供应商报出的数字（`reported 9000 tokens exceeds context limit 8192`）。按块 map 再 reduce 不是 v0.1 的行为。
 
 `RunResult.usage` 是 `UsageSummary`：请求数、输入和输出 token、缓存命中 token、耗时毫秒、按轮次的分解，以及 `cache_hit_rate`（`cache_hit_tokens / input_tokens`）。map 和它的修复会计在同一条 map `QueryResult` 上，避免算两次。归并按单次调用累加，不再把已经加总的结果加一遍。
 
@@ -507,7 +510,7 @@ v0.1.0 是第一次公开发布：一个 session、本地执行、引用检查�
 * 流式的部分结果
 * 把缓存预热从第一次真实查询里单独记一笔指标
 * 在同一个 `Executor` 协议后面接第二种工作流运行时
-* 可选的分块 map 再 reduce（提示词大于上下文窗口时）。默认仍然是直接失败
+* 可选的分块 map 再 reduce（提示词大于上下文窗口时）。本地估算只警告；供应商报出上下文超长时，这次调用仍然失败
 
 ## 状态与相对设计稿的差异
 

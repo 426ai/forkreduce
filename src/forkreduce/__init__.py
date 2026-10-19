@@ -8,6 +8,7 @@ package imports a workflow engine; the optional Temporal adapter lives in
 from __future__ import annotations
 
 from forkreduce.checks import CheckReport, CitationCheck, CitationRepair
+from forkreduce.context import ContextEstimateWarning, ContextWarning
 from forkreduce.coverage import AcceptUncovered, Provenance, ReduceReport
 from forkreduce.documents import END_MARKER, Block, Document
 from forkreduce.errors import ForkReduceError, PrefixMismatchWarning, UnregisteredOutputError
@@ -35,6 +36,8 @@ __all__ = [
     "BudgetReport",
     "CheckFailure",
     "CheckReport",
+    "ContextEstimateWarning",
+    "ContextWarning",
     "CitationCheck",
     "CitationRepair",
     "DiscardExplanation",

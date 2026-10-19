@@ -146,10 +146,10 @@ def context_overflow_failure(
     where: str,
     reported_tokens: int | None = None,
 ) -> Failure:
-    """Permanent failure when one prompt does not fit the context window.
+    """Permanent failure when the provider reports that one prompt does not fit.
 
-    The library does not truncate or split the prompt. ``where`` is ``prefix``
-    at build time and ``request`` for a single query.
+    The local character estimate never produces this failure. ``where`` is
+    ``provider``. The library does not truncate or split the prompt.
     """
     size = reported_tokens if reported_tokens is not None else estimated_tokens
     size_label = "reported" if reported_tokens is not None else "estimated"
