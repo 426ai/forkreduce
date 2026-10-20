@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: |
+          ruff check src tests examples
+          ruff format --check src tests examples
+      - name: Type check
+        run: mypy
+      - name: Tests
+        env:
+          PYDANTIC_AI_NO_BANNER: "1"
+        run: python -m pytest
