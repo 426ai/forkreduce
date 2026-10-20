@@ -2,7 +2,7 @@
 
 forkreduce 是一个基于 [Pydantic AI](https://ai.pydantic.dev/) 的 Python 库，用来让很多次 LLM 查询共享同一份长上下文。
 
-![forkreduce 概览：工具、说明和文档组成稳定的共享前缀，供多个问题并行查询；结果经过检查、修复和过滤，再合并结果并保留来源。报告保留缺口与失败，可选的后续查询开启下一轮。供应商缓存不保证命中。](docs/assets/overview.zh-CN.svg)
+![forkreduce 概览：工具、说明和文档组成稳定的共享前缀，供多个问题并行查询；结果经过检查、修复和过滤，再合并结果并保留来源。报告保留缺口与失败，可选的后续查询开启下一轮。供应商缓存不保证命中。](https://github.com/426ai/forkreduce/raw/main/docs/assets/overview.zh-CN.svg)
 
 ## 安装
 
@@ -565,6 +565,21 @@ OPENAI_API_KEY=... OPENAI_MODEL=... OPENAI_BASE_URL=... python examples/run_live
 
 模型名也可以用环境变量 `FORKREDUCE_MODEL`。
 
+## 发布
+
+PyPI 由 git tag 触发。`.github/workflows/release.yml` 构建 sdist 和 wheel，检查后通过 [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) 上传。仓库里没有 PyPI token。发布者是 `426ai/forkreduce` 上名为 `pypi` 的环境，工作流文件是 `release.yml`。
+
+1. 把 `pyproject.toml` 的 `version` 和 `src/forkreduce/__init__.py` 的 `__version__` 改成同一个版本。
+2. 把这次改动提交到 `main`。
+3. 给这个提交打 tag 并推送：
+
+```bash
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+tag 是 `v` 加上版本号：`0.1.0` 对应 `v0.1.0`。两者不一致时工作流失败。也可以在 Actions 里手动运行 Release，但只能选一个已经存在的 `v*` tag。
+
 ## 路线图
 
 v0.1.0 是第一次公开发布：一个 session、本地执行、引用检查与修复、带覆盖动作的语义归并、补洞、用量统计，以及可选的 Temporal activity 封装。
@@ -580,4 +595,4 @@ v0.1.0 是第一次公开发布：一个 session、本地执行、引用检查�
 
 ## 许可证
 
-MIT。见 [LICENSE](LICENSE)。
+MIT。见 [LICENSE](https://github.com/426ai/forkreduce/blob/main/LICENSE)。

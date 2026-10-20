@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Share one frozen prompt prefix across many LLM queries, MapReduce style, on Pydantic AI."
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "forkreduce contributors" }]
 keywords = ["llm", "pydantic-ai", "mapreduce", "prompt-cache", "context"]
