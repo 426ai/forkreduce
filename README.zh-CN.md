@@ -2,123 +2,78 @@
 
 forkreduce 是一个基于 [Pydantic AI](https://ai.pydantic.dev/) 的 Python 库，用来让很多次 LLM 查询共享同一份长上下文。
 
-前缀只冻结一次：注册好的输出工具集、说明文字、文档。之后每个查询都是这段前缀上的短尾巴，这样供应商的前缀缓存才能命中。查询一起跑（map），检查可以在有限字段上修复，业务代码自己过滤，再由模型把留下来的结果合并（reduce），并且用 `source_ids` 标明出处。轮次之间可以挂 follow-up。被漏掉的条目、没通过的检查、预算用尽，都会留在报告上，不会悄悄丢掉。
+![forkreduce 概览：工具、说明和文档组成稳定的共享前缀，供多个问题并行查询；结果经过检查、修复和过滤，再合并结果并保留来源。报告保留缺口与失败，可选的后续查询开启下一轮。供应商缓存不保证命中。](docs/assets/overview.zh-CN.svg)
+
+## 安装
+
+需要 Python 3.11 或更高版本。
 
 ```bash
 pip install forkreduce
 ```
 
-需要 Python 3.11 或更高版本。Temporal 适配器是可选额外依赖，核心包不会导入它。
-
-```bash
-pip install "forkreduce[temporal]"
-```
-
-## 动机
-
-一份长文档配一个短问题，在问题很多的时候是很差的工作单位。每次都把文档再发一遍，输入 token 会重复计费，答案之间也没有统一的结构和出处。
-
-前缀缓存改变的是成本形状。能缓存稳定前缀的供应商，对已经见过的 token 会便宜很多，也更快。前提是前缀逐字节稳定：同一套工具、同一段说明、同一份文档，变化的只有尾巴。forkreduce 负责把这个前缀冻住，并给周围的 map/reduce 步骤一个落点。
-
-框架不理解业务。它不会认定“少了截止日期就是失败”，也不会自己丢掉一条引用检查失败的结果。它只报告事实，并执行你的策略返回的动作。
-
-## 概念
-
-| 部分 | 是什么 |
-| --- | --- |
-| **Session** | `build()` 得到。持有冻结前缀、输出类型、模型和执行策略。 |
-| **Prefix** | 说明 + 清洗后的文档 + 结束标记，以及（tools 模式下的）工具集。哈希用作缓存身份。 |
-| **Query** | 一条尾巴、期望的输出类型，以及可选的消息历史，用来延续一条分支。 |
-| **Map** | 同一 session 上的多个查询。第一批可以先预热缓存，再放开并发。 |
-| **Check / repair** | 检查只报告问题。修复可以延续同一条分支，代码只把允许的字段抄回去。 |
-| **Filter** | 你的谓词。没通过的输出留在本次运行里，但不进入 reduce。 |
-| **Reduce** | 在同一前缀上的一次或多次查询。条目带 `source_ids`。覆盖策略决定缺口怎么处理。 |
-| **Follow-up** | 轮次之间的钩子。内置的 `GapFill` 会问还缺什么，再变成下一轮 map。 |
-
-### 一轮的流程
-
-```mermaid
-flowchart TD
-    build["build()：冻结工具、说明、文档"] --> map["map：在前缀上分叉查询"]
-    map --> check["检查，然后有界修复"]
-    check --> filter["业务过滤"]
-    filter --> reduce["在同一前缀上做语义归并"]
-    reduce --> report["ReduceReport：已覆盖、未覆盖、非法引用"]
-    report --> policy{"CoveragePolicy.decide"}
-    policy -->|Accept| follow{"followup 钩子"}
-    policy -->|RequireReason| reason["延续归并分支，要求说明"]
-    policy -->|Retry| reduce
-    policy -->|Fail| stop["停止，报告保留"]
-    reason --> follow
-    follow -->|有新查询| map
-    follow -->|空列表或达到 max_rounds| done["RunResult"]
-```
-
-### 缓存前缀里有什么
-
-```mermaid
-flowchart LR
-    subgraph prefix["冻结前缀（参与哈希）"]
-        tools["输出工具集<br/>名称、描述、JSON schema"]
-        instructions["说明"]
-        docs["清洗后的文档"]
-        marker["===END_FIXED_DOCUMENTS==="]
-        tools --> instructions --> docs --> marker
-    end
-    tail["查询尾巴<br/>以及修复 / 归并 / 补洞文本"]
-    prefix --> tail
-    tail --> model["模型调用"]
-```
-
-`prompted` 模式下工具列表是空的。期望类型的 schema 追加在尾巴上，因此不属于前缀。
-
-### 工具集
-
-```mermaid
-flowchart TB
-    session["一个 Agent，一套工具，在 build() 时注册"]
-    session --> answer["Answer"]
-    session --> leads["LeadList"]
-    session --> findings["FindingList"]
-    session --> reasons["DiscardExplanations"]
-    q1["查询期望 Answer"] --> session
-    q2["归并期望 FindingList"] --> session
-    q3["RequireReason 期望 DiscardExplanations"] --> session
-```
-
-凡是之后会用到的输出类型，都要事先注册。如果策略可能要求解释，就把 `DiscardExplanations` 一并放进去。未注册的类型会在任何模型调用之前抛出 `UnregisteredOutputError`。tools 模式下，模型如果调用了另一个已注册工具，算校验失败，会重试。
-
-## 安装与开发
-
-```bash
-pip install forkreduce
-pip install "forkreduce[temporal]"   # 可选
-```
-
-从源码目录：
-
-```bash
-pip install -e ".[dev]"
-ruff check src tests examples && ruff format --check src tests examples
-mypy
-pytest
-```
-
-示例不需要密钥，完全离线：
-
-```bash
-python examples/run_offline.py
-```
-
-也可以对着 OpenAI 兼容接口跑。没设置 `OPENAI_API_KEY` 时进程会直接退出。
-
-```bash
-OPENAI_API_KEY=... OPENAI_MODEL=... OPENAI_BASE_URL=... python examples/run_live.py
-```
-
-模型名也可以用环境变量 `FORKREDUCE_MODEL`。
+Temporal 适配器是可选依赖：`pip install "forkreduce[temporal]"`。核心包不会导入它。
 
 ## 快速开始
+
+对同一份文档提两个问题（map），再把回答合并为保留来源的摘要（reduce）。这个示例会调用真实模型；请先配置 OpenAI 兼容接口的环境变量：
+
+```bash
+export OPENAI_API_KEY="your-api-key"
+export OPENAI_MODEL="your-model-name"
+# 使用自定义接口时可选：
+# export OPENAI_BASE_URL="https://your-provider.example/v1"
+```
+
+```python
+import asyncio
+from pydantic import BaseModel
+from forkreduce import Query, Traced, build, openai_compatible_model
+
+
+class Answer(BaseModel):
+    text: str
+
+
+class Summary(Traced):
+    text: str
+
+
+async def main() -> None:
+    session = build(
+        openai_compatible_model(),
+        documents="Eligible titles: Science Digest and River Almanac. Deadline: 30 April 2026.",
+        instructions="Answer only from the document.",
+        outputs=[Answer, Summary],
+    )
+    result = await (
+        session.map([
+            Query(id="titles", tail="Which titles are eligible?", output=Answer),
+            Query(id="deadline", tail="What is the deadline?", output=Answer),
+        ])
+        .reduce(output=Summary, instructions="Combine both answers into one concise summary.")
+        .run()
+    )
+    if result.merged is not None:
+        print(result.merged.text)
+    if result.failures:
+        print(result.failures)
+
+
+asyncio.run(main())
+```
+
+输出示例（具体措辞取决于模型）：
+
+```text
+Eligible titles are Science Digest and River Almanac; the deadline is 30 April 2026.
+```
+
+文档和说明只需在 `build()` 时提供；map 和 reduce 共享同一前缀，变化的只是查询尾部。两种输出类型都预先注册；`Summary` 继承 `Traced` 来保留输入来源，合并结果从 `result.merged` 读取。默认先完成第一个 map 查询预热，再并行执行其余查询。真实缓存命中取决于供应商。如需无密钥、离线运行，可看下面的 `TestModel` 示例。
+
+## 完整流程示例
+
+在查询后加上引用检查、有界修复、业务过滤和合并。`TestModel` 只生成测试数据，用于演示 API 流程，不代表真实模型的抽取效果。
 
 下面这份公告是虚构的。Northbridge 不是真实城市，刊名和数量都是编的。
 
@@ -179,6 +134,7 @@ async def main() -> None:
     result = await (
         session.map([Query(tail="Which titles are eligible?", output=Answer, id="titles")])
         .check(CitationCheck(), repair=CitationRepair(max_rounds=2))
+        .filter(lambda item: bool(item.quote))
         .reduce(output=FindingList, instructions="Merge the cited facts.")
         .run()
     )
@@ -189,6 +145,91 @@ asyncio.run(main())
 ```
 
 `examples/run_offline.py` 是更完整的脚本：用 `FunctionModel` 走完 map、引用检查、覆盖策略和补洞，文档仍是同一份虚构公告。
+
+## 动机
+
+一份长文档配一个短问题，在问题很多的时候是很差的工作单位。每次都把文档再发一遍，输入 token 会重复计费，答案之间也没有统一的结构和出处。
+
+前缀缓存改变的是成本形状。能缓存稳定前缀的供应商，对已经见过的 token 会便宜很多，也更快。前提是前缀逐字节稳定：同一套工具、同一段说明、同一份文档，变化的只有尾巴。forkreduce 负责把这个前缀冻住，并给周围的 map/reduce 步骤一个落点。
+
+框架不理解业务。它不会认定“少了截止日期就是失败”，也不会自己丢掉一条引用检查失败的结果。它只报告事实，并执行你的策略返回的动作。
+
+## 概念
+
+| 部分 | 是什么 |
+| --- | --- |
+| **Session** | `build()` 得到。持有冻结前缀、输出类型、模型和执行策略。 |
+| **Prefix** | 说明 + 清洗后的文档 + 结束标记，以及（tools 模式下的）工具集。哈希用作缓存身份。 |
+| **Query** | 一条尾巴、期望的输出类型，以及可选的消息历史，用来延续一条分支。 |
+| **Map** | 同一 session 上的多个查询。第一批可以先预热缓存，再放开并发。 |
+| **Check / repair** | 检查只报告问题。修复可以延续同一条分支，代码只把允许的字段抄回去。 |
+| **Filter** | 你的谓词。没通过的输出留在本次运行里，但不进入 reduce。 |
+| **Reduce** | 在同一前缀上的一次或多次查询。条目带 `source_ids`。覆盖策略决定缺口怎么处理。 |
+| **Follow-up** | 轮次之间的钩子。内置的 `GapFill` 会问还缺什么，再变成下一轮 map。 |
+
+### 查询与归并流程
+
+```mermaid
+flowchart TB
+    context["共享上下文<br/>工具 · 说明 · 文档"]
+
+    subgraph map["Map · 并行查询"]
+        direction LR
+        q1["问题 A"]
+        q2["问题 B"]
+        q3["问题 C"]
+    end
+
+    context --> q1
+    context --> q2
+    context --> q3
+
+    q1 --> check["检查与有界修复 · 可选"]
+    q2 --> check
+    q3 --> check
+    check --> filter["业务过滤 · 可选"]
+    filter --> reduce["Reduce · 合并结果，保留来源"]
+    reduce --> result["结果与报告<br/>已覆盖 · 未覆盖 · 失败"]
+
+    result -.->|"Follow-up · 可选：生成新问题"| map
+
+    style check stroke-dasharray: 5 5
+    style filter stroke-dasharray: 5 5
+```
+
+### 缓存前缀里有什么
+
+```mermaid
+flowchart LR
+    subgraph prefix["冻结前缀（参与哈希）"]
+        tools["输出工具集<br/>名称、描述、JSON schema"]
+        instructions["说明"]
+        docs["清洗后的文档"]
+        marker["===END_FIXED_DOCUMENTS==="]
+        tools --> instructions --> docs --> marker
+    end
+    tail["查询尾巴<br/>以及修复 / 归并 / 补洞文本"]
+    prefix --> tail
+    tail --> model["模型调用"]
+```
+
+`prompted` 模式下工具列表是空的。期望类型的 schema 追加在尾巴上，因此不属于前缀。
+
+### 工具集
+
+```mermaid
+flowchart TB
+    session["一个 Agent，一套工具，在 build() 时注册"]
+    session --> answer["Answer"]
+    session --> leads["LeadList"]
+    session --> findings["FindingList"]
+    session --> reasons["DiscardExplanations"]
+    q1["查询期望 Answer"] --> session
+    q2["归并期望 FindingList"] --> session
+    q3["RequireReason 期望 DiscardExplanations"] --> session
+```
+
+凡是之后会用到的输出类型，都要事先注册。如果策略可能要求解释，就把 `DiscardExplanations` 一并放进去。未注册的类型会在任何模型调用之前抛出 `UnregisteredOutputError`。tools 模式下，模型如果调用了另一个已注册工具，算校验失败，会重试。
 
 ## 按概念看 API
 
@@ -499,6 +540,31 @@ set_message_store(InMemoryMessageStore())
 
 **核心会导入 Temporal 吗？** 不会。只 `import forkreduce` 的进程不会加载 `temporalio`。
 
+## 开发与测试
+
+从源码目录：
+
+```bash
+pip install -e ".[dev]"
+ruff check src tests examples && ruff format --check src tests examples
+mypy
+pytest
+```
+
+示例不需要密钥，完全离线：
+
+```bash
+python examples/run_offline.py
+```
+
+也可以对着 OpenAI 兼容接口跑。没设置 `OPENAI_API_KEY` 时进程会直接退出。
+
+```bash
+OPENAI_API_KEY=... OPENAI_MODEL=... OPENAI_BASE_URL=... python examples/run_live.py
+```
+
+模型名也可以用环境变量 `FORKREDUCE_MODEL`。
+
 ## 路线图
 
 v0.1.0 是第一次公开发布：一个 session、本地执行、引用检查与修复、带覆盖动作的语义归并、补洞、用量统计，以及可选的 Temporal activity 封装。
@@ -511,19 +577,6 @@ v0.1.0 是第一次公开发布：一个 session、本地执行、引用检查�
 * 把缓存预热从第一次真实查询里单独记一笔指标
 * 在同一个 `Executor` 协议后面接第二种工作流运行时
 * 可选的分块 map 再 reduce（提示词大于上下文窗口时）。本地估算只警告；供应商报出上下文超长时，这次调用仍然失败
-
-## 状态与相对设计稿的差异
-
-这是 v0.1.0。设计稿里有几处形状，和已安装的 Pydantic AI 2.57 并不一致。库以实际安装的版本为准：
-
-* Python 要求 `>=3.11`，因为 pydantic-ai 2.57 如此要求。
-* Prompted 模式使用 `PromptedOutput(..., template=False)`，并在单次运行时覆盖为单一类型。schema 追加在尾巴上。不使用多类型联合信封 `{"result": {"kind", "data"}}`。
-* 工具挂在 `Agent` 上，不写进消息历史。`prefix_hash` 仍然覆盖工具 schema。历史检查比较渲染后的文档正文，忽略时间戳和 run id。
-* 预热是第一批 fork 的第一个真实查询，不是一次空调用。
-* 缓存命中 token 优先取 `cache_read_tokens`，否则取 `usage.details["prompt_cache_hit_tokens"]`。两者不相加。
-* 要用 `RequireReason`，必须在 `outputs` 里列入 `DiscardExplanations`。不会自动注册。
-* 引用修复再次请求同一个输出类型，然后只抄回允许的字段。没有单独的修复模型。
-* 覆盖动作面对的是原始 id。树内部对非法 source id 做有界的语义重试，返回对象上的批次 id 会被展开。
 
 ## 许可证
 

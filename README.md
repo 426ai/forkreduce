@@ -2,123 +2,78 @@
 
 forkreduce is a small Python framework, built on [Pydantic AI](https://ai.pydantic.dev/), for the case where many LLM queries share one long context.
 
-You freeze a prefix once: the registered output tool set, the instructions, and the documents. Every later query is a short tail on that prefix, so a provider prefix cache can hit. The queries run together (map), a check can repair a bounded set of fields, your code filters, and an LLM merges the survivors (reduce) while citing the inputs it used. A follow-up hook can open another round. Nothing is dropped quietly: uncovered items, failed checks, and budget stops stay on the report.
+![forkreduce overview: reuse one stable prefix of tools, instructions, and documents across parallel queries; check, repair, and filter results, then merge results while retaining provenance. Reports retain gaps and failures, and optional follow-ups start another round. Provider cache hits are not guaranteed.](docs/assets/overview.svg)
+
+## Installation
+
+Requires Python 3.11 or newer.
 
 ```bash
 pip install forkreduce
 ```
 
-Python 3.11 or newer. The optional Temporal adapter is a separate extra and is never imported by the core package.
-
-```bash
-pip install "forkreduce[temporal]"
-```
-
-## Why
-
-A long document plus a short question is a bad unit of work when you have dozens of questions. Sending the document on every call spends the same input tokens again, and the answers do not share a schema or a way to say where they came from.
-
-Prefix caching changes the cost shape. Providers that cache a stable prompt prefix charge much less, and answer much faster, for the tokens they have already seen. That only works when the prefix is byte-for-byte stable: same tools, same instructions, same documents, and a tail that varies. forkreduce's job is to keep that prefix frozen and to give the map/reduce steps around it a place to live.
-
-The framework does not know your domain. It will not decide that a missing "deadline" is fatal or that a citation failure should be dropped. It reports the facts and runs the action your policy returns.
-
-## Concepts
-
-| Piece | What it is |
-| --- | --- |
-| **Session** | Built by `build()`. Holds the frozen prefix, the output types, the model, and the execution policy. |
-| **Prefix** | Instructions + cleaned documents + the end marker, and (in tools mode) the tool set. Hashed for cache identity. |
-| **Query** | A tail, an expected output type, and optional message history for continuing a branch. |
-| **Map** | Many queries on one session. The first batch can warm the cache before concurrency opens. |
-| **Check / repair** | A check reports problems. A repair may continue the branch, and code copies back only the allowed fields. |
-| **Filter** | Your predicate. Outputs that fail it stay on the run and are left out of the reduce. |
-| **Reduce** | One or more queries on the same prefix. Entries carry `source_ids`. A coverage policy decides what to do with gaps. |
-| **Follow-up** | A hook between rounds. The built-in `GapFill` asks for missing leads and turns them into the next map. |
-
-### Round flow
-
-```mermaid
-flowchart TD
-    build["build(): freeze tools, instructions, documents"] --> map["map: fork queries on the prefix"]
-    map --> check["check, then bounded repair"]
-    check --> filter["business filter"]
-    filter --> reduce["semantic reduce on the same prefix"]
-    reduce --> report["ReduceReport: covered, uncovered, invalid refs"]
-    report --> policy{"CoveragePolicy.decide"}
-    policy -->|Accept| follow{"followup hook"}
-    policy -->|RequireReason| reason["continue the reduce branch"]
-    policy -->|Retry| reduce
-    policy -->|Fail| stop["stop, keep the report"]
-    reason --> follow
-    follow -->|queries| map
-    follow -->|empty or max_rounds| done["RunResult"]
-```
-
-### What sits in the cache prefix
-
-```mermaid
-flowchart LR
-    subgraph prefix["Frozen prefix (hashed)"]
-        tools["Output tool set<br/>name, description, JSON schema"]
-        instructions["Instructions"]
-        docs["Cleaned documents"]
-        marker["===END_FIXED_DOCUMENTS==="]
-        tools --> instructions --> docs --> marker
-    end
-    tail["Query tail<br/>+ repair / reduce / gap text"]
-    prefix --> tail
-    tail --> model["Model call"]
-```
-
-In `prompted` mode the tool list is empty. The expected schema is appended to the tail, so it is not part of the prefix.
-
-### Tool set
-
-```mermaid
-flowchart TB
-    session["One Agent, one tool set, registered at build()"]
-    session --> answer["Answer"]
-    session --> leads["LeadList"]
-    session --> findings["FindingList"]
-    session --> reasons["DiscardExplanations"]
-    q1["Query expects Answer"] --> session
-    q2["Reduce expects FindingList"] --> session
-    q3["RequireReason expects DiscardExplanations"] --> session
-```
-
-Every output type you will ask for, including `DiscardExplanations` if a policy may request reasons, is registered up front. A later call that names an unregistered type raises `UnregisteredOutputError` before any model call. In tools mode, a reply that uses a different registered tool is a validation failure and is retried.
-
-## Install and develop
-
-```bash
-pip install forkreduce
-pip install "forkreduce[temporal]"   # optional
-```
-
-From a checkout:
-
-```bash
-pip install -e ".[dev]"
-ruff check src tests examples && ruff format --check src tests examples
-mypy
-pytest
-```
-
-Examples run offline with no key:
-
-```bash
-python examples/run_offline.py
-```
-
-A live OpenAI-compatible endpoint is optional. The process exits immediately when `OPENAI_API_KEY` is unset.
-
-```bash
-OPENAI_API_KEY=... OPENAI_MODEL=... OPENAI_BASE_URL=... python examples/run_live.py
-```
-
-`FORKREDUCE_MODEL` is accepted as another name for the model.
+The Temporal adapter is optional: `pip install "forkreduce[temporal]"`. The core package never imports it.
 
 ## Quick start
+
+Ask two questions about the same document (map), then merge the answers into a summary with provenance (reduce). This example calls a real model; first configure an OpenAI-compatible endpoint:
+
+```bash
+export OPENAI_API_KEY="your-api-key"
+export OPENAI_MODEL="your-model-name"
+# Optional for a custom endpoint:
+# export OPENAI_BASE_URL="https://your-provider.example/v1"
+```
+
+```python
+import asyncio
+from pydantic import BaseModel
+from forkreduce import Query, Traced, build, openai_compatible_model
+
+
+class Answer(BaseModel):
+    text: str
+
+
+class Summary(Traced):
+    text: str
+
+
+async def main() -> None:
+    session = build(
+        openai_compatible_model(),
+        documents="Eligible titles: Science Digest and River Almanac. Deadline: 30 April 2026.",
+        instructions="Answer only from the document.",
+        outputs=[Answer, Summary],
+    )
+    result = await (
+        session.map([
+            Query(id="titles", tail="Which titles are eligible?", output=Answer),
+            Query(id="deadline", tail="What is the deadline?", output=Answer),
+        ])
+        .reduce(output=Summary, instructions="Combine both answers into one concise summary.")
+        .run()
+    )
+    if result.merged is not None:
+        print(result.merged.text)
+    if result.failures:
+        print(result.failures)
+
+
+asyncio.run(main())
+```
+
+Example output (wording depends on the model):
+
+```text
+Eligible titles are Science Digest and River Almanac; the deadline is 30 April 2026.
+```
+
+Provide the documents and instructions once at `build()`. Map and reduce share that prefix; only their query tails change. Register both output types up front; `Summary` inherits provenance tracking from `Traced`, and the merged result is available as `result.merged`. By default, the first map query finishes as a warmup before the rest run concurrently. Actual cache hits depend on the provider. For an offline example with no API key, see the `TestModel` example below.
+
+## Full workflow example
+
+Add citation checks, bounded repair, a business filter, and a merge. `TestModel` generates test data to demonstrate the API flow, not real document extraction.
 
 The notice below is fictional. Northbridge is not a real city, and the titles and quantities are invented.
 
@@ -179,6 +134,7 @@ async def main() -> None:
     result = await (
         session.map([Query(tail="Which titles are eligible?", output=Answer, id="titles")])
         .check(CitationCheck(), repair=CitationRepair(max_rounds=2))
+        .filter(lambda item: bool(item.quote))
         .reduce(output=FindingList, instructions="Merge the cited facts.")
         .run()
     )
@@ -189,6 +145,91 @@ asyncio.run(main())
 ```
 
 `examples/run_offline.py` is a fuller script: a `FunctionModel` walks map, citation check, a coverage policy, and gap-fill against the same notice.
+
+## Why
+
+A long document plus a short question is a bad unit of work when you have dozens of questions. Sending the document on every call spends the same input tokens again, and the answers do not share a schema or a way to say where they came from.
+
+Prefix caching changes the cost shape. Providers that cache a stable prompt prefix charge much less, and answer much faster, for the tokens they have already seen. That only works when the prefix is byte-for-byte stable: same tools, same instructions, same documents, and a tail that varies. forkreduce's job is to keep that prefix frozen and to give the map/reduce steps around it a place to live.
+
+The framework does not know your domain. It will not decide that a missing "deadline" is fatal or that a citation failure should be dropped. It reports the facts and runs the action your policy returns.
+
+## Concepts
+
+| Piece | What it is |
+| --- | --- |
+| **Session** | Built by `build()`. Holds the frozen prefix, the output types, the model, and the execution policy. |
+| **Prefix** | Instructions + cleaned documents + the end marker, and (in tools mode) the tool set. Hashed for cache identity. |
+| **Query** | A tail, an expected output type, and optional message history for continuing a branch. |
+| **Map** | Many queries on one session. The first batch can warm the cache before concurrency opens. |
+| **Check / repair** | A check reports problems. A repair may continue the branch, and code copies back only the allowed fields. |
+| **Filter** | Your predicate. Outputs that fail it stay on the run and are left out of the reduce. |
+| **Reduce** | One or more queries on the same prefix. Entries carry `source_ids`. A coverage policy decides what to do with gaps. |
+| **Follow-up** | A hook between rounds. The built-in `GapFill` asks for missing leads and turns them into the next map. |
+
+### Query and reduce flow
+
+```mermaid
+flowchart TB
+    context["Shared context<br/>Tools · instructions · documents"]
+
+    subgraph map["Map · parallel queries"]
+        direction LR
+        q1["Question A"]
+        q2["Question B"]
+        q3["Question C"]
+    end
+
+    context --> q1
+    context --> q2
+    context --> q3
+
+    q1 --> check["Check and bounded repair · optional"]
+    q2 --> check
+    q3 --> check
+    check --> filter["Business filter · optional"]
+    filter --> reduce["Reduce · merge results, retain provenance"]
+    reduce --> result["Results and reports<br/>Covered · uncovered · failures"]
+
+    result -.->|"Follow-up · optional: generate new questions"| map
+
+    style check stroke-dasharray: 5 5
+    style filter stroke-dasharray: 5 5
+```
+
+### What sits in the cache prefix
+
+```mermaid
+flowchart LR
+    subgraph prefix["Frozen prefix (hashed)"]
+        tools["Output tool set<br/>name, description, JSON schema"]
+        instructions["Instructions"]
+        docs["Cleaned documents"]
+        marker["===END_FIXED_DOCUMENTS==="]
+        tools --> instructions --> docs --> marker
+    end
+    tail["Query tail<br/>+ repair / reduce / gap text"]
+    prefix --> tail
+    tail --> model["Model call"]
+```
+
+In `prompted` mode the tool list is empty. The expected schema is appended to the tail, so it is not part of the prefix.
+
+### Tool set
+
+```mermaid
+flowchart TB
+    session["One Agent, one tool set, registered at build()"]
+    session --> answer["Answer"]
+    session --> leads["LeadList"]
+    session --> findings["FindingList"]
+    session --> reasons["DiscardExplanations"]
+    q1["Query expects Answer"] --> session
+    q2["Reduce expects FindingList"] --> session
+    q3["RequireReason expects DiscardExplanations"] --> session
+```
+
+Every output type you will ask for, including `DiscardExplanations` if a policy may request reasons, is registered up front. A later call that names an unregistered type raises `UnregisteredOutputError` before any model call. In tools mode, a reply that uses a different registered tool is a validation failure and is retried.
 
 ## API by concept
 
@@ -499,6 +540,31 @@ set_message_store(InMemoryMessageStore())
 
 **Does core import Temporal?** No. A subprocess that imports `forkreduce` does not load `temporalio`.
 
+## Development and testing
+
+From a checkout:
+
+```bash
+pip install -e ".[dev]"
+ruff check src tests examples && ruff format --check src tests examples
+mypy
+pytest
+```
+
+Examples run offline with no key:
+
+```bash
+python examples/run_offline.py
+```
+
+A live OpenAI-compatible endpoint is optional. The process exits immediately when `OPENAI_API_KEY` is unset.
+
+```bash
+OPENAI_API_KEY=... OPENAI_MODEL=... OPENAI_BASE_URL=... python examples/run_live.py
+```
+
+`FORKREDUCE_MODEL` is accepted as another name for the model.
+
 ## Roadmap
 
 v0.1.0 is the first public cut: one session, local execution, citation check/repair, semantic reduce with coverage actions, gap-fill, usage stats, and an optional Temporal activity wrapper.
@@ -511,19 +577,6 @@ Not in this version, and reasonable later:
 * explicit cache-warmup metrics separated from the first real query
 * a second workflow runtime behind the same `Executor` protocol
 * opt-in chunked map-then-reduce when a prompt is larger than the context window (the local estimate only warns; a provider context-length error still fails the call)
-
-## Status and deviations
-
-This is v0.1.0. The design notes asked for a few shapes that Pydantic AI 2.57 does not quite provide. The library follows the installed library instead:
-
-* Python `>=3.11`, because pydantic-ai 2.57 requires it.
-* Prompted mode uses `PromptedOutput(..., template=False)` and a per-run single-type override. The schema is appended to the tail. It does not use the multi-type union envelope `{"result": {"kind", "data"}}`.
-* Tools live on the `Agent`, not inside the message history. `prefix_hash` still covers their schemas. The history check compares rendered document text and ignores timestamps and run ids.
-* Warmup is the first real query of the first fork, not a dummy call.
-* Cache-hit tokens prefer `cache_read_tokens`, and fall back to `usage.details["prompt_cache_hit_tokens"]`. They are not added together.
-* `DiscardExplanations` must be listed in `outputs` to use `RequireReason`. It is not registered automatically.
-* Citation repair re-asks for the same output type and then copies only the allowed fields. There is no separate repair model.
-* Coverage actions see the original ids. Inside a tree, invalid source ids are bounded semantic retries, and batch ids are expanded on the returned objects.
 
 ## License
 

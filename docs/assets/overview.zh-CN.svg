@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="560" viewBox="0 0 1440 560" role="img" aria-labelledby="title desc">
+  <title id="title">一份长上下文，多个问题并行解答</title>
+  <desc id="desc">输出工具、说明和文档组成稳定前缀，供多个并行查询复用。结果经过检查、有界修复和业务过滤，再合并结果并保留来源。报告保留缺口与失败，可选的后续查询开启下一轮。供应商缓存不保证命中。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#425777"/>
+    </marker>
+    <marker id="loop" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7251aa"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; fill: #172e50; }
+      .heading { font-size: 21px; font-weight: 700; }
+      .body { font-size: 18px; }
+      .small { font-size: 16px; fill: #52627a; }
+      .edge { fill: none; stroke: #425777; stroke-width: 2.5; marker-end: url(#arrow); }
+      .query { fill: #edfafa; stroke: #138c8c; stroke-width: 2; }
+    </style>
+  </defs>
+  <rect width="1440" height="560" rx="16" fill="#fff"/>
+  <text x="720" y="53" text-anchor="middle" font-size="32" font-weight="750">一份长上下文，多个问题并行解答</text>
+  <text x="480" y="105" text-anchor="middle" class="heading">MAP · 并行查询</text>
+  <g fill="#f5f8fc" stroke="#263f65" stroke-width="2">
+    <rect x="32" y="138" width="245" height="272" rx="12"/>
+  </g>
+  <text x="154" y="177" text-anchor="middle" class="heading">共享前缀</text>
+  <g fill="#e6edf6">
+    <rect x="51" y="198" width="207" height="45" rx="7"/>
+    <rect x="51" y="254" width="207" height="45" rx="7"/>
+    <rect x="51" y="310" width="207" height="45" rx="7"/>
+  </g>
+  <g text-anchor="middle" class="body">
+    <text x="154" y="227">输出工具集*</text>
+    <text x="154" y="283">说明</text>
+    <text x="154" y="339">文档</text>
+    <text x="154" y="389" class="small">每次调用保持不变</text>
+  </g>
+  <path class="edge" d="M277 220 H299 Q311 220 311 208 V184 Q311 172 325 172 H344"/>
+  <path class="edge" d="M277 274 H344"/>
+  <path class="edge" d="M277 328 H299 Q311 328 311 340 V364 Q311 376 325 376 H344"/>
+  <rect class="query" x="350" y="132" width="260" height="80" rx="10"/>
+  <rect class="query" x="350" y="234" width="260" height="80" rx="10"/>
+  <rect class="query" x="350" y="336" width="260" height="80" rx="10"/>
+  <g class="heading">
+    <text x="370" y="163">问题 A</text>
+    <text x="370" y="265">问题 B</text>
+    <text x="370" y="367">问题 C</text>
+  </g>
+  <g fill="#263f65">
+    <rect x="370" y="178" width="166" height="16" rx="3"/>
+    <rect x="370" y="280" width="166" height="16" rx="3"/>
+    <rect x="370" y="382" width="166" height="16" rx="3"/>
+  </g>
+  <g fill="#13a3a3">
+    <rect x="540" y="178" width="49" height="16" rx="3"/>
+    <rect x="540" y="280" width="49" height="16" rx="3"/>
+    <rect x="540" y="382" width="49" height="16" rx="3"/>
+  </g>
+  <path class="edge" d="M610 172 H626 Q643 172 643 193 V253 Q643 274 666 274 H682"/>
+  <path class="edge" d="M610 274 H682"/>
+  <path class="edge" d="M610 376 H626 Q643 376 643 355 V295 Q643 274 666 274 H682"/>
+  <rect x="690" y="219" width="226" height="110" rx="12" fill="#f1f6fc" stroke="#263f65" stroke-width="2"/>
+  <text x="803" y="252" text-anchor="middle" class="heading">检查 + 过滤</text>
+  <text x="803" y="281" text-anchor="middle" class="small">仅修复允许的字段</text>
+  <text x="803" y="305" text-anchor="middle" class="small">按业务规则筛选</text>
+  <path class="edge" d="M916 274 H956"/>
+  <rect x="964" y="219" width="194" height="110" rx="12" fill="#f5f0fc" stroke="#7251aa" stroke-width="2"/>
+  <text x="1061" y="257" text-anchor="middle" class="heading">REDUCE · 合并</text>
+  <text x="1061" y="290" text-anchor="middle" class="small">合并结果，保留来源</text>
+  <path class="edge" d="M1158 274 H1198"/>
+  <rect x="1206" y="219" width="202" height="110" rx="12" fill="#f5f0fc" stroke="#7251aa" stroke-width="2"/>
+  <text x="1307" y="257" text-anchor="middle" class="heading">报告</text>
+  <text x="1307" y="290" text-anchor="middle" class="small">结果、缺口、失败</text>
+  <path d="M1307 329 V441 Q1307 454 1294 454 H493 Q480 454 480 441 V423" fill="none" stroke="#7251aa" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#loop)"/>
+  <rect x="735" y="441" width="255" height="26" fill="#fff"/>
+  <text x="862" y="460" text-anchor="middle" class="small">可选：后续查询开启下一轮</text>
+  <rect x="350" y="482" width="28" height="12" rx="2" fill="#263f65"/>
+  <text x="387" y="494" class="small">相同前缀</text>
+  <rect x="506" y="482" width="28" height="12" rx="2" fill="#13a3a3"/>
+  <text x="543" y="494" class="small">不同问题</text>
+  <text x="32" y="525" class="small">* tools 模式下，输出工具集属于前缀。稳定前缀可被供应商的前缀缓存复用；是否命中取决于供应商。</text>
+</svg>
