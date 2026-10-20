@@ -24,7 +24,7 @@ from forkreduce.schemas import DiscardExplanation, DiscardExplanations, Traced
 from forkreduce.session import Session, build
 from forkreduce.stats import UsageSummary
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "END_MARKER",

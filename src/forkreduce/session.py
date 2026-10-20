@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from pydantic_ai import Agent, PromptedOutput, ToolOutput, capture_run_messages
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
+from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 from forkreduce.context import (
@@ -24,7 +25,7 @@ from forkreduce.context import (
     request_context_warning,
     request_text,
 )
-from forkreduce.documents import DocumentIndex, DocumentsInput, coerce_documents
+from forkreduce.documents import DocumentIndex, DocumentsInput, MetaRenderer, coerce_documents
 from forkreduce.errors import ForkReduceError, UnregisteredOutputError
 from forkreduce.executor import BudgetLedger, Executor, LocalExecutor, budget_action_failure
 from forkreduce.failures import Failure, classify_exception, wrong_output_failure
@@ -65,8 +66,11 @@ class Session:
         prefix_hash_value: str,
         tool_specs: list[dict[str, Any]],
         executor: Executor | None,
+        model_settings: ModelSettings | None = None,
     ) -> None:
         self.model = model
+        copied = cast(ModelSettings, dict(model_settings)) if model_settings else None
+        self.model_settings: ModelSettings | None = copied
         self.instructions = instructions
         self.documents = documents
         self.rendered_documents = documents.rendered
@@ -194,6 +198,11 @@ class Session:
             kwargs: dict[str, Any] = {}
             if self.output_mode == "prompted":
                 kwargs["output_type"] = PromptedOutput(query.output, template=False)
+            merged_settings = merge_model_settings(self.model_settings, query.model_settings)
+            if merged_settings:
+                # Copy so a later mutation of the caller's dict cannot change
+                # this request, and so pydantic-ai's in-place edits stay local.
+                kwargs["model_settings"] = dict(merged_settings)
             try:
                 with capture_run_messages() as captured:
                     try:
@@ -356,6 +365,9 @@ def build(
     warmup: bool = True,
     policy: Policy | None = None,
     executor: Executor | None = None,
+    model_settings: ModelSettings | None = None,
+    meta_keys: Sequence[str] | None = None,
+    meta_renderer: MetaRenderer | None = None,
 ) -> Session:
     """Freeze a shared prefix and the output tool set.
 
@@ -366,12 +378,17 @@ def build(
     ``output_mode="tools"`` (the default) registers every output as a tool on
     every call. ``output_mode="prompted"`` keeps tools out of the prefix and
     appends only the expected output's JSON schema to the query tail.
+
+    ``model_settings`` is sent on every call. A :class:`~forkreduce.query.Query`
+    may override individual keys. Sampling parameters and timeouts do not change
+    the frozen prefix. ``meta_keys`` or ``meta_renderer`` do: rendered block
+    meta becomes part of the prefix and its hash. The default renders no meta.
     """
     if output_mode not in {"tools", "prompted"}:
         raise ForkReduceError("output_mode must be 'tools' or 'prompted'")
     if not outputs:
         raise ForkReduceError("outputs must register at least one pydantic model")
-    index = coerce_documents(documents)
+    index = coerce_documents(documents, meta_keys=meta_keys, meta_renderer=meta_renderer)
     chosen = policy if policy is not None else Policy()
     output_types: dict[str, type[BaseModel]] = {}
     tool_specs: list[dict[str, Any]] = []
@@ -407,6 +424,7 @@ def build(
         prefix_hash_value=hashed,
         tool_specs=tool_specs,
         executor=executor,
+        model_settings=model_settings,
     )
     notice = prefix_context_warning(
         chosen,

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "forkreduce"
-version = "0.1.0"
+version = "0.1.1"
 description = "Share one frozen prompt prefix across many LLM queries, MapReduce style, on Pydantic AI."
 readme = "README.md"
 license = "MIT"

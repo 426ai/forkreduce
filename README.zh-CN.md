@@ -245,12 +245,28 @@ session = build(
     policy=Policy(concurrency=8, retries=2),
     warmup=True,
     executor=None,                  # 默认 LocalExecutor(policy)
+    model_settings={"temperature": 0},  # 每次调用都带上
 )
 ```
 
 `session.prefix_hash` 是一份规范 JSON 的 SHA-256：版本、输出模式、说明、清洗后的文档，以及每个工具的名称、描述和 schema。同样的内容重建 session，哈希不变。改工具 schema、说明或文档正文，哈希就会变。
 
 `documents` 可以是一个字符串（单个块，id 为 `b1`）、一串字符串（`b1`、`b2`……），或 `Block` / `Document`。渲染和哈希之前会去掉控制字符。渲染结果以单独一行 `===END_FIXED_DOCUMENTS===` 结束。
+
+`Block.meta` 会保存下来，默认不渲染，因此已有的前缀哈希不变。需要时用 `meta_keys`（按给出的键顺序渲染）或 `meta_renderer`（一个可调用对象）。渲染出来的 meta 属于前缀，也会进入哈希。两者只能传一个。
+
+```python
+session = build(
+    model,
+    documents=Document(
+        doc_id="notice",
+        blocks=[Block(block_id="b1", text="Hours are 9 to 5.", meta={"page": "3"})],
+    ),
+    instructions="Answer from the notice.",
+    outputs=[Answer],
+    meta_keys=["page"],  # 在块下方写入 [meta {"page":"3"}]
+)
+```
 
 ### Query 与 QueryResult
 
@@ -262,6 +278,7 @@ query = Query(
     history=None,           # None 从前缀开始；传入 previous.messages 则延续该分支
     meta={},
     round=0,
+    model_settings={"temperature": 0.2},  # 只覆盖这一次调用的 session 设置
 )
 result = await session.ask(query)
 # 或
@@ -481,9 +498,18 @@ follow = await session.ask(Query(
 from forkreduce import openai_compatible_model
 
 model = openai_compatible_model()  # OPENAI_MODEL 或 FORKREDUCE_MODEL、OPENAI_API_KEY、OPENAI_BASE_URL
+
+model = openai_compatible_model(
+    "local-model",
+    base_url="http://127.0.0.1:8000/v1",
+    timeout=30,
+    temperature=0,
+    profile={"supports_tools": True},
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
 ```
 
-OpenAI 客户端以 `max_retries=0` 构造。重试由 forkreduce 做。
+OpenAI 客户端以 `max_retries=0` 构造。重试由 forkreduce 做。`timeout`、`profile`、`extra_body` 和常用采样参数都是 pydantic-ai 的模型设置。`settings={...}` 可以传入其他 `ModelSettings` 键；同名的显式参数优先。`build(..., model_settings=...)` 让每次调用都带上这些设置，`Query.model_settings` 只覆盖这一次的对应键。`extra_body` 是整段替换，不会按字段合并。
 
 ### Temporal（可选）
 
@@ -491,7 +517,7 @@ OpenAI 客户端以 `max_retries=0` 构造。重试由 forkreduce 做。
 
 每个查询是一个 activity。activity 调用 `Session.run_once`（只尝试一次），然后抛出 `ApplicationError`。`non_retryable` 跟随 `Failure.retryable`：校验和传输失败可以重试；永久失败和预算用尽不可以。`temporal_retry_policy(policy)` 把 `maximum_attempts` 设为 `policy.retries + 1`。
 
-幂等键是 `forkreduce:{prefix_hash}:{query_id}`，由 `activity_id` 生成。工作流启动前，在 worker 里用 `register_session(session)` 登记建好的 session。同一个前缀哈希如果换成另一个模型或另一套策略，会抛出 `ForkReduceError`；先调用 `unregister_session`。执行指纹相同则可以替换。工作流载荷带的是前缀哈希、尾巴、输出类型名和重试预算（`max_attempts`、退避），不是模型对象。`MapQueriesWorkflow` 使用这份预算。`query_activity_input(session, ...)` 把 `Policy.retries + 1` 抄进 `max_attempts`。没有消息存储时，把上一个 activity 的 `messages_json` 作为 `history_json` 传回去，就能延续分支。
+幂等键是 `forkreduce:{prefix_hash}:{query_id}`，由 `activity_id` 生成。工作流启动前，在 worker 里用 `register_session(session)` 登记建好的 session。同一个前缀哈希如果换成另一个模型、另一份会改变请求体的设置、另一份模型 profile，或另一套策略，会抛出 `ForkReduceError`；先调用 `unregister_session`。执行指纹相同则可以替换。`timeout` 和 `extra_headers` 不计入指纹。单次查询的 `model_settings` 也不计入；把它传给 `query_activity_input(..., model_settings=...)`，worker 只在这次 activity 里套用。工作流载荷带的是前缀哈希、尾巴、输出类型名和重试预算（`max_attempts`、退避），不是模型对象。`MapQueriesWorkflow` 使用这份预算。`query_activity_input(session, ...)` 把 `Policy.retries + 1` 抄进 `max_attempts`。没有消息存储时，把上一个 activity 的 `messages_json` 作为 `history_json` 传回去，就能延续分支。
 
 很长的对话记录不适合作为 activity 的返回值。用 `set_message_store` 接一个 `MessageStore`。有存储时，activity 返回 `messages_ref`，`messages_json` 为空。没有存储时，消息会内联返回，测试方便，真实历史不合适。`InMemoryMessageStore` 只活在当前进程里。
 
@@ -525,6 +551,10 @@ set_message_store(InMemoryMessageStore())
 **历史。** 延续分支时，除了前缀，还会带上之前的问答。只要这些字节不变，前缀缓存（含之前的轮次）同样可以命中。时间戳和 run id 不参与前缀检查；检查比较的是渲染后的文档正文。
 
 **Prompted 模式。** `output_mode="prompted"` 不往 Agent 上挂工具。期望类型的 schema 只追加在尾巴上，因此不同查询可以用不同的已注册类型，而不会打掉前缀。所有调用共享同一份工具列表时，tools 模式的缓存更稳，所以默认是 `"tools"`。
+
+**采样和传输。** `temperature`、`top_p`、`max_tokens`、`seed`、惩罚项、`stop_sequences`、`timeout` 和 `extra_headers` 不改变冻结前缀，因此不会打掉供应商的前缀缓存。`extra_body` 也不改变这些字节。采样参数和 `extra_body` 会改变 JSON 请求体，所以 Temporal 把不同的值当成不同的执行，`register_session` 会拒绝。`timeout` 和 `extra_headers` 属于传输选项，不进入这份指纹。
+
+**Profile 和块 meta。** 模型 `profile` 可能改变工具或 schema 在线路上的渲染方式。即便 `prefix_hash` 没变，供应商缓存仍可能 miss，所以解析后的 profile 会计入执行指纹。`Block.meta` 默认不渲染，除非传入 `meta_keys` 或 `meta_renderer`。一旦启用，meta 会写进文档正文，`prefix_hash` 和被缓存的前缀都会变。
 
 ## 常见问题
 

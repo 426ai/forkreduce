@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
 from pydantic_ai.messages import ModelMessage
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RunUsage
 
 from forkreduce.context import ContextWarning
@@ -35,6 +36,10 @@ class Query(Generic[T]):
     wanted; it only warns when a continuation does not start with the prefix.
 
     ``output`` must be one of the types registered on the session.
+
+    ``model_settings`` overrides the session settings for this call only.
+    pydantic-ai merges the two shallowly: a key set here replaces that key,
+    and ``extra_body`` is replaced as a whole rather than merged key by key.
     """
 
     tail: str
@@ -43,6 +48,7 @@ class Query(Generic[T]):
     history: list[ModelMessage] | None = None
     meta: dict[str, Any] = field(default_factory=dict)
     round: int = 0
+    model_settings: ModelSettings | None = None
 
 
 @dataclass
