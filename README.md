@@ -2,7 +2,7 @@
 
 forkreduce is a small Python framework, built on [Pydantic AI](https://ai.pydantic.dev/), for the case where many LLM queries share one long context.
 
-![forkreduce overview: reuse one stable prefix of tools, instructions, and documents across parallel queries; check, repair, and filter results, then merge results while retaining provenance. Reports retain gaps and failures, and optional follow-ups start another round. Provider cache hits are not guaranteed.](docs/assets/overview.svg)
+![forkreduce overview: reuse one stable prefix of tools, instructions, and documents across parallel queries; check, repair, and filter results, then merge results while retaining provenance. Reports retain gaps and failures, and optional follow-ups start another round. Provider cache hits are not guaranteed.](https://github.com/426ai/forkreduce/raw/main/docs/assets/overview.svg)
 
 ## Installation
 
@@ -565,6 +565,21 @@ OPENAI_API_KEY=... OPENAI_MODEL=... OPENAI_BASE_URL=... python examples/run_live
 
 `FORKREDUCE_MODEL` is accepted as another name for the model.
 
+## Releasing
+
+PyPI publishes from a git tag. `.github/workflows/release.yml` builds the sdist and wheel, checks them, and uploads with [Trusted Publishing](https://docs.pypi.org/trusted-publishers/). The repository has no PyPI token. The publisher is the `pypi` environment on `426ai/forkreduce`, workflow `release.yml`.
+
+1. Set the same version in `pyproject.toml` (`version`) and `src/forkreduce/__init__.py` (`__version__`).
+2. Commit that change on `main`.
+3. Tag that commit and push the tag:
+
+```bash
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+The tag is `v` plus the version string: `0.1.0` is `v0.1.0`. The workflow fails when they differ. You can also run the Release workflow by hand from the Actions tab, but only on an existing `v*` tag.
+
 ## Roadmap
 
 v0.1.0 is the first public cut: one session, local execution, citation check/repair, semantic reduce with coverage actions, gap-fill, usage stats, and an optional Temporal activity wrapper.
@@ -580,4 +595,4 @@ Not in this version, and reasonable later:
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/426ai/forkreduce/blob/main/LICENSE).
