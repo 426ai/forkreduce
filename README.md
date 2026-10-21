@@ -1,4 +1,7 @@
-# forkreduce
+<p align="center">
+  <img src="https://github.com/426ai/forkreduce/raw/main/docs/assets/logo.svg" alt="forkreduce logo" width="160">
+</p>
+<h1 align="center">forkreduce</h1>
 
 forkreduce is a small Python framework, built on [Pydantic AI](https://ai.pydantic.dev/), for the case where many LLM queries share one long context.
 
