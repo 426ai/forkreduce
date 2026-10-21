@@ -253,3 +253,133 @@ def test_mixed_document_input_keeps_caller_order() -> None:
     rendered = index.rendered
     assert rendered.index("[block a]") < rendered.index("id=mid") < rendered.index("tail")
     assert [doc.doc_id for doc in index.documents] == ["doc", "mid", "doc-2"]
+
+
+def _notice(meta: dict[str, str] | None = None) -> Block:
+    return Block(block_id="b1", text="Hours are 9 to 5.", meta=dict(meta or {}))
+
+
+def test_block_meta_is_omitted_from_the_prefix_by_default() -> None:
+    plain = build(
+        _scripted().model(),
+        documents=_notice(),
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+    )
+    tagged = build(
+        _scripted().model(),
+        documents=_notice({"page": "3", "section": "PAGE-TOKEN"}),
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+    )
+    assert plain.prefix_hash == tagged.prefix_hash
+    assert "PAGE-TOKEN" not in tagged.rendered_documents
+    assert "[meta " not in tagged.rendered_documents
+    assert tagged.documents.blocks["b1"].meta["section"] == "PAGE-TOKEN"
+
+
+def test_meta_keys_render_in_caller_order_and_change_the_hash() -> None:
+    silent = build(
+        _scripted().model(),
+        documents=_notice({"page": "3", "section": "PAGE-TOKEN"}),
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+    )
+    forward = build(
+        _scripted().model(),
+        documents=_notice({"page": "3", "section": "PAGE-TOKEN"}),
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        meta_keys=["page", "section"],
+    )
+    reverse = build(
+        _scripted().model(),
+        documents=_notice({"page": "3", "section": "PAGE-TOKEN"}),
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        meta_keys=["section", "page"],
+    )
+    missing = build(
+        _scripted().model(),
+        documents=_notice({"page": "3", "section": "PAGE-TOKEN"}),
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        meta_keys=["absent"],
+    )
+    empty = build(
+        _scripted().model(),
+        documents=_notice({"page": "3", "section": "PAGE-TOKEN"}),
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        meta_keys=[],
+    )
+    assert '[meta {"page":"3","section":"PAGE-TOKEN"}]' in forward.rendered_documents
+    assert '[meta {"section":"PAGE-TOKEN","page":"3"}]' in reverse.rendered_documents
+    assert forward.prefix_hash != silent.prefix_hash
+    assert reverse.prefix_hash != forward.prefix_hash
+    assert missing.prefix_hash == silent.prefix_hash
+    assert empty.prefix_hash == silent.prefix_hash
+    assert "[meta " not in missing.rendered_documents
+
+
+def test_meta_renderer_is_part_of_the_prefix() -> None:
+    def render(document: Document, block: Block) -> str | None:
+        page = block.meta.get("page")
+        if not page or document.doc_id != "doc":
+            return None
+        return f"meta-page {page}"
+
+    silent = build(
+        _scripted().model(),
+        documents=_notice({"page": "3\x00"}),
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+    )
+    shown = build(
+        _scripted().model(),
+        documents=_notice({"page": "3\x00"}),
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        meta_renderer=render,
+    )
+    blank = build(
+        _scripted().model(),
+        documents=_notice({"page": "3"}),
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        meta_renderer=lambda _document, _block: " \x00\n",
+    )
+    stripped = build(
+        _scripted().model(),
+        documents=_notice({"page": "3\x00"}),
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        meta_keys=["page"],
+    )
+    assert "meta-page 3" in shown.rendered_documents
+    assert "\x00" not in shown.rendered_documents
+    assert shown.prefix_hash != silent.prefix_hash
+    assert blank.prefix_hash == silent.prefix_hash
+    assert '[meta {"page":"3"}]' in stripped.rendered_documents
+    assert "\x00" not in stripped.rendered_documents
+    with pytest.raises(forkreduce.ForkReduceError, match="not both"):
+        build(
+            _scripted().model(),
+            documents=_notice({"page": "3"}),
+            instructions="rules",
+            outputs=[Answer],
+            warmup=False,
+            meta_keys=["page"],
+            meta_renderer=render,
+        )

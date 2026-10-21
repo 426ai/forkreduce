@@ -19,18 +19,22 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from collections.abc import Mapping
+
     from pydantic import BaseModel
     from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
+    from pydantic_ai.settings import ModelSettings, merge_model_settings
 
     from forkreduce.errors import ForkReduceError
     from forkreduce.failures import Failure
+    from forkreduce.models import canonical_value, request_body_settings
     from forkreduce.policy import Policy
     from forkreduce.query import Query
     from forkreduce.session import Session
@@ -78,14 +82,30 @@ def execution_fingerprint(session: Session) -> str:
 
     ``prefix_hash`` ignores the model and the retry/budget policy. Two sessions
     can share a hash and still send calls to different places.
+
+    The fingerprint includes settings that change the request body (sampling
+    parameters, ``extra_body``, and anything else on ``ModelSettings`` except
+    ``timeout`` and ``extra_headers``) and the resolved model profile. A
+    profile can change tool or schema rendering, so two sessions with the same
+    prefix hash and different profiles are different executions. A per-query
+    ``model_settings`` override is not part of this identity; the activity
+    payload carries that override itself.
+
+    Sampling parameters, timeouts, and extra headers do not change the frozen
+    prefix bytes. A profile, or opt-in block meta, can.
     """
     model = session.model
     policy = session.policy
     budget = policy.budget
+    raw_settings = getattr(model, "settings", None)
+    model_settings = cast(ModelSettings, raw_settings) if isinstance(raw_settings, Mapping) else None
+    merged_settings = merge_model_settings(model_settings, session.model_settings)
     payload = {
         "model_type": type(model).__qualname__,
         "model_name": getattr(model, "model_name", None),
         "system": getattr(model, "system", None),
+        "model_settings": canonical_value(request_body_settings(merged_settings)),
+        "model_profile": canonical_value(getattr(model, "profile", None)),
         "output_mode": session.output_mode,
         "warmup": session.warmup,
         "concurrency": policy.concurrency,
@@ -119,7 +139,8 @@ def register_session(session: Session) -> str:
     current = _FINGERPRINTS.get(key)
     if current is not None and current != fingerprint:
         raise ForkReduceError(
-            "A session with this prefix_hash is already registered with a different model or policy. "
+            "A session with this prefix_hash is already registered with a different model, "
+            "model settings, profile, or policy. "
             "Call unregister_session before registering a different execution config."
         )
     _SESSIONS[key] = session
@@ -191,6 +212,7 @@ class QueryActivityInput:
     max_attempts: int = 1
     retry_backoff_seconds: float = 0.0
     max_backoff_seconds: float = 0.0
+    model_settings: dict[str, Any] | None = None
 
 
 def query_activity_input(
@@ -203,8 +225,14 @@ def query_activity_input(
     history_ref: str | None = None,
     history_json: str | None = None,
     meta: dict[str, Any] | None = None,
+    model_settings: ModelSettings | None = None,
 ) -> QueryActivityInput:
-    """Build an activity payload that carries this session's retry policy."""
+    """Build an activity payload that carries this session's retry policy.
+
+    ``model_settings`` is a per-query override. The worker merges it over the
+    registered session's settings. It is not part of the execution fingerprint.
+    Values must be JSON-serializable; a client ``timeout`` object is not.
+    """
     policy = session.policy
     return QueryActivityInput(
         prefix_hash=session.prefix_hash,
@@ -218,6 +246,7 @@ def query_activity_input(
         max_attempts=policy.retries + 1,
         retry_backoff_seconds=policy.retry_backoff,
         max_backoff_seconds=policy.max_backoff,
+        model_settings=dict(model_settings) if model_settings else None,
     )
 
 
@@ -284,6 +313,7 @@ async def execute_query_activity(payload: QueryActivityInput) -> QueryActivityOu
                 non_retryable=True,
             )
         history = list(ModelMessagesTypeAdapter.validate_json(await _STORE.get(payload.history_ref)))
+    query_settings = cast(ModelSettings, dict(payload.model_settings)) if payload.model_settings else None
     query: Query[Any] = Query(
         tail=payload.tail,
         output=output_type,
@@ -291,6 +321,7 @@ async def execute_query_activity(payload: QueryActivityInput) -> QueryActivityOu
         history=history,
         meta=dict(payload.meta),
         round=payload.round,
+        model_settings=query_settings,
     )
     session.prepare_query(query)
     result = await session.run_once(query)

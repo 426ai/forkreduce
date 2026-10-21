@@ -245,12 +245,28 @@ session = build(
     policy=Policy(concurrency=8, retries=2),
     warmup=True,
     executor=None,                  # default LocalExecutor(policy)
+    model_settings={"temperature": 0},  # sent on every call
 )
 ```
 
 `session.prefix_hash` is a SHA-256 of a canonical JSON document: version, output mode, instructions, cleaned documents, and each tool's name, description, and schema. Rebuilding the same session produces the same hash. Changing a tool schema, the instructions, or the document text changes the hash.
 
 `documents` accepts a string (one block, id `b1`), a sequence of strings (`b1`, `b2`, ...), or `Block` / `Document` values. Text is stripped of control characters before it is rendered or hashed. The rendered prefix ends with a line `===END_FIXED_DOCUMENTS===`.
+
+`Block.meta` is stored and, by default, not rendered, so existing prefix hashes stay the same. Opt in with `meta_keys` (a list of keys, rendered in that order) or `meta_renderer` (a callable). Rendered meta is part of the prefix and the hash. Pass one of the two, not both.
+
+```python
+session = build(
+    model,
+    documents=Document(
+        doc_id="notice",
+        blocks=[Block(block_id="b1", text="Hours are 9 to 5.", meta={"page": "3"})],
+    ),
+    instructions="Answer from the notice.",
+    outputs=[Answer],
+    meta_keys=["page"],  # writes [meta {"page":"3"}] under the block
+)
+```
 
 ### Query and QueryResult
 
@@ -262,6 +278,7 @@ query = Query(
     history=None,           # None starts at the prefix; previous.messages continues a branch
     meta={},
     round=0,
+    model_settings={"temperature": 0.2},  # overrides the session value for this call
 )
 result = await session.ask(query)
 # or
@@ -481,9 +498,18 @@ Pass any pydantic-ai `Model`, including `TestModel` and `FunctionModel`. For an 
 from forkreduce import openai_compatible_model
 
 model = openai_compatible_model()  # OPENAI_MODEL or FORKREDUCE_MODEL, OPENAI_API_KEY, OPENAI_BASE_URL
+
+model = openai_compatible_model(
+    "local-model",
+    base_url="http://127.0.0.1:8000/v1",
+    timeout=30,
+    temperature=0,
+    profile={"supports_tools": True},
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
 ```
 
-The OpenAI client is constructed with `max_retries=0`. forkreduce does the retrying.
+The OpenAI client is constructed with `max_retries=0`. forkreduce does the retrying. `timeout`, `profile`, `extra_body`, and the usual sampling keys are pydantic-ai model settings. A `settings={...}` dict passes any other `ModelSettings` key; an explicit argument overrides the same key. `build(..., model_settings=...)` applies settings to every call, and `Query.model_settings` overrides keys for that call. `extra_body` is replaced as a whole, not merged field by field.
 
 ### Temporal (optional)
 
@@ -491,7 +517,7 @@ The OpenAI client is constructed with `max_retries=0`. forkreduce does the retry
 
 Each query is one activity. The activity calls `Session.run_once` (a single attempt) and raises `ApplicationError`. `non_retryable` follows `Failure.retryable`: validation and transport stay retryable; permanent failures and budget exhaustion do not. `temporal_retry_policy(policy)` sets `maximum_attempts` to `policy.retries + 1`.
 
-The idempotency key is `forkreduce:{prefix_hash}:{query_id}` via `activity_id`. Register the built session on the worker with `register_session(session)` before the workflow runs. Registering another session with the same prefix hash but a different model or policy raises `ForkReduceError`; call `unregister_session` first. The same fingerprint may replace the session. The workflow payload carries the prefix hash, the tail, the output name, and the retry budget (`max_attempts`, backoff), not the model. `MapQueriesWorkflow` uses that budget. `query_activity_input(session, ...)` copies `Policy.retries + 1` into `max_attempts`. Without a message store, pass the previous activity's `messages_json` back as `history_json` to continue a branch.
+The idempotency key is `forkreduce:{prefix_hash}:{query_id}` via `activity_id`. Register the built session on the worker with `register_session(session)` before the workflow runs. Registering another session with the same prefix hash but a different model, request-body settings, model profile, or policy raises `ForkReduceError`; call `unregister_session` first. The same fingerprint may replace the session. `timeout` and `extra_headers` are not part of the fingerprint. A per-query `model_settings` override is not either; pass it to `query_activity_input(..., model_settings=...)` so the worker applies it for that activity. The workflow payload carries the prefix hash, the tail, the output name, and the retry budget (`max_attempts`, backoff), not the model. `MapQueriesWorkflow` uses that budget. `query_activity_input(session, ...)` copies `Policy.retries + 1` into `max_attempts`. Without a message store, pass the previous activity's `messages_json` back as `history_json` to continue a branch.
 
 Large transcripts should not be activity return values. Pass a `MessageStore` to `set_message_store`. With a store, the activity returns `messages_ref` and leaves `messages_json` empty. Without one, messages are inlined, which is fine for tests and a poor fit for real histories. `InMemoryMessageStore` is process-local.
 
@@ -525,6 +551,10 @@ set_message_store(InMemoryMessageStore())
 **History.** Continuing a branch sends the prior question and answer as well as the prefix. That also hits a prefix cache, including the earlier turns, as long as those bytes are unchanged. Timestamps and run ids are not part of the prefix check; the check compares the rendered document text.
 
 **Prompted mode.** `output_mode="prompted"` puts no tools on the agent. The schema of the expected type is appended to the tail only, so different queries can use different registered types without busting the prefix. The tool-mode cache is more stable when every call shares one tool list, which is why `"tools"` is the default.
+
+**Sampling and transport.** `temperature`, `top_p`, `max_tokens`, `seed`, penalties, `stop_sequences`, `timeout`, and `extra_headers` do not change the frozen prefix, so they do not bust a provider prefix cache. `extra_body` does not change those bytes either. Sampling parameters and `extra_body` do change the JSON body, so Temporal treats a different value as a different execution and `register_session` rejects it. `timeout` and `extra_headers` are transport options and are left out of that fingerprint.
+
+**Profile and block meta.** A model `profile` can change how tools or schemas are rendered on the wire. That can miss the provider cache even when `prefix_hash` is unchanged, which is why the resolved profile is part of the execution fingerprint. `Block.meta` is omitted unless you pass `meta_keys` or `meta_renderer`. Opting in writes meta into the document text, which changes `prefix_hash` and the cached prefix.
 
 ## FAQ
 
