@@ -1,4 +1,7 @@
-# forkreduce
+<p align="center">
+  <img src="https://github.com/426ai/forkreduce/raw/main/docs/assets/logo.svg" alt="forkreduce logo" width="160">
+</p>
+<h1 align="center">forkreduce</h1>
 
 forkreduce 是一个基于 [Pydantic AI](https://ai.pydantic.dev/) 的 Python 库，用来让很多次 LLM 查询共享同一份长上下文。
 
