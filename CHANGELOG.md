@@ -4,6 +4,8 @@
 
 ### Added
 
+- Worker-local `build(instrument=False|True|InstrumentationSettings)` applies to ordinary, feedback and dynamic Agents without changing hashes/fingerprints; explicit default-off remains independent of global Agent defaults. `forkreduce_temporal_names(prefix=...)` / serializable `TemporalNames` provide sandboxed, cached prefixed activity/workflow definitions while preserving original default registrations, child/query IDs, application hooks and custom batch choices. Real in-memory tracing and same-worker official TemporalDurability/PydanticAIPlugin coexistence are covered.
+
 - Public serializable `OutputSpec` / `DynamicOutputs` support per-question JSON schemas and dictionary outputs, with JSON Schema validation, local refs/composition, and native output-feedback retries. Prompted schemas stay in tails; opt-in `dynamic_outputs="generic_tool"` adds one fixed permissive output tool rather than changing tools per query. Dynamic-only auto sessions without that tool use prompted mode. Both Temporal converters handle specs/follow-ups and frozen dynamic settings. Only enabling/changing the frozen tool/mode contract changes hashes; per-question schemas do not.
 
 - Public workflow primitives `plan_batches`, `batch_child_id`, `require_query_references`, `validate_query_references`, `query_failure`, and `execute_query` support application-owned orchestration. Built-in pipelines add `AfterQueryInput` / `AfterQueryDecision`, per-query `after_query_activity` with independent options, bounded repair rounds, safe `after_query_failed` records, and small copied `result_meta`. `batch_workflow` selects an application batch with the same input/output contract. Defaults and hashes are unchanged; repair IDs append `#r{round}`.
@@ -60,6 +62,8 @@ Public `QueryFailureKind` is exported from `forkreduce.contrib.temporal` as a `L
 | `unknown` | Ambiguous terminal application/SDK failure or failed child batch. |
 
 ### Upgrade notes
+
+- **Observability and registration:** rebuild models and instrumentation in worker session factories, never serialize providers/exporters/functions. Configure tracing/export explicitly and consider `include_content=False`. Prefixed definitions still use the documented sandbox passthrough runner; register/replay the same definitions. Official plugin clients supply the worker plugin once. forkreduce query activities remain their own Agent path, not a TemporalDurability forwarding shim.
 
 - **Dynamic outputs:** restore `FrozenPrefix.dynamic_outputs` in factories. A static frozen tools session needs the generic tool declared up front before accepting dynamic schemas; otherwise choose a separate prompted/dynamic session. Remote schema references are rejected; both strict modes validate schema/types without coercion, with extra format/JSON checks in strict mode. Dictionary outputs need application validators/hooks for BaseModel-specific citation operations. Run real-model regressions before switching output modes; offline tests establish contracts, not model quality.
 

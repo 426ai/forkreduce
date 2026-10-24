@@ -25,6 +25,7 @@ import json
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
+from functools import cache
 from typing import Any, Literal, TypeVar, cast
 
 from temporalio import activity, workflow
@@ -41,8 +42,7 @@ from temporalio.exceptions import (
 with workflow.unsafe.imports_passed_through():
     from collections.abc import Awaitable, Callable, Mapping
 
-    from pydantic import BaseModel, TypeAdapter
-    from pydantic import JsonValue as JSONValue
+    from pydantic import BaseModel, JsonValue, TypeAdapter
     from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
     from pydantic_ai.settings import ModelSettings, merge_model_settings
 
@@ -113,11 +113,11 @@ class InMemoryMessageStore:
 _SESSIONS: dict[str, Session] = {}
 _FINGERPRINTS: dict[str, str] = {}
 _STORE: Store | None = None
-_APP_META_ADAPTER = TypeAdapter(dict[str, JSONValue])
+_APP_META_ADAPTER = TypeAdapter(dict[str, JsonValue])
 _APP_META_MAX_BYTES = 16 * 1024
 
 
-def _app_meta_json(app_meta: Mapping[str, JSONValue]) -> str:
+def _app_meta_json(app_meta: Mapping[str, Any]) -> str:
     if not isinstance(app_meta, Mapping):
         raise ValueError("Frozen prefix app_meta must be a JSON object")
     validated = _APP_META_ADAPTER.validate_python(dict(app_meta), strict=True)
@@ -200,7 +200,7 @@ async def freeze_prefix(
     session: Session,
     store: Store,
     *,
-    app_meta: Mapping[str, JSONValue] | None = None,
+    app_meta: Mapping[str, Any] | None = None,
 ) -> str:
     """Persist a prefix without serializing the model or Python output classes.
 
@@ -217,7 +217,7 @@ async def freeze_prefix(
         tools_json=json.dumps(session.tool_specs),
         resolved_output_mode=session.resolved_output_mode,
         on_unforced_tools=session.on_unforced_tools,
-        app_meta=cast(dict[str, JSONValue], json.loads(_app_meta_json({} if app_meta is None else app_meta))),
+        app_meta=cast(dict[str, Any], json.loads(_app_meta_json({} if app_meta is None else app_meta))),
         output_feedback_retries=session.policy.output_feedback_retries,
         dynamic_outputs=session.dynamic_outputs,
     )
@@ -811,6 +811,7 @@ class MapQueriesInput:
     max_rounds: int = 1
     batch_workflow: str | None = None
     batch_index: int = 0
+    activity_name: str = "forkreduce.run_query"
 
 
 def activity_timeout_options(options: ActivityOptions | None) -> dict[str, Any]:
@@ -1025,7 +1026,12 @@ def _copy_result_meta(value: dict[str, Any]) -> dict[str, Any]:
 
 async def _query_pipeline(query: QueryActivityInput, config: MapQueriesInput) -> QueryActivityOutput:
     if config.after_query_activity is None:
-        return await execute_query(query, on_query_failure=config.on_query_failure, task_queue=config.task_queue)
+        return await execute_query(
+            query,
+            on_query_failure=config.on_query_failure,
+            task_queue=config.task_queue,
+            activity_name=config.activity_name,
+        )
     current = require_query_references(replace(query, round=0))
     root_id = query.query_id
     result_meta: dict[str, Any] | None = None
@@ -1042,6 +1048,7 @@ async def _query_pipeline(query: QueryActivityInput, config: MapQueriesInput) ->
             on_query_failure=config.on_query_failure,
             task_queue=config.task_queue,
             require_references=True,
+            activity_name=config.activity_name,
         )
         output = replace(output, result_meta=result_meta)
         try:
@@ -1192,3 +1199,94 @@ class MapQueriesWorkflow:
             )
         )
         return [*first, *(output for outputs in batches for output in outputs)]
+
+
+@dataclass(frozen=True)
+class TemporalNames:
+    """Serializable registration names; definitions are generated only on workers.
+
+    Only ``prefix`` is data. Register ``activities`` and ``workflows`` on a
+    worker, then start maps by ``map_workflow_name``. An empty prefix preserves
+    the original activity and workflow definitions exactly.
+    """
+
+    prefix: str = ""
+
+    @property
+    def activity_name(self) -> str:
+        return self.prefix + "forkreduce.run_query"
+
+    @property
+    def map_workflow_name(self) -> str:
+        return self.prefix + "forkreduce.map_queries"
+
+    @property
+    def batch_workflow_name(self) -> str:
+        return self.prefix + "forkreduce.query_batch"
+
+    @property
+    def activities(self) -> tuple[Callable[[QueryActivityInput], Awaitable[QueryActivityOutput]], ...]:
+        return (_temporal_definitions(self.prefix)[0],)
+
+    @property
+    def workflows(self) -> tuple[type[MapQueriesWorkflow], type[QueryBatchWorkflow]]:
+        definitions = _temporal_definitions(self.prefix)
+        return definitions[1], definitions[2]
+
+
+def forkreduce_temporal_names(*, prefix: str = "") -> TemporalNames:
+    """Choose a registration namespace without changing query or child IDs."""
+    return TemporalNames(prefix=prefix)
+
+
+@cache
+def _temporal_definitions(
+    prefix: str,
+) -> tuple[
+    Callable[[QueryActivityInput], Awaitable[QueryActivityOutput]],
+    type[MapQueriesWorkflow],
+    type[QueryBatchWorkflow],
+]:
+    if not prefix:
+        return run_query_activity, MapQueriesWorkflow, QueryBatchWorkflow
+    names = TemporalNames(prefix)
+
+    @activity.defn(name=names.activity_name)
+    async def named_activity(payload: QueryActivityInput) -> QueryActivityOutput:
+        return await execute_query_activity(payload)
+
+    class NamedMapQueriesWorkflow(MapQueriesWorkflow):
+        async def run(self, inputs: list[QueryActivityInput] | MapQueriesInput) -> list[QueryActivityOutput]:
+            config = MapQueriesInput(queries=inputs) if isinstance(inputs, list) else inputs
+            return await super().run(
+                replace(
+                    config,
+                    activity_name=names.activity_name,
+                    batch_workflow=(
+                        config.batch_workflow if config.batch_workflow is not None else names.batch_workflow_name
+                    ),
+                )
+            )
+
+    class NamedQueryBatchWorkflow(QueryBatchWorkflow):
+        async def run(self, inputs: MapQueriesInput) -> list[QueryActivityOutput]:
+            return await super().run(replace(inputs, activity_name=names.activity_name))
+
+    # Temporal's sandbox imports workflow classes by module and Python name.
+    # Export cached worker-local definitions for passthrough sandbox imports.
+    suffix = hashlib.sha256(prefix.encode("utf-8")).hexdigest()
+    NamedMapQueriesWorkflow.__name__ = f"_ForkReduceMapQueries_{suffix}"
+    NamedMapQueriesWorkflow.__qualname__ = NamedMapQueriesWorkflow.__name__
+    NamedMapQueriesWorkflow.run.__qualname__ = f"{NamedMapQueriesWorkflow.__name__}.run"
+    NamedQueryBatchWorkflow.__name__ = f"_ForkReduceQueryBatch_{suffix}"
+    NamedQueryBatchWorkflow.__qualname__ = NamedQueryBatchWorkflow.__name__
+    NamedQueryBatchWorkflow.run.__qualname__ = f"{NamedQueryBatchWorkflow.__name__}.run"
+    workflow.run(NamedMapQueriesWorkflow.run)
+    workflow.run(NamedQueryBatchWorkflow.run)
+    globals()[NamedMapQueriesWorkflow.__name__] = NamedMapQueriesWorkflow
+    globals()[NamedQueryBatchWorkflow.__name__] = NamedQueryBatchWorkflow
+    return (
+        named_activity,
+        workflow.defn(name=names.map_workflow_name)(NamedMapQueriesWorkflow),
+        workflow.defn(name=names.batch_workflow_name)(NamedQueryBatchWorkflow),
+    )

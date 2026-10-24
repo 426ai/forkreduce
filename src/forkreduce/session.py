@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from pydantic_ai import Agent, PromptedOutput, StructuredDict, ToolOutput, capture_run_messages
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
+from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RunUsage, UsageLimits
@@ -101,6 +102,7 @@ class Session:
         activity_options: ActivityOptions | None = None,
         output_validator: OutputValidator | None = None,
         dynamic_outputs: DynamicOutputs | None = None,
+        instrument: bool | InstrumentationSettings = False,
     ) -> None:
         self.model = model
         copied = cast(ModelSettings, dict(model_settings)) if model_settings else None
@@ -117,6 +119,7 @@ class Session:
         self.policy = policy
         self.activity_options = activity_options
         self.output_validator = output_validator
+        self.instrument = instrument
         self.warmup = warmup
         self.prefix_hash = prefix_hash_value
         self.tool_specs = tool_specs
@@ -134,6 +137,7 @@ class Session:
             output_feedback_retries=policy.output_feedback_retries,
             output_validator=output_validator,
             dynamic_outputs=dynamic_outputs,
+            instrument=instrument,
         )
 
     @property
@@ -386,6 +390,7 @@ class Session:
                 output_validator=validate_dynamic,
                 dynamic_outputs=self.dynamic_outputs,
                 dynamic_query=True,
+                instrument=self.instrument,
             )
             kwargs.pop("output_type", None)
         elif self.resolved_output_mode == "prompted" and self.output_validator is not None:
@@ -402,6 +407,7 @@ class Session:
                 output_feedback_retries=retries,
                 output_validator=self.output_validator,
                 dynamic_outputs=self.dynamic_outputs,
+                instrument=self.instrument,
             )
             kwargs.pop("output_type", None)
         usage = RunUsage()
@@ -594,6 +600,7 @@ def build(
     activity_options: ActivityOptions | None = None,
     output_validator: OutputValidator | None = None,
     dynamic_outputs: DynamicOutputs | None = None,
+    instrument: bool | InstrumentationSettings = False,
     meta_keys: Sequence[str] | None = None,
     meta_renderer: MetaRenderer | None = None,
 ) -> Session:
@@ -631,6 +638,10 @@ def build(
     Return the validated output, or raise ``pydantic_ai.ModelRetry`` to send its
     error back on this branch when ``policy.output_feedback_retries`` is enabled.
     The callback is never serialized and does not affect the frozen prefix.
+
+    ``instrument`` is a worker-local Pydantic AI instrumentation setting, off by
+    default even when a global agent default is enabled. It applies to ordinary,
+    feedback and dynamic agents without changing hashes or execution fingerprints.
     """
     if dynamic_outputs not in (None, "generic_tool", "prompted"):
         raise ForkReduceError("dynamic_outputs must be 'generic_tool', 'prompted', or None")
@@ -700,6 +711,7 @@ def build(
         activity_options=activity_options,
         output_validator=output_validator,
         dynamic_outputs=dynamic_outputs,
+        instrument=instrument,
     )
     notice = prefix_context_warning(
         chosen,
@@ -722,6 +734,7 @@ def _build_agent(
     output_validator: OutputValidator | None = None,
     dynamic_outputs: DynamicOutputs | None = None,
     dynamic_query: bool = False,
+    instrument: bool | InstrumentationSettings = False,
 ) -> Agent[None, Any]:
     if output_mode == "tools":
         # Native retries are opt-in; the default still raises after one payload.
@@ -754,6 +767,7 @@ def _build_agent(
         retries=output_feedback_retries,
         name="forkreduce",
     )
+    agent.instrument = instrument
     if output_validator is not None:
         agent.output_validator(output_validator)
     return agent

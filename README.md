@@ -636,6 +636,59 @@ When configured, one periodic heartbeat task covers the entire asynchronous quer
 
 Registration is process-local. Payloads carry hashes, tails, output names, options, and optional per-query `model_settings`, never model instances or Python classes. Conflicting model/request-body settings/profile/policy registrations raise `ForkReduceError`; unregister before replacement. `timeout`/`extra_headers` remain outside the fingerprint. Settings must be JSON-serializable. `activity_id(prefix_hash, query_id)` remains `forkreduce:{prefix_hash}:{query_id}`. Inline single-workflow continuations still accept the previous `messages_json` as `history_json`.
 
+#### Coexisting with Pydantic AI TemporalDurability / PydanticAIPlugin
+
+forkreduce runs its own worker-local Agent inside query activities; it does not route those model calls through `TemporalDurability`. Both execution paths can coexist on the same worker and queue. Build the model in the session factory using your application's resolver (or a `TestModel` / `FunctionModel` for offline work), and pass `instrument=False`, `True`, or `InstrumentationSettings` to `build`. The default is explicitly off, even if an application has set a global Agent instrumentation default. Settings apply to static, feedback and dynamic per-query agents, are never serialized in workflows/snapshots, and change neither hashes nor execution fingerprints. Configure an application-owned OpenTelemetry provider/exporter when collecting spans; `include_content=False` avoids prompt/result text in traces.
+
+For a shared worker, retain the client-side `PydanticAIPlugin` and do not install it again on the worker. The existing `client`, `payloads`, and worker-local `restore` factory are application setup; the full integration recipe below shows factory/store setup. A synthetic official workflow can be registered alongside namespaced forkreduce definitions:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai.durable_exec.temporal import PydanticAIWorkflow, TemporalDurability
+from pydantic_ai.models.instrumented import InstrumentationSettings
+from pydantic_ai.models.test import TestModel
+from temporalio import workflow
+from temporalio.worker import Worker
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
+from forkreduce.contrib.temporal import (
+    QueryActivityOutput, forkreduce_temporal_names, set_default_session_factory,
+)
+
+instrumentation = InstrumentationSettings(include_content=False)
+official_agent = Agent(
+    TestModel(custom_output_args={"text": "offline"}), output_type=Answer,
+    name="official-example", capabilities=[TemporalDurability()],
+)
+official_agent.instrument = instrumentation
+
+@workflow.defn
+class OfficialQueryWorkflow(PydanticAIWorkflow):
+    __pydantic_ai_agents__ = [official_agent]
+
+    @workflow.run
+    async def run(self, question: str) -> str:
+        return (await official_agent.run(question)).output.text
+
+set_default_session_factory(restore)  # restore builds with instrument=instrumentation
+names = forkreduce_temporal_names(prefix="app.")
+runner = SandboxedWorkflowRunner(
+    restrictions=SandboxRestrictions.default.with_passthrough_modules("forkreduce", "pydantic_ai")
+)
+async with Worker(
+    client, task_queue="shared-models", workflow_runner=runner,
+    workflows=[*names.workflows, OfficialQueryWorkflow], activities=list(names.activities),
+):
+    official_text = await client.execute_workflow(
+        OfficialQueryWorkflow.run, "Synthetic question.", id="official-example", task_queue="shared-models",
+    )
+    results = await client.execute_workflow(
+        names.map_workflow_name, MapQueriesInput(queries=payloads),
+        id="fork-example", task_queue="shared-models", result_type=list[QueryActivityOutput],
+    )
+```
+
+`TemporalNames(prefix="app.")` stores only the prefix as serializable data; `activities` / `workflows` are cached worker-local definitions. Names become `app.forkreduce.run_query`, `app.forkreduce.map_queries`, and `app.forkreduce.query_batch`. Empty prefixes return the original definitions. Namespacing preserves sandboxing, child/query IDs, hashes, custom batch choices and application hook names. Use the same documented passthrough sandbox runner for registration and replay. Custom workflows can pass `MapQueriesInput.activity_name` to `execute_query` when using these definitions.
+
 #### Bounded batches and references
 
 `MapQueriesInput(queries=payloads, batch_size=15, child_concurrency=4)` runs bounded child workflows; register **both** `MapQueriesWorkflow` and `QueryBatchWorkflow`. Results preserve input order. Child IDs derive from the parent workflow ID, prefix hash, and batch index. They stay stable on replay and workflow retries that change the run ID; distinct parent workflow IDs do not collide. This is orchestration identity, not exactly-once provider billing.
@@ -682,6 +735,7 @@ class AppBatch:
             result = await execute_query(
                 query, config.activity_options, on_query_failure=config.on_query_failure,
                 task_queue=config.task_queue, require_references=True,
+                activity_name=config.activity_name,
             )
             validate_query_references(result)
             results.append(result)

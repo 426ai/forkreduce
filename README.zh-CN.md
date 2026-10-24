@@ -636,6 +636,59 @@ Temporal 默认 converter 和 `PydanticAIPlugin` 安装的 `PydanticAIPayloadCon
 
 登记仅对本进程有效。payload 只带哈希、问题尾巴、输出类型名、选项和可选单题 `model_settings`，不带模型实例或 Python 类。相同前缀登记不同模型/请求体设置/profile/policy 会抛出 `ForkReduceError`，替换前先 unregister。`timeout`/`extra_headers` 仍不计入指纹；设置必须能 JSON 序列化。`activity_id(prefix_hash, query_id)` 仍是 `forkreduce:{prefix_hash}:{query_id}`。单工作流内联续问仍可把前次 `messages_json` 传入 `history_json`。
 
+#### 与 Pydantic AI TemporalDurability / PydanticAIPlugin 在同一 worker 共存
+
+forkreduce 在 query activity 中运行自己的 worker 本地 Agent，不会把这些模型调用转交给 `TemporalDurability`；两条路径可以同 worker、同队列共存。在 session factory 中使用应用自己的模型解析器构建模型，离线可换 `TestModel` / `FunctionModel`，并向 `build` 传 `instrument=False`、`True` 或 `InstrumentationSettings`。默认明确关闭，即使应用开启了 Agent 全局观测默认值。配置适用于静态、feedback 和动态逐题 agent，不序列化到 workflow/快照，不影响 hash 或 execution fingerprint。采集 span 时由应用配置 OpenTelemetry provider/exporter；`include_content=False` 避免记录提示/结果正文。
+
+共享 worker 继承 client 上的 `PydanticAIPlugin`，不要重复安装 worker plugin。`client`、`payloads` 与 worker 本地 `restore` factory 来自应用配置；下面完整接入示例展示 factory/store 设置。合成的官方 workflow 可与带前缀的 forkreduce 定义一起注册：
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai.durable_exec.temporal import PydanticAIWorkflow, TemporalDurability
+from pydantic_ai.models.instrumented import InstrumentationSettings
+from pydantic_ai.models.test import TestModel
+from temporalio import workflow
+from temporalio.worker import Worker
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
+from forkreduce.contrib.temporal import (
+    QueryActivityOutput, forkreduce_temporal_names, set_default_session_factory,
+)
+
+instrumentation = InstrumentationSettings(include_content=False)
+official_agent = Agent(
+    TestModel(custom_output_args={"text": "offline"}), output_type=Answer,
+    name="official-example", capabilities=[TemporalDurability()],
+)
+official_agent.instrument = instrumentation
+
+@workflow.defn
+class OfficialQueryWorkflow(PydanticAIWorkflow):
+    __pydantic_ai_agents__ = [official_agent]
+
+    @workflow.run
+    async def run(self, question: str) -> str:
+        return (await official_agent.run(question)).output.text
+
+set_default_session_factory(restore)  # restore 在 build 中传 instrument=instrumentation
+names = forkreduce_temporal_names(prefix="app.")
+runner = SandboxedWorkflowRunner(
+    restrictions=SandboxRestrictions.default.with_passthrough_modules("forkreduce", "pydantic_ai")
+)
+async with Worker(
+    client, task_queue="shared-models", workflow_runner=runner,
+    workflows=[*names.workflows, OfficialQueryWorkflow], activities=list(names.activities),
+):
+    official_text = await client.execute_workflow(
+        OfficialQueryWorkflow.run, "Synthetic question.", id="official-example", task_queue="shared-models",
+    )
+    results = await client.execute_workflow(
+        names.map_workflow_name, MapQueriesInput(queries=payloads),
+        id="fork-example", task_queue="shared-models", result_type=list[QueryActivityOutput],
+    )
+```
+
+`TemporalNames(prefix="app.")` 仅把 prefix 当作可序列化数据；`activities` / `workflows` 是缓存的 worker 本地定义。名称变为 `app.forkreduce.run_query`、`app.forkreduce.map_queries`、`app.forkreduce.query_batch`；空前缀返回原定义。命名前缀不关闭 sandbox，不改变 child/query ID、hash、自定义 batch 选择或应用钩子名。注册和 replay 使用相同的已说明 passthrough runner；自定义 workflow 可把 `MapQueriesInput.activity_name` 传给 `execute_query`。
+
 #### 有界子工作流与引用传递
 
 `MapQueriesInput(queries=payloads, batch_size=15, child_concurrency=4)` 启用有界子工作流；worker 必须同时登记 `MapQueriesWorkflow` 与 `QueryBatchWorkflow`。结果保持输入顺序。child ID 从父 workflow ID、prefix hash、batch index 推导，重放以及改变 run ID 的 workflow 重试均保持稳定；不同父 workflow ID 不碰撞。它不是供应商计费的 exactly-once 保证。
@@ -682,6 +735,7 @@ class AppBatch:
             result = await execute_query(
                 query, config.activity_options, on_query_failure=config.on_query_failure,
                 task_queue=config.task_queue, require_references=True,
+                activity_name=config.activity_name,
             )
             validate_query_references(result)
             results.append(result)
