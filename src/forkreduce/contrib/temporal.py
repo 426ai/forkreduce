@@ -40,10 +40,11 @@ with workflow.unsafe.imports_passed_through():
     from forkreduce.errors import ForkReduceError
     from forkreduce.failures import Failure
     from forkreduce.models import canonical_value, request_body_settings
+    from forkreduce.output_modes import OutputMode, ResolvedOutputMode, UnforcedToolsPolicy
     from forkreduce.policy import Policy
     from forkreduce.prefix import prefix_hash as compute_prefix_hash
     from forkreduce.query import Query
-    from forkreduce.session import OutputMode, Session
+    from forkreduce.session import Session
     from forkreduce.temporal_options import ActivityOptions
 
 
@@ -104,6 +105,8 @@ class FrozenPrefix:
     rendered_documents: str
     output_mode: OutputMode
     tools_json: str
+    resolved_output_mode: ResolvedOutputMode | None = None
+    on_unforced_tools: UnforcedToolsPolicy = "warn"
 
     @property
     def documents(self) -> list[Document]:
@@ -112,8 +115,17 @@ class FrozenPrefix:
 
     def validate(self) -> None:
         """Reject corrupt snapshots before invoking a worker factory."""
+        resolved = self.resolved_output_mode
+        if resolved is None:
+            if self.output_mode not in {"tools", "prompted"}:
+                raise ValueError("An auto snapshot must record its resolved_output_mode")
+            resolved = self.output_mode
+        if resolved not in {"tools", "prompted"}:
+            raise ValueError("Invalid resolved_output_mode in frozen prefix")
+        if self.output_mode not in {"auto", resolved}:
+            raise ValueError("Frozen requested and resolved output modes conflict")
         actual = compute_prefix_hash(
-            output_mode=self.output_mode,
+            output_mode=resolved,
             instructions=self.instructions,
             rendered_documents=self.rendered_documents,
             tools=json.loads(self.tools_json),
@@ -138,6 +150,8 @@ async def freeze_prefix(session: Session, store: PrefixStore) -> str:
         rendered_documents=session.rendered_documents,
         output_mode=session.output_mode,
         tools_json=json.dumps(session.tool_specs),
+        resolved_output_mode=session.resolved_output_mode,
+        on_unforced_tools=session.on_unforced_tools,
     )
     snapshot.validate()
     return await store.put(f"prefix:{session.prefix_hash}", json.dumps(asdict(snapshot)).encode())
@@ -190,6 +204,8 @@ def execution_fingerprint(session: Session) -> str:
         "model_settings": canonical_value(request_body_settings(merged_settings)),
         "model_profile": canonical_value(getattr(model, "profile", None)),
         "output_mode": session.output_mode,
+        "resolved_output_mode": session.resolved_output_mode,
+        "on_unforced_tools": session.on_unforced_tools,
         "warmup": session.warmup,
         "concurrency": policy.concurrency,
         "retries": policy.retries,
@@ -379,6 +395,7 @@ class QueryActivityOutput:
     messages_ref: str | None = None
     messages_json: str | None = None
     output_ref: str | None = None
+    resolved_output_mode: ResolvedOutputMode | None = None
 
 
 def _permanent(message: str) -> ApplicationError:
@@ -411,7 +428,7 @@ async def _resolve_session(payload: QueryActivityInput) -> Session:
         if not isinstance(session, Session):
             raise TypeError("Session factory must return a Session")
         actual = compute_prefix_hash(
-            output_mode=session.output_mode,
+            output_mode=session.resolved_output_mode,
             instructions=session.instructions,
             rendered_documents=session.rendered_documents,
             tools=session.tool_specs,
@@ -490,9 +507,14 @@ async def execute_query_activity(payload: QueryActivityInput) -> QueryActivityOu
         round=payload.round,
         model_settings=query_settings,
     )
-    session.prepare_query(query)
-    options = payload.activity_options
-    result = await heartbeat_while(session.run_once(query), options.heartbeat_timeout if options is not None else None)
+    try:
+        session.prepare_query(query)
+        options = payload.activity_options
+        result = await heartbeat_while(
+            session.run_once(query), options.heartbeat_timeout if options is not None else None
+        )
+    except ForkReduceError as exc:
+        raise _permanent(str(exc)) from exc
     if result.failure is not None:
         raise to_application_error(result.failure)
     dumped = ModelMessagesTypeAdapter.dump_json(result.messages)
@@ -521,6 +543,7 @@ async def execute_query_activity(payload: QueryActivityInput) -> QueryActivityOu
         messages_ref=messages_ref,
         messages_json=messages_json,
         output_ref=output_ref,
+        resolved_output_mode=result.resolved_output_mode,
     )
 
 

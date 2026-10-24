@@ -144,15 +144,15 @@ async def test_map_queries_converter_and_replay(plugin: bool, model_kind: str) -
 
 
 @pytest.mark.parametrize("plugin", [False, True])
-async def test_batched_references_bound_history_and_heartbeat(plugin: bool) -> None:
+async def test_batched_references_bound_history_and_options(plugin: bool) -> None:
     document = "Synthetic frozen evidence. " * 80_000
     seen_attempts: list[int] = []
 
     async def handler(messages, info, _n):  # type: ignore[no-untyped-def]
         assert document in user_text(messages)
         seen_attempts.append(activity.info().attempt)
-        # Longer than heartbeat_timeout: no heartbeat would cause a retry/failure.
-        await asyncio.sleep(0.65)
+        # Yield provider I/O so child overlap is exercised without a CPU-size deadline.
+        await asyncio.sleep(0.01)
         return tool_result(info, "RuntimeAnswer", {"text": "stored result"})
 
     model = Scripted(handler).model()
@@ -210,7 +210,7 @@ async def test_batched_references_bound_history_and_heartbeat(plugin: bool) -> N
                     ],
                     batch_size=2,
                     child_concurrency=2,
-                    activity_options=ActivityOptions(start_to_close=10, heartbeat_timeout=0.2, maximum_attempts=1),
+                    activity_options=ActivityOptions(start_to_close=10, maximum_attempts=1),
                 )
                 handle = await env.client.start_workflow(
                     MapQueriesWorkflow.run, payload, id=f"batch-{uuid4()}", task_queue=queue
@@ -246,7 +246,6 @@ async def test_batched_references_bound_history_and_heartbeat(plugin: bool) -> N
                     for event in child_history.events:
                         if event.HasField("activity_task_scheduled_event_attributes"):
                             attrs = event.activity_task_scheduled_event_attributes
-                            assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(milliseconds=200)
                             assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
                             assert attrs.retry_policy.maximum_attempts == 1
                             assert all(len(p.data) < 16 * 1024 for p in attrs.input.payloads)
@@ -319,5 +318,140 @@ async def test_recipe_enforces_two_total_attempts() -> None:
                 assert scheduled[0].retry_policy.initial_interval.ToTimedelta() == timedelta(milliseconds=10)
                 assert scheduled[0].retry_policy.maximum_interval.ToTimedelta() == timedelta(milliseconds=50)
                 assert scheduled[0].retry_policy.backoff_coefficient == 3
+    finally:
+        unregister_session(prefix)
+
+
+@pytest.mark.parametrize("plugin", [False, True])
+@pytest.mark.parametrize("forced", [False, True])
+async def test_auto_snapshot_mode_survives_plugin_children_and_replay(plugin: bool, forced: bool) -> None:
+    model = TestModel(
+        custom_output_args={"text": "auto restored"} if forced else None,
+        custom_output_text=None if forced else '{"text":"auto restored"}',
+        profile={"supports_forced_tool_choice": forced},
+    )
+    session = build(
+        model,
+        documents="Auto mode frozen evidence.",
+        instructions="Answer from evidence.",
+        outputs=[RuntimeAnswer],
+        on_unforced_tools="error",
+    )
+    expected = "tools" if forced else "prompted"
+    store = InMemoryMessageStore()
+    ref = await freeze_prefix(session, store)
+
+    def restore(frozen):  # type: ignore[no-untyped-def]
+        assert frozen.resolved_output_mode == expected
+        return build(
+            model,
+            documents=frozen.documents,
+            instructions=frozen.instructions,
+            outputs=[RuntimeAnswer],
+            output_mode=frozen.output_mode,
+            on_unforced_tools=frozen.on_unforced_tools,
+        )
+
+    register_session_factory(session.prefix_hash, restore)
+    set_prefix_store(store)
+    set_message_store(store)
+    plugins = [PydanticAIPlugin()] if plugin else []
+    runner = sandbox_runner()
+    try:
+        async with await WorkflowEnvironment.start_time_skipping(plugins=plugins, **server_options()) as env:
+            queue = f"forkreduce-auto-{uuid4()}"
+            async with Worker(
+                env.client,
+                task_queue=queue,
+                workflows=[MapQueriesWorkflow, QueryBatchWorkflow],
+                activities=[run_query_activity],
+                workflow_runner=runner,
+            ):
+                handle = await env.client.start_workflow(
+                    MapQueriesWorkflow.run,
+                    MapQueriesInput(
+                        queries=[
+                            query_activity_input(
+                                session,
+                                query_id="q1",
+                                tail="Question",
+                                output_name="RuntimeAnswer",
+                                prefix_ref=ref,
+                            )
+                        ],
+                        batch_size=1,
+                        child_concurrency=1,
+                    ),
+                    id=f"auto-{uuid4()}",
+                    task_queue=queue,
+                )
+                results = await asyncio.wait_for(handle.result(), timeout=30)
+                assert results[0].resolved_output_mode == expected
+                assert results[0].output_ref and results[0].output_json is None
+                assert json.loads(await store.get(results[0].output_ref)) == {"text": "auto restored"}
+                history = await handle.fetch_history()
+                child_id = next(
+                    e.start_child_workflow_execution_initiated_event_attributes.workflow_id
+                    for e in history.events
+                    if e.HasField("start_child_workflow_execution_initiated_event_attributes")
+                )
+                child_history = await env.client.get_workflow_handle(child_id).fetch_history()
+            replayer = Replayer(
+                workflows=[MapQueriesWorkflow, QueryBatchWorkflow],
+                plugins=plugins,
+                workflow_runner=runner,
+            )
+            await replayer.replay_workflow(history)
+            await replayer.replay_workflow(child_history)
+    finally:
+        unregister_session(session.prefix_hash)
+        set_prefix_store(None)
+        set_message_store(None)
+
+
+@pytest.mark.parametrize("plugin", [False, True])
+async def test_periodic_heartbeat_protects_awaiting_provider(plugin: bool) -> None:
+    attempts = []
+
+    async def handler(_messages, info, _n):  # type: ignore[no-untyped-def]
+        attempts.append(activity.info().attempt)
+        # Test liveness independently of large-document CPU hydration.
+        await asyncio.sleep(0.65)
+        return tool_result(info, "RuntimeAnswer", {"text": "heartbeat survived"})
+
+    session = build(
+        Scripted(handler).model(),
+        documents="Small frozen evidence.",
+        instructions="Answer.",
+        outputs=[RuntimeAnswer],
+        activity_options=ActivityOptions(start_to_close=10, heartbeat_timeout=0.2, maximum_attempts=1),
+    )
+    prefix = register_session(session)
+    plugins = [PydanticAIPlugin()] if plugin else []
+    try:
+        async with await WorkflowEnvironment.start_time_skipping(plugins=plugins, **server_options()) as env:
+            queue = f"forkreduce-heartbeat-{uuid4()}"
+            async with Worker(
+                env.client,
+                task_queue=queue,
+                workflows=[MapQueriesWorkflow],
+                activities=[run_query_activity],
+                workflow_runner=sandbox_runner(),
+                max_heartbeat_throttle_interval=timedelta(milliseconds=40),
+                default_heartbeat_throttle_interval=timedelta(milliseconds=40),
+            ):
+                results = await env.client.execute_workflow(
+                    MapQueriesWorkflow.run,
+                    [
+                        query_activity_input(
+                            session, query_id="q", tail="Wait for provider", output_name="RuntimeAnswer"
+                        )
+                    ],
+                    id=f"heartbeat-{uuid4()}",
+                    task_queue=queue,
+                    execution_timeout=timedelta(seconds=30),
+                )
+                assert attempts == [1]
+                assert json.loads(results[0].output_json) == {"text": "heartbeat survived"}
     finally:
         unregister_session(prefix)

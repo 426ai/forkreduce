@@ -244,7 +244,7 @@ session = build(
     documents=notice,               # str、字符串序列、Block、Document，或它们的序列
     instructions="...",
     outputs=[Answer, FindingList],  # 互不相同的 BaseModel 子类；工具名是类名
-    output_mode="tools",            # 或 "prompted"
+    output_mode="auto",             # 默认；也可显式指定 "tools" / "prompted"
     policy=Policy(concurrency=8, retries=2),
     warmup=True,
     executor=None,                  # 默认 LocalExecutor(policy)
@@ -252,11 +252,35 @@ session = build(
 )
 ```
 
-`session.prefix_hash` 是一份规范 JSON 的 SHA-256：版本、输出模式、说明、清洗后的文档，以及每个工具的名称、描述和 schema。同样的内容重建 session，哈希不变。改工具 schema、说明或文档正文，哈希就会变。
+`session.prefix_hash` 是规范 JSON 的 SHA-256：版本、**实际解析的**输出模式、说明、清洗后的文档，以及工具名称、描述和 schema。相同内容重建 hash 不变；修改 schema、说明或文档会改变 hash。算法未改变：默认 `"auto"` 解析为 tools 保留旧 tools hash，解析为 prompted 则改变旧默认 hash；显式 tools/prompted hash 稳定，hash 中没有 `"auto"` 标记。
 
-如果 OpenAI 兼容网关忽略必选的 `tool_choice`，只返回 JSON 文本而不调用输出工具，请显式选择 `output_mode="prompted"`。该模式仍按同一个已注册的 Pydantic 输出类型解析 JSON；tools 模式不会悄悄接受文本，也不会自动切换模式。切换输出模式会改变 session 身份。即使使用 prompted 模式，已注册 schema 仍参与 `prefix_hash`，只是 schema 的 JSON 只放在查询尾部，不在供应商共享的提示前缀里。
+`build()` 默认 `output_mode="auto"`：解析后的 profile 和有效设置支持**强制输出工具调用**才选 tools，否则选 prompted JSON，仍按同一已注册 Pydantic 类型校验。`session.output_mode` 保留请求模式（`"auto"`、`"tools"`、`"prompted"`），`session.resolved_output_mode` 记录实际 `"tools"` 或 `"prompted"`。真实 `QueryResult`（包括失败、合并后的 reduce 结果）均记录 `resolved_output_mode`；`None` 仅是旧数据/手动构造默认值。这是在 build 时选择能力，不是请求失败后的回退。tools 不会悄悄接受文本或在响应后切换模式。prompted 下 schema 仍参与 hash，但 schema JSON 只放在查询尾部，不在共享提示前缀里。
+
+显式模式被保留。显式 tools 缺少有效强制调用能力时默认发出 `UnforcedToolsWarning`；`on_unforced_tools="error"` 抛出 `UnforcedToolsError`，`"ignore"` 关闭诊断，都不会增加供应商能力。策略适用于 build 及查询设置改变能力时。auto session 的 `Query.model_settings` 若会切换实际模式，在预留预算或供应商调用前抛出 `OutputModeConflictError`；请用这些设置新建 session。模型默认值、build 设置、查询覆盖依次浅合并；查询 `extra_body` 整体替换 session 值。
+
+限制可能来自**模型/供应商 API**，尤其 thinking 模式，而不是网关。[MiMo API 文档](https://mimo.mi.com/docs/en-US/api/chat/openai-api) 说明非 `auto` 的 `tool_choice` 被移除，仍按 `auto` 执行；[DeepSeek issue #1376](https://github.com/deepseek-ai/DeepSeek-V3/issues/1376) 报告 thinking 开启时强制调用返回 HTTP 400。[Pydantic AI PR #7450](https://github.com/pydantic/pydantic-ai/pull/7450) 说明按请求判断及隐式降级为 `auto`。不能据此推断所有模型/端点相同；自定义端点应配置准确 profile，`supports_tools=True` 不保证强制输出。
+
+Pydantic AI 2.61 的以下公共 `ModelProfile` 字段均存在：
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `supports_tools` | `True` | 能否使用工具。 |
+| `supports_forced_tool_choice` | `True` | 支持 required/指定名称强制调用；false 时 SDK 隐式强制可降为 auto，显式强制抛 SDK `UserError`。 |
+| `supports_forced_tool_choice_with_thinking` | `True` | thinking 时是否支持强制调用。 |
+| `thinking_enabled_by_default` | `False` | 无覆盖设置时默认 thinking，不表示不能关闭。 |
+| `supports_thinking` | `False` | 支持统一 thinking 配置；false 时 SDK 忽略统一 `thinking`。 |
+| `thinking_always_enabled` | `False` | thinking 不可关闭，蕴含 thinking 支持；`thinking=False` 只选最低可接受 effort。 |
+| `forced_tool_choice_disables_thinking` | `False` | 强制调用会禁用 thinking；thinking 活跃时 SDK 避免隐式强制输出工具调用。 |
+
+`default_structured_output_mode="tool"` 是 SDK 偏好，不是能力保证；forkreduce 的 auto 只选 tools/prompted，不选 native 结构化输出。
+
+实际规则：须同时支持 tools 和强制调用；thinking 活跃时还须 `supports_forced_tool_choice_with_thinking=True` 且 `forced_tool_choice_disables_thinking=False`。`thinking_always_enabled` 始终优先。供应商控制优先于统一 `thinking`：`openai_reasoning_effort` / `extra_body.reasoning_effort`（none 关闭）；`anthropic_thinking.type` / `extra_body.thinking.type`（enabled/adaptive 开启、disabled 关闭）；布尔 `extra_body.chat_template_kwargs.enable_thinking`（也支持顶层 `chat_template_kwargs`）；`google_thinking_config.thinking_budget`（0 关闭，其余包括 -1 开启）或 `thinking_level`（minimal/low/medium/high 均开启）。冲突时保守视为开启。否则仅在 `supports_thinking=True` 时采纳统一设置，再回退 `thinking_enabled_by_default`。未知的非 `None` thinking/reasoning 形状设置（包括已知控制的无效格式）在 auto 下抛出错误码为 `unknown_thinking_control` 的 `ForkReduceError`；显式 tools 视为无法保证强制调用并应用诊断策略，显式 prompted 保持有效。仅控制显示的 `include_thoughts`、`openai_reasoning_summary`、`openai_reasoning_generate_summary` 不开启 thinking。不按模型名猜测。
+
+只有 thinking 可能改变强制调用能力时才检查这些控制：不支持 tools 或强制调用时，auto 直接选 prompted；支持 thinking 下强制调用且不会禁用 thinking 时，直接选 tools。这些无条件 profile 不会因无关的未知 thinking 控制报错；上述未知控制错误和显式 tools 的保守诊断仅适用于条件性 profile。
 
 给推理模型留足输出余量：供应商的 completion 上限可能同时计算推理 token 和可见答案。`max_tokens` 太小，可能还没生成任何 JSON 或工具参数就已经耗尽。可以给 `build()` 传 `model_settings={"max_tokens": 8192}`，或给 `openai_compatible_model()` 传 `max_tokens=8192`，再按工作负载和供应商调整；8,192 只是示例，不保证不会截断，也不是账单上限。不要未经核实就假设网关支持 reasoning-effort 控制。
+
+[MiMo 深度思考指南](https://mimo.mi.com/docs/en-US/quick-start/usage-guide/text-generation/deep-thinking) 说明其列出的 thinking 模型忽略请求的 `temperature`/`top_p`，固定使用 `1.0`/`0.95`；即使请求 `temperature=0` 也不能保证确定性输出。
 
 `documents` 可以是一个字符串（单个块，id 为 `b1`）、一串字符串（`b1`、`b2`……），或 `Block` / `Document`。渲染和哈希之前会去掉控制字符。渲染结果以单独一行 `===END_FIXED_DOCUMENTS===` 结束。
 
@@ -596,6 +620,7 @@ def restore(frozen):
     return build(
         model, documents=frozen.documents, instructions=frozen.instructions,
         outputs=[Answer], output_mode=frozen.output_mode,
+        on_unforced_tools=frozen.on_unforced_tools,
     )
 
 set_prefix_store(store)
@@ -612,6 +637,7 @@ answer = Answer.model_validate_json(await store.get(results[0].output_ref))
 ```
 
 `FrozenPrefix` 存文档、说明、渲染前缀与工具身份，不序列化可执行模型/schema 类。worker 会校验重建后的 prefix hash；须保持 schema/渲染配置一致。worker 启动时登记 factory，引用对象保留到重试/续问生命周期结束。最终结果与引用应持久化，已结束 workflow 的实时流不能当归档重放接口。编排存在不兼容变更时，排空在途执行或使用 worker versioning/新队列，并重放实际迁移所需历史；converter 测试不保证任意旧工作流代码在编排变更后仍能重放。
+`FrozenPrefix.output_mode` 保留请求模式（包括 auto），`resolved_output_mode` 记录实际模式（旧快照可为 `None`），`on_unforced_tools` 保留诊断策略。factory 按上例恢复请求模式和策略，还须恢复相同 thinking 相关模型/session 设置。worker 校验实际模式及 prefix hash；能力或设置改变必须失败，不得悄悄恢复不同输出约定。模型/设置由 factory 管理，不将含传输凭据的设置序列化进快照。
 factory 默认每个 activity attempt 调用一次，避免无意中跨工作流共享可变 session 预算。需要 worker 内复用时，factory 可返回应用显式管理的缓存 session，或调用 `register_session`；缓存同步、生命周期与预算范围由应用负责。
 
 
@@ -627,9 +653,9 @@ factory 默认每个 activity attempt 调用一次，避免无意中跨工作流
 
 **历史。** 延续分支时，除了前缀，还会带上之前的问答。只要这些字节不变，前缀缓存（含之前的轮次）同样可以命中。时间戳和 run id 不参与前缀检查；检查比较的是渲染后的文档正文。
 
-**Prompted 模式。** `output_mode="prompted"` 不往 Agent 上挂工具。期望类型的 schema 只追加在尾巴上，因此不同查询可以用不同的已注册类型，而不会打掉前缀。所有调用共享同一份工具列表时，tools 模式的缓存更稳，所以默认是 `"tools"`。
+**Prompted 模式。** 实际解析为 prompted 的 session 不往 Agent 上挂工具。期望 schema 只追加在尾巴，不同查询可用不同已注册类型而不打掉前缀。tools 模式保持稳定工具列表；默认 auto 只在支持强制输出工具调用时选择它。
 
-**采样和传输。** `temperature`、`top_p`、`max_tokens`、`seed`、惩罚项、`stop_sequences`、`timeout` 和 `extra_headers` 不改变冻结前缀，因此不会打掉供应商的前缀缓存。`extra_body` 也不改变这些字节。采样参数和 `extra_body` 会改变 JSON 请求体，所以 Temporal 把不同的值当成不同的执行，`register_session` 会拒绝。`timeout` 和 `extra_headers` 属于传输选项，不进入这份指纹。
+**采样和传输。** `temperature`、`top_p`、`max_tokens`、`seed`、惩罚项、`stop_sequences`、`timeout` 和 `extra_headers` 不改变冻结前缀，不会打掉供应商前缀缓存。`extra_body` 本身也不改变这些字节，但 thinking 设置可能在 build 时改变 auto 实际模式（从而改变 hash），查询覆盖不能切换模式。采样参数和 `extra_body` 会改变 JSON 请求体，Temporal 因此视不同值为不同执行，`register_session` 会拒绝。`timeout` 和 `extra_headers` 是传输选项，不进入该指纹。
 
 **Profile 和块 meta。** 模型 `profile` 可能改变工具或 schema 在线路上的渲染方式。即便 `prefix_hash` 没变，供应商缓存仍可能 miss，所以解析后的 profile 会计入执行指纹。`Block.meta` 默认不渲染，除非传入 `meta_keys` 或 `meta_renderer`。一旦启用，meta 会写进文档正文，`prefix_hash` 和被缓存的前缀都会变。
 

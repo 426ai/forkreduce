@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel
+from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.test import TestModel
 from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
 from tests.support import Scripted, tool_result, user_text
@@ -310,3 +312,105 @@ async def test_batch_rejects_inline_history_and_activity_results(monkeypatch):  
     with pytest.raises(ApplicationError, match="references") as caught:
         await adapter.QueryBatchWorkflow().run(adapter.MapQueriesInput(queries=[replace(query, history_json=None)]))
     assert caught.value.non_retryable
+
+
+@pytest.mark.parametrize("forced", [False, True])
+async def test_auto_prefix_restores_resolved_mode_and_result_metadata(forced: bool) -> None:
+    model = TestModel(
+        custom_output_args={"text": "restored"} if forced else None,
+        custom_output_text=None if forced else '{"text":"restored"}',
+        profile={"supports_forced_tool_choice": forced},
+    )
+    session = build(
+        model,
+        documents="frozen auto document",
+        instructions="Use the evidence.",
+        outputs=[FeatureAnswer],
+        on_unforced_tools="error",
+    )
+    store = adapter.InMemoryMessageStore()
+    ref = await adapter.freeze_prefix(session, store)
+    snapshot = adapter.FrozenPrefix(**json.loads(await store.get(ref)))
+    expected = "tools" if forced else "prompted"
+    assert snapshot.output_mode == "auto" and snapshot.resolved_output_mode == expected
+    snapshot.validate()
+
+    def restore(frozen):  # type: ignore[no-untyped-def]
+        return build(
+            model,
+            documents=frozen.documents,
+            instructions=frozen.instructions,
+            outputs=[FeatureAnswer],
+            output_mode=frozen.output_mode,
+            on_unforced_tools=frozen.on_unforced_tools,
+        )
+
+    adapter.register_session_factory(session.prefix_hash, restore)
+    adapter.set_prefix_store(store)
+    result = await adapter.execute_query_activity(payload_for(session, prefix_ref=ref))
+    assert json.loads(result.output_json) == {"text": "restored"}
+    assert result.resolved_output_mode == expected
+    fingerprint = json.loads(adapter.execution_fingerprint(restore(snapshot)))
+    assert fingerprint["resolved_output_mode"] == expected
+    assert fingerprint["on_unforced_tools"] == "error"
+
+
+async def test_legacy_snapshot_without_resolved_mode_is_still_readable() -> None:
+    session = build(
+        TestModel(custom_output_args={"text": "legacy"}),
+        documents="old snapshot",
+        instructions="Use the evidence.",
+        outputs=[FeatureAnswer],
+        output_mode="tools",
+    )
+    store = adapter.InMemoryMessageStore()
+    ref = await adapter.freeze_prefix(session, store)
+    record = json.loads(await store.get(ref))
+    del record["resolved_output_mode"]
+    del record["on_unforced_tools"]
+    old_ref = await store.put("legacy", json.dumps(record).encode())
+    adapter.FrozenPrefix(**record).validate()
+    adapter.set_prefix_store(store)
+    adapter.register_session_factory(session.prefix_hash, lambda _snapshot: session)
+    result = await adapter.execute_query_activity(payload_for(session, prefix_ref=old_ref))
+    assert json.loads(result.output_json) == {"text": "legacy"}
+    assert result.resolved_output_mode == "tools"
+
+
+async def test_worker_rejects_changed_auto_resolution_during_restore() -> None:
+    original = make_session()
+    store = adapter.InMemoryMessageStore()
+    ref = await adapter.freeze_prefix(original, store)
+    changed = TestModel(profile={"supports_forced_tool_choice": False})
+    adapter.set_prefix_store(store)
+    adapter.register_session_factory(
+        original.prefix_hash,
+        lambda frozen: build(
+            changed,
+            documents=frozen.documents,
+            instructions=frozen.instructions,
+            outputs=[FeatureAnswer],
+            output_mode=frozen.output_mode,
+        ),
+    )
+    with pytest.raises(ApplicationError, match="prefix hash") as caught:
+        await adapter.execute_query_activity(payload_for(original, prefix_ref=ref))
+    assert caught.value.non_retryable
+
+
+async def test_temporal_thinking_mode_flip_is_a_permanent_caller_error() -> None:
+    scripted = Scripted(lambda _messages, info, _n: tool_result(info, "FeatureAnswer", {"text": "unused"}))
+    model = FunctionModel(
+        scripted.model().function,
+        profile={
+            "supports_thinking": True,
+            "supports_forced_tool_choice_with_thinking": False,
+        },
+    )
+    session = build(model, documents="mode conflict", instructions="Use evidence.", outputs=[FeatureAnswer])
+    adapter.register_session(session)
+    payload = payload_for(session, model_settings={"thinking": True})
+    with pytest.raises(ApplicationError) as caught:
+        await adapter.execute_query_activity(payload)
+    assert caught.value.non_retryable
+    assert not scripted.calls
