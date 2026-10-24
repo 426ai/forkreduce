@@ -23,7 +23,7 @@ import json
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, TypeVar, cast
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
@@ -46,6 +46,8 @@ with workflow.unsafe.imports_passed_through():
     from forkreduce.query import Query
     from forkreduce.session import Session
     from forkreduce.temporal_options import ActivityOptions
+
+_T = TypeVar("_T")
 
 
 class MessageStore(Protocol):
@@ -440,10 +442,10 @@ async def _resolve_session(payload: QueryActivityInput) -> Session:
     return session
 
 
-async def heartbeat_while(awaitable: Awaitable[Any], heartbeat_timeout: float | None) -> Any:
+async def heartbeat_while(awaitable: Awaitable[_T], heartbeat_timeout: float | None) -> _T:
     """Await work with periodic heartbeats; safe to use outside a Temporal activity.
 
-    The heartbeat task is always cancelled and awaited, including on model
+    The heartbeat task is always cancelled and awaited, including on work
     failures and activity cancellation. No task is started without a timeout.
     """
     if heartbeat_timeout is None or not activity.in_activity():
@@ -464,7 +466,15 @@ async def heartbeat_while(awaitable: Awaitable[Any], heartbeat_timeout: float | 
 
 
 async def execute_query_activity(payload: QueryActivityInput) -> QueryActivityOutput:
-    """Run one query attempt. Temporal activities call this through the defn wrapper."""
+    """Run one attempt, heartbeating across reference I/O, factory, and model awaits."""
+    options = payload.activity_options
+    return await heartbeat_while(
+        _execute_query_activity(payload), options.heartbeat_timeout if options is not None else None
+    )
+
+
+async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityOutput:
+    """Activity work inside the single outer heartbeat lifetime."""
     if payload.require_references and _STORE is None:
         raise _permanent("Batch activities require a message store for transcript and output references")
     if payload.require_references and payload.history_json is not None:
@@ -509,10 +519,7 @@ async def execute_query_activity(payload: QueryActivityInput) -> QueryActivityOu
     )
     try:
         session.prepare_query(query)
-        options = payload.activity_options
-        result = await heartbeat_while(
-            session.run_once(query), options.heartbeat_timeout if options is not None else None
-        )
+        result = await session.run_once(query)
     except ForkReduceError as exc:
         raise _permanent(str(exc)) from exc
     if result.failure is not None:

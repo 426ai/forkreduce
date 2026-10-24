@@ -23,11 +23,12 @@ with workflow.unsafe.imports_passed_through():
         TemporalDurability,
     )
     from pydantic_ai.exceptions import ModelHTTPError
+    from pydantic_ai.messages import ModelMessagesTypeAdapter
     from pydantic_ai.models.test import TestModel
     from temporalio.client import WorkflowFailureError
     from tests.support import Scripted, tool_result, user_text
 
-    from forkreduce import ActivityOptions, build
+    from forkreduce import ActivityOptions, Query, build
     from forkreduce.contrib.temporal import (
         InMemoryMessageStore,
         MapQueriesInput,
@@ -455,3 +456,119 @@ async def test_periodic_heartbeat_protects_awaiting_provider(plugin: bool) -> No
                 assert json.loads(results[0].output_json) == {"text": "heartbeat survived"}
     finally:
         unregister_session(prefix)
+
+
+class SlowReferenceStore(InMemoryMessageStore):
+    """Delay one real storage boundary beyond the activity heartbeat deadline."""
+
+    def __init__(self, phase: str) -> None:
+        super().__init__()
+        self.phase = phase
+        self.waits: list[tuple[str, int]] = []
+
+    async def pause(self, phase: str) -> None:
+        if phase == self.phase and activity.in_activity():
+            self.waits.append((phase, activity.info().attempt))
+            await asyncio.sleep(0.65)
+
+    async def get(self, ref: str) -> bytes:
+        await self.pause("prefix_read" if ref.startswith("prefix:") else "history_read")
+        return await super().get(ref)
+
+    async def put(self, key: str, payload: bytes) -> str:
+        if not key.startswith("prefix:"):
+            await self.pause("output_write" if key.startswith("output:") else "messages_write")
+        return await super().put(key, payload)
+
+
+@pytest.mark.parametrize("plugin", [False, True])
+@pytest.mark.parametrize("phase", ["prefix_read", "history_read", "messages_write", "output_write", "factory"])
+async def test_heartbeat_covers_reference_io_and_async_factory(plugin: bool, phase: str) -> None:
+    model_attempts: list[int] = []
+    factory_attempts: list[int] = []
+
+    def handler(messages, info, _n):  # type: ignore[no-untyped-def]
+        if activity.in_activity():
+            model_attempts.append(activity.info().attempt)
+            assert "Final question" in user_text(messages)
+            if phase == "history_read":
+                assert "Prior question" in user_text(messages)
+        return tool_result(info, "RuntimeAnswer", {"text": "persisted after slow I/O"})
+
+    model = Scripted(handler).model()
+    session = build(
+        model,
+        documents=f"Small frozen evidence for {phase}.",
+        instructions="Answer from evidence.",
+        outputs=[RuntimeAnswer],
+        activity_options=ActivityOptions(start_to_close=10, heartbeat_timeout=0.2, maximum_attempts=1),
+    )
+    store = SlowReferenceStore(phase)
+    prefix_ref = await freeze_prefix(session, store)
+    history_ref = None
+    if phase == "history_read":
+        prior = await session.ask(Query(tail="Prior question", output=RuntimeAnswer))
+        assert prior.failure is None
+        history_ref = await store.put("history", ModelMessagesTypeAdapter.dump_json(prior.messages))
+
+    async def restore(frozen):  # type: ignore[no-untyped-def]
+        factory_attempts.append(activity.info().attempt)
+        if phase == "factory":
+            await asyncio.sleep(0.65)
+        return build(
+            model,
+            documents=frozen.documents,
+            instructions=frozen.instructions,
+            outputs=[RuntimeAnswer],
+            output_mode=frozen.output_mode,
+        )
+
+    register_session_factory(session.prefix_hash, restore)
+    set_prefix_store(store)
+    set_message_store(store)
+    plugins = [PydanticAIPlugin()] if plugin else []
+    try:
+        async with await WorkflowEnvironment.start_time_skipping(plugins=plugins, **server_options()) as env:
+            queue = f"forkreduce-slow-reference-{uuid4()}"
+            async with Worker(
+                env.client,
+                task_queue=queue,
+                workflows=[MapQueriesWorkflow, QueryBatchWorkflow],
+                activities=[run_query_activity],
+                workflow_runner=sandbox_runner(),
+                max_heartbeat_throttle_interval=timedelta(milliseconds=40),
+                default_heartbeat_throttle_interval=timedelta(milliseconds=40),
+            ):
+                results = await env.client.execute_workflow(
+                    MapQueriesWorkflow.run,
+                    MapQueriesInput(
+                        queries=[
+                            query_activity_input(
+                                session,
+                                query_id="q",
+                                tail="Final question",
+                                output_name="RuntimeAnswer",
+                                prefix_ref=prefix_ref,
+                                history_ref=history_ref,
+                            )
+                        ],
+                        batch_size=1,
+                        child_concurrency=1,
+                    ),
+                    id=f"slow-reference-{uuid4()}",
+                    task_queue=queue,
+                    execution_timeout=timedelta(seconds=30),
+                )
+                result = results[0]
+                assert result.output_json is None and result.output_ref
+                assert result.messages_json is None and result.messages_ref
+                assert json.loads(await store.get(result.output_ref)) == {"text": "persisted after slow I/O"}
+                messages = ModelMessagesTypeAdapter.validate_json(await store.get(result.messages_ref))
+                assert "Final question" in user_text(messages)
+                assert model_attempts == [1]
+                assert factory_attempts == [1]
+                assert store.waits == ([] if phase == "factory" else [(phase, 1)])
+    finally:
+        unregister_session(session.prefix_hash)
+        set_prefix_store(None)
+        set_message_store(None)
