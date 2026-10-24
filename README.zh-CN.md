@@ -236,7 +236,7 @@ flowchart TB
     q3["RequireReason 期望 DiscardExplanations"] --> session
 ```
 
-凡是之后会用到的输出类型，都要事先注册。如果策略可能要求解释，就把 `DiscardExplanations` 一并放进去。未注册的类型会在任何模型调用之前抛出 `UnregisteredOutputError`。tools 模式下，模型如果调用了另一个已注册工具，算校验失败，会重试。
+之后使用的静态 BaseModel 输出类型都须事先注册，包括策略可能要求的 `DiscardExplanations`。未注册的静态类型会在模型调用前抛出 `UnregisteredOutputError`。tools 模式调用其他已注册工具是校验失败。逐题 `OutputSpec` schema 使用下面单独声明的动态输出模式，不会每题增加工具。
 
 ## 按概念看 API
 
@@ -341,6 +341,37 @@ results = await session.fork([query, other])
 如果传入的 `history` 不是以渲染后的文档开头，会发出 `PrefixMismatchWarning`，调用仍会执行。框架不去猜你是不是想开一条新分支。
 
 `session.map(queries)` 返回惰性的 `Plan`。`session.reduce(...)` 立刻做一次归并，返回 `ReduceOutcome`。
+
+### 每题 JSON schema
+
+`OutputSpec(name, json_schema, *, description=None, strict=True)` 是可序列化、复制后的 JSON-schema 契约；`Query.output` 除已注册 BaseModel 类外也接受它，成功输出为字典。直接按 JSON Schema 校验，不做类型强转，支持本地 `$ref` / `$defs`、组合、const 和 additionalProperties。远程引用被拒绝，避免隐式网络 I/O。`strict=True` 额外检查已知 format 和严格 JSON 值（无 NaN/Infinity）；`strict=False` 只关闭可选 format 检查，不跳过 schema/类型校验。
+
+```python
+from forkreduce import OutputSpec, Policy, Query, build
+
+count = OutputSpec("Count", {
+    "type": "object", "properties": {"value": {"type": "integer", "minimum": 0}},
+    "required": ["value"], "additionalProperties": False,
+})
+label = OutputSpec("Label", {
+    "type": "object", "properties": {"value": {"type": "string", "minLength": 1}},
+    "required": ["value"], "additionalProperties": False,
+})
+session = build(
+    model, documents="Synthetic shared evidence.", instructions="Use the evidence.",
+    outputs=[], dynamic_outputs="generic_tool", policy=Policy(output_feedback_retries=1),
+)
+results = await session.fork([
+    Query(id="count", tail="Return the count.", output=count),
+    Query(id="label", tail="Return the label.", output=label),
+])
+```
+
+prompted 模式仅将本题 schema 放在尾巴。`dynamic_outputs="generic_tool"` 显式登记一个固定的宽松 object 输出工具 `forkreduce_dynamic_output`；每题始终保留同一工具及全部静态工具。本题 schema 仍只放尾巴，解析后按 schema 校验。非法输出通过原生 `ModelRetry` 在 `Policy.output_feedback_retries` 内回喂；worker 本地应用校验器可继续验证字典。不同逐题 schema 不改变 session prefix hash；启用通用工具会改变工具集合/hash，未启用的旧用户哈希不变。
+
+动态能力 session 的 auto 规则：支持强制输出且启用 generic_tool 时为 tools，否则为 prompted。可用 `dynamic_outputs="prompted"` 显式声明该意图；`outputs=[]` 且没有 generic tool 时 auto 也选 prompted。旧静态输出 auto session 保持原规则。已经冻结的静态 tools session 未启用 generic tool 时不能接动态 schema：应新建 prompted/dynamic session，不能中途改变缓存工具集合。显式 tools 的动态题必须启用 generic option。
+
+Temporal 用 `query_activity_input(..., output_spec=count)`，可选的 `output_name` 必须相同；快照保存 `dynamic_outputs`，factory 须恢复。两种 converter 都支持 query/follow-up 中的 spec，字典结果使用相同 JSON/引用字段。schema 字节仍进入 query/history，不是共享前缀，应用需控制体积。内置 BaseModel 引文检查/修复不是字典 schema 校验器，动态字典应接 `output_validator` 或读取引用的钩子。**切换输出方式前，应用应使用真实模型做回归；本项目离线测试不证明供应商的抽取质量。**
 
 ### 检查与修复
 
@@ -782,7 +813,7 @@ factory 默认每个 activity attempt 调用一次，避免无意中跨工作流
 
 ## 缓存注意事项
 
-**Schema 固定。** 工具定义属于前缀。供应商会先渲染工具再渲染消息，forkreduce 也不会事后添加工具。新增输出类型、改字段名或改描述，都会改变 `prefix_hash`，于是所有查询都错过缓存，不只是尾巴变了的那一条。`Literal` 枚举最好留一个 `"other"` 之类的出口，避免以后为了一个意外取值去改 schema。
+**工具 schema 固定。** 工具定义属于前缀，不能逐题追加。已注册静态输出的 schema/name/description 改动会改变 `prefix_hash`；动态 `OutputSpec` schema 留在题目尾巴，tools 模式只增加一个显式启用的固定通用工具。静态枚举若有开放取值需求，应留 `"other"` 之类的出口。
 
 **控制字符。** 有的供应商会拒绝工具参数 JSON 里的原始控制字符。forkreduce 在渲染和哈希之前去掉除制表符、换行、回车以外的 C0 控制字符，以及 DEL。带空字节的文档和去掉空字节之后的文档，哈希相同。
 

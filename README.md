@@ -236,7 +236,7 @@ flowchart TB
     q3["RequireReason expects DiscardExplanations"] --> session
 ```
 
-Every output type you will ask for, including `DiscardExplanations` if a policy may request reasons, is registered up front. A later call that names an unregistered type raises `UnregisteredOutputError` before any model call. In tools mode, a reply that uses a different registered tool is a validation failure and is retried.
+Every static BaseModel output type you will ask for, including `DiscardExplanations` if a policy may request reasons, is registered up front. An unregistered static type raises `UnregisteredOutputError` before a model call. In tools mode, a reply using a different registered tool is a validation failure. Per-question `OutputSpec` schemas use the separately declared dynamic-output mode below rather than adding tools per question.
 
 ## API by concept
 
@@ -341,6 +341,37 @@ results = await session.fork([query, other])
 Passing a `history` that does not start with the rendered documents emits `PrefixMismatchWarning` and still runs. The framework does not guess whether you meant a new branch.
 
 `session.map(queries)` returns a lazy `Plan`. `session.reduce(...)` runs a reduce immediately and returns a `ReduceOutcome`.
+
+### Per-question JSON schemas
+
+`OutputSpec(name, json_schema, *, description=None, strict=True)` is a serializable, copied JSON-schema contract; `Query.output` accepts it alongside registered BaseModel classes. Accepted dynamic outputs are dictionaries. Schema validation uses JSON Schema without coercion, including local `$ref` / `$defs`, composition, constants and additional-property constraints. Remote references are rejected to avoid implicit network I/O. `strict=True` additionally checks known formats and strict JSON values (no NaN/Infinity); `strict=False` omits optional format checks but never disables schema/type validation.
+
+```python
+from forkreduce import OutputSpec, Policy, Query, build
+
+count = OutputSpec("Count", {
+    "type": "object", "properties": {"value": {"type": "integer", "minimum": 0}},
+    "required": ["value"], "additionalProperties": False,
+})
+label = OutputSpec("Label", {
+    "type": "object", "properties": {"value": {"type": "string", "minLength": 1}},
+    "required": ["value"], "additionalProperties": False,
+})
+session = build(
+    model, documents="Synthetic shared evidence.", instructions="Use the evidence.",
+    outputs=[], dynamic_outputs="generic_tool", policy=Policy(output_feedback_retries=1),
+)
+results = await session.fork([
+    Query(id="count", tail="Return the count.", output=count),
+    Query(id="label", tail="Return the label.", output=label),
+])
+```
+
+Prompted mode puts only this question's schema in its tail. `dynamic_outputs="generic_tool"` opts into one fixed permissive object output tool, `forkreduce_dynamic_output`; this same tool and all registered static tools remain present for every question. The specific schema stays in the tail and is checked after parsing. Invalid outputs raise native `ModelRetry` feedback within `Policy.output_feedback_retries`; worker-local application validators can further validate dictionaries. Different question schemas never change the session prefix hash. Enabling the generic tool does change the frozen tool set/hash; leaving dynamic support off preserves old hashes.
+
+For dynamic-capable auto sessions, a supported forced-output profile plus `generic_tool` selects tools; otherwise prompted is selected. Use `dynamic_outputs="prompted"` to declare that intent explicitly; `outputs=[]` without a generic tool also selects prompted in auto. Existing fixed-output auto sessions retain their previous resolution. A frozen static-tools session without the generic tool cannot accept dynamic schemas: build a separate prompted/dynamic session instead of changing its cached tool list. Explicit tools requires the generic option for dynamic queries.
+
+Temporal accepts `query_activity_input(..., output_spec=count)` (optional matching `output_name`); snapshots retain `dynamic_outputs`, and factories restore it. Both converters reconstruct specs in queries and follow-ups; dictionary results use the same JSON/reference fields as static models. Schema bytes live in query/history payloads, not the shared prefix, so keep them bounded operationally. Built-in BaseModel citation checking/repair is not a dictionary-schema validator: use `output_validator` or a reference-aware hook for dynamic dictionaries. **Before switching an application's output mode, run a real-model regression; these tests are offline and do not establish provider extraction quality.**
 
 ### Check and repair
 
@@ -782,7 +813,7 @@ Factories run per activity attempt by default; this avoids silently sharing muta
 
 ## Caching caveats
 
-**Fixed schema.** Tool definitions are part of the prefix. Providers render tools before messages, and forkreduce does not add tools later. A new output type, a renamed field, or a changed description changes `prefix_hash` and misses the cache for every query, not just the one with the new tail. `Literal` enums need an `"other"` (or similar) escape so one unexpected value does not force a schema change later.
+**Fixed tool schema.** Tool definitions are part of the prefix and cannot be added per question. Changing a registered static output schema/name/description changes `prefix_hash`; dynamic `OutputSpec` schemas instead stay in question tails, with one explicitly enabled generic tool if tools mode is used. Keep an `"other"` escape in static enums when the application's domain needs one.
 
 **Control characters.** Some providers reject tool-call JSON that contains raw control characters. forkreduce strips C0 controls other than tab, newline, and carriage return, and strips DEL, before rendering and hashing. The hash of a document with a null byte matches the hash of that document without it.
 

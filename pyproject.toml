@@ -27,6 +27,7 @@ dependencies = [
     "pydantic>=2.6",
     "pydantic-ai-slim>=2.57,<3",
     "httpx>=0.27",
+    "jsonschema>=4.22,<5",
 ]
 
 [project.optional-dependencies]

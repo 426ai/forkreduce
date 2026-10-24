@@ -12,6 +12,7 @@ from pydantic_ai.usage import RunUsage
 from forkreduce.context import ContextWarning
 from forkreduce.failures import Failure
 from forkreduce.output_modes import ResolvedOutputMode
+from forkreduce.output_specs import OutputSpec
 
 T = TypeVar("T")
 
@@ -36,7 +37,9 @@ class Query(Generic[T]):
     single-question follow-ups). The framework does not decide which one you
     wanted; it only warns when a continuation does not start with the prefix.
 
-    ``output`` must be one of the types registered on the session.
+    ``output`` is a registered BaseModel subclass or a per-query ``OutputSpec``.
+    Dynamic outputs produce dictionaries; tools mode requires a generic output
+    tool registered when building the session.
 
     ``model_settings`` overrides the session settings for this call only.
     pydantic-ai merges the two shallowly: a key set here replaces that key,
@@ -46,7 +49,7 @@ class Query(Generic[T]):
     """
 
     tail: str
-    output: type[T]
+    output: type[T] | OutputSpec
     id: str | None = None
     history: list[ModelMessage] | None = None
     meta: dict[str, Any] = field(default_factory=dict)

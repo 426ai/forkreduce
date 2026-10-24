@@ -76,6 +76,7 @@ with workflow.unsafe.imports_passed_through():
     from forkreduce.failures import Failure
     from forkreduce.models import canonical_value, request_body_settings
     from forkreduce.output_modes import OutputMode, ResolvedOutputMode, UnforcedToolsPolicy
+    from forkreduce.output_specs import DynamicOutputs, OutputSpec
     from forkreduce.policy import Policy
     from forkreduce.prefix import prefix_hash as compute_prefix_hash
     from forkreduce.query import Query
@@ -148,8 +149,9 @@ class FrozenPrefix:
     tools_json: str
     resolved_output_mode: ResolvedOutputMode | None = None
     on_unforced_tools: UnforcedToolsPolicy = "warn"
-    app_meta: dict[str, JSONValue] = field(default_factory=dict)
+    app_meta: dict[str, Any] = field(default_factory=dict)
     output_feedback_retries: int = 0
+    dynamic_outputs: DynamicOutputs | None = None
 
     @property
     def documents(self) -> list[Document]:
@@ -159,6 +161,8 @@ class FrozenPrefix:
     def validate(self) -> None:
         """Reject corrupt snapshots before invoking a worker factory."""
         _app_meta_json(self.app_meta)
+        if self.dynamic_outputs not in {None, "generic_tool", "prompted"}:
+            raise ValueError("Invalid dynamic_outputs in frozen prefix")
         if (
             isinstance(self.output_feedback_retries, bool)
             or not isinstance(self.output_feedback_retries, int)
@@ -215,6 +219,7 @@ async def freeze_prefix(
         on_unforced_tools=session.on_unforced_tools,
         app_meta=cast(dict[str, JSONValue], json.loads(_app_meta_json({} if app_meta is None else app_meta))),
         output_feedback_retries=session.policy.output_feedback_retries,
+        dynamic_outputs=session.dynamic_outputs,
     )
     snapshot.validate()
     encoded = json.dumps(asdict(snapshot), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -309,6 +314,8 @@ def execution_fingerprint(session: Session) -> str:
         payload["output_feedback_retries"] = policy.output_feedback_retries
     if session.output_validator is not None:
         payload["output_validator"] = canonical_value(session.output_validator)
+    if session.dynamic_outputs is not None:
+        payload["dynamic_outputs"] = session.dynamic_outputs
     return json.dumps(payload, sort_keys=True, default=str)
 
 
@@ -411,6 +418,7 @@ class QueryActivityInput:
     activity_options: ActivityOptions | None = None
     require_references: bool = False
     parent_workflow_id: str | None = None
+    output_spec: OutputSpec | None = None
 
 
 def query_activity_input(
@@ -418,7 +426,7 @@ def query_activity_input(
     *,
     query_id: str,
     tail: str,
-    output_name: str,
+    output_name: str | None = None,
     round: int = 0,
     history_ref: str | None = None,
     history_json: str | None = None,
@@ -426,6 +434,7 @@ def query_activity_input(
     model_settings: ModelSettings | None = None,
     prefix_ref: str | None = None,
     ref_namespace: str | None = None,
+    output_spec: OutputSpec | None = None,
 ) -> QueryActivityInput:
     """Build an activity payload that carries this session's retry policy.
 
@@ -438,6 +447,14 @@ def query_activity_input(
     metadata value is preserved. Conflicting query and snapshot namespaces fail
     before session reconstruction or model execution.
     """
+    if output_spec is not None:
+        if output_name is not None and output_name != output_spec.name:
+            raise ValueError("output_name must match output_spec.name")
+        session.require_output(output_spec)
+        output_name = output_spec.name
+        output_spec = replace(output_spec)
+    if output_name is None:
+        raise ValueError("Set output_name or output_spec")
     policy = session.policy
     query_meta = dict(meta or {})
     if ref_namespace is not None:
@@ -457,6 +474,7 @@ def query_activity_input(
         model_settings=dict(model_settings) if model_settings else None,
         prefix_ref=prefix_ref,
         activity_options=session.activity_options,
+        output_spec=output_spec,
     )
 
 
@@ -679,9 +697,11 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
         else None
     )
     session = await _resolve_session(payload, snapshot=snapshot)
-    output_type = session.output_types.get(payload.output_name)
+    output_type = payload.output_spec or session.output_types.get(payload.output_name)
     if output_type is None:
         raise _permanent(f"Output {payload.output_name!r} is not registered on this session")
+    if payload.output_spec is not None and payload.output_spec.name != payload.output_name:
+        raise _permanent("output_name does not match output_spec.name")
     history: list[ModelMessage] | None = None
     if payload.history_ref is not None and payload.history_json is not None:
         raise _permanent("Set only one of history_ref and history_json")
@@ -732,14 +752,17 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
     if isinstance(result.output, BaseModel):
         output_json = result.output.model_dump_json()
         output_name = type(result.output).__name__
-        if _STORE is not None and payload.require_references:
-            output_ref = await store_put(
-                _STORE,
-                f"output:{payload.prefix_hash}:{payload.query_id}",
-                output_json.encode(),
-                context=_query_store_context("output", payload, namespace),
-            )
-            output_json = None
+    elif isinstance(result.output, dict):
+        output_json = json.dumps(result.output, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        output_name = payload.output_name
+    if output_json is not None and _STORE is not None and payload.require_references:
+        output_ref = await store_put(
+            _STORE,
+            f"output:{payload.prefix_hash}:{payload.query_id}",
+            output_json.encode(),
+            context=_query_store_context("output", payload, namespace),
+        )
+        output_json = None
     return QueryActivityOutput(
         query_id=result.query_id,
         prefix_hash=result.prefix_hash,

@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel
-from pydantic_ai import Agent, PromptedOutput, ToolOutput, capture_run_messages
+from pydantic_ai import Agent, PromptedOutput, StructuredDict, ToolOutput, capture_run_messages
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
 from pydantic_ai.run import AgentRunResult
@@ -38,6 +38,13 @@ from forkreduce.output_modes import (
     effective_model_settings,
     forced_tools_available,
     resolve_output_mode,
+)
+from forkreduce.output_specs import (
+    DYNAMIC_OUTPUT_TOOL_DESCRIPTION,
+    DYNAMIC_OUTPUT_TOOL_NAME,
+    DYNAMIC_OUTPUT_TOOL_SCHEMA,
+    DynamicOutputs,
+    OutputSpec,
 )
 from forkreduce.policy import Policy
 from forkreduce.prefix import (
@@ -93,6 +100,7 @@ class Session:
         model_settings: ModelSettings | None = None,
         activity_options: ActivityOptions | None = None,
         output_validator: OutputValidator | None = None,
+        dynamic_outputs: DynamicOutputs | None = None,
     ) -> None:
         self.model = model
         copied = cast(ModelSettings, dict(model_settings)) if model_settings else None
@@ -104,6 +112,7 @@ class Session:
         self.output_mode: OutputMode = output_mode
         self.resolved_output_mode: ResolvedOutputMode = resolved_output_mode
         self.on_unforced_tools: UnforcedToolsPolicy = on_unforced_tools
+        self.dynamic_outputs = dynamic_outputs
         self._forced_tools_available = forced_tools_available(model, effective_model_settings(model, copied))
         self.policy = policy
         self.activity_options = activity_options
@@ -121,11 +130,10 @@ class Session:
             instructions=instructions,
             output_types=self.output_types,
             output_mode=resolved_output_mode,
-            descriptions={
-                name: str(spec.get("description", "")) for name, spec in zip(output_types, tool_specs, strict=True)
-            },
+            descriptions={str(spec["name"]): str(spec.get("description", "")) for spec in tool_specs},
             output_feedback_retries=policy.output_feedback_retries,
             output_validator=output_validator,
+            dynamic_outputs=dynamic_outputs,
         )
 
     @property
@@ -133,8 +141,16 @@ class Session:
         """Names of the output types registered on this session, in build order."""
         return list(self.output_types)
 
-    def require_output(self, output: type[Any]) -> str:
-        """Return the registered tool name or raise :class:`UnregisteredOutputError`."""
+    def require_output(self, output: type[Any] | OutputSpec) -> str:
+        """Return the output name, refusing any change to the frozen tool set."""
+        if isinstance(output, OutputSpec):
+            if self.resolved_output_mode == "tools" and self.dynamic_outputs != "generic_tool":
+                raise UnregisteredOutputError(
+                    "Dynamic OutputSpec cannot run on a frozen static-tools session. "
+                    "Build a dynamic session with dynamic_outputs='generic_tool', or choose "
+                    "dynamic_outputs='prompted' or output_mode='prompted'."
+                )
+            return output.name
         for name, registered in self.output_types.items():
             if registered is output:
                 return name
@@ -162,7 +178,7 @@ class Session:
     def _check_output_mode(self, query: Query[Any], *, diagnose: bool = True) -> None:
         settings = effective_model_settings(self.model, self.model_settings, query.model_settings)
         if self.output_mode == "auto":
-            actual = resolve_output_mode(self.model, settings)
+            actual = _resolve_session_output_mode(self.model, settings, self.output_types, self.dynamic_outputs)
             if actual != self.resolved_output_mode:
                 raise OutputModeConflictError(
                     f"Query settings would change the frozen output mode from {self.resolved_output_mode!r} "
@@ -182,13 +198,17 @@ class Session:
     def render_tail(self, query: Query[Any]) -> str:
         """Query text that follows the frozen prefix. Schema lives here in prompted mode."""
         name = self.require_output(query.output)
-        parts = [query.tail.rstrip(), "", f"Use the `{name}` output and no other output type."]
-        if self.resolved_output_mode == "prompted":
-            schema = json.dumps(
-                query.output.model_json_schema(),
-                sort_keys=True,
-                ensure_ascii=False,
-            )
+        dynamic = isinstance(query.output, OutputSpec)
+        tool_name = DYNAMIC_OUTPUT_TOOL_NAME if dynamic and self.resolved_output_mode == "tools" else name
+        parts = [query.tail.rstrip(), "", f"Use the `{tool_name}` output and no other output type."]
+        if isinstance(query.output, OutputSpec) and query.output.description:
+            parts.append(query.output.description)
+        if self.resolved_output_mode == "prompted" or dynamic:
+            if isinstance(query.output, OutputSpec):
+                schema_value = query.output.json_schema
+            else:
+                schema_value = query.output.model_json_schema()
+            schema = json.dumps(schema_value, sort_keys=True, ensure_ascii=False)
             parts.append("Respond with a single JSON object matching this schema:")
             parts.append(schema)
         return "\n".join(parts)
@@ -245,14 +265,18 @@ class Session:
             started = time.perf_counter()
             messages: list[ModelMessage] = self.history_for(query)
             kwargs: dict[str, Any] = {}
-            if self.resolved_output_mode == "prompted":
+            if self.resolved_output_mode == "prompted" and not isinstance(query.output, OutputSpec):
                 kwargs["output_type"] = PromptedOutput(query.output, template=False)
             merged_settings = merge_model_settings(self.model_settings, query.model_settings)
             if merged_settings:
                 # Copy so a later mutation of the caller's dict cannot change
                 # this request, and so pydantic-ai's in-place edits stay local.
                 kwargs["model_settings"] = dict(merged_settings)
-            if self.policy.output_feedback_retries or self.output_validator is not None:
+            if (
+                self.policy.output_feedback_retries
+                or self.output_validator is not None
+                or isinstance(query.output, OutputSpec)
+            ):
                 return await self._run_with_feedback(query, messages, kwargs, started, notice)
             try:
                 with capture_run_messages() as captured:
@@ -292,7 +316,8 @@ class Session:
             hits = cache_hit_tokens(result.usage)
             transcript = list(result.all_messages())
             output = result.output
-            if not isinstance(output, query.output):
+            expected_type = dict if isinstance(query.output, OutputSpec) else query.output
+            if not isinstance(output, expected_type):
                 return QueryResult(
                     query_id=query.id or "",
                     output=None,
@@ -302,7 +327,7 @@ class Session:
                     usage=result.usage,
                     cache_hit_tokens=hits,
                     attempts=1,
-                    failure=wrong_output_failure(query.output.__name__, type(output).__name__),
+                    failure=wrong_output_failure(self.require_output(query.output), type(output).__name__),
                     round=query.round,
                     elapsed_ms=elapsed,
                     context_warning=notice,
@@ -338,7 +363,32 @@ class Session:
         """
         agent = self._agent
         retries = self.policy.output_feedback_retries
-        if self.resolved_output_mode == "prompted" and self.output_validator is not None:
+        if isinstance(query.output, OutputSpec):
+            spec = query.output
+
+            async def validate_dynamic(output: Any) -> Any:
+                validated: Any = spec.validate_output(output)
+                if self.output_validator is not None:
+                    validated = self.output_validator(validated)
+                    if inspect.isawaitable(validated):
+                        validated = await validated
+                return validated
+
+            # Keep the entire registered tool list and the original instructions.
+            # Only this worker-local callback knows the per-query schema.
+            agent = _build_agent(
+                self.model,
+                instructions=self.instructions,
+                output_types=self.output_types,
+                output_mode=self.resolved_output_mode,
+                descriptions={str(item["name"]): str(item.get("description", "")) for item in self.tool_specs},
+                output_feedback_retries=retries,
+                output_validator=validate_dynamic,
+                dynamic_outputs=self.dynamic_outputs,
+                dynamic_query=True,
+            )
+            kwargs.pop("output_type", None)
+        elif self.resolved_output_mode == "prompted" and self.output_validator is not None:
             # The SDK forbids per-run output_type with output validators. Build
             # the expected type locally instead, retaining identical instructions
             # and template=False so no schema enters the frozen prefix.
@@ -351,6 +401,7 @@ class Session:
                 descriptions={},
                 output_feedback_retries=retries,
                 output_validator=self.output_validator,
+                dynamic_outputs=self.dynamic_outputs,
             )
             kwargs.pop("output_type", None)
         usage = RunUsage()
@@ -412,10 +463,11 @@ class Session:
         assert completed is not None
         output = completed.output
         transcript = list(completed.all_messages())
-        if not isinstance(output, query.output):
+        expected_type = dict if isinstance(query.output, OutputSpec) else query.output
+        if not isinstance(output, expected_type):
             return self._empty_result(
                 query,
-                wrong_output_failure(query.output.__name__, type(output).__name__),
+                wrong_output_failure(self.require_output(query.output), type(output).__name__),
                 messages=transcript,
                 elapsed_ms=elapsed,
                 usage=usage,
@@ -424,7 +476,7 @@ class Session:
             )
         return QueryResult(
             query_id=query.id or "",
-            output=output,
+            output=cast(T, output),
             messages=transcript,
             prefix_hash=self.prefix_hash,
             resolved_output_mode=self.resolved_output_mode,
@@ -532,7 +584,7 @@ def build(
     *,
     documents: DocumentsInput,
     instructions: str,
-    outputs: Sequence[type[BaseModel]],
+    outputs: Sequence[type[BaseModel]] = (),
     output_mode: OutputMode = "auto",
     on_unforced_tools: UnforcedToolsPolicy = "warn",
     warmup: bool = True,
@@ -541,6 +593,7 @@ def build(
     model_settings: ModelSettings | None = None,
     activity_options: ActivityOptions | None = None,
     output_validator: OutputValidator | None = None,
+    dynamic_outputs: DynamicOutputs | None = None,
     meta_keys: Sequence[str] | None = None,
     meta_renderer: MetaRenderer | None = None,
 ) -> Session:
@@ -549,6 +602,13 @@ def build(
     ``outputs`` is every structured type any query, repair, or reduce on this
     session will ask for. Adding one later is refused: a new tool schema would
     invalidate the provider prefix cache.
+
+    ``outputs`` may be empty for a dynamic-only session. ``dynamic_outputs``
+    registers one fixed permissive tool with ``"generic_tool"``, or selects
+    schema-in-tail output with ``"prompted"``. In auto mode, dynamic-only
+    sessions without a generic tool use prompted output; generic tools use
+    tools only when forcing is supported. Existing fixed-output auto sessions
+    retain their original selection. Per-query schemas never enter the hash.
 
     ``output_mode="auto"`` (the default) freezes tools when the model profile
     and effective thinking settings permit forced output tools, otherwise
@@ -572,16 +632,22 @@ def build(
     error back on this branch when ``policy.output_feedback_retries`` is enabled.
     The callback is never serialized and does not affect the frozen prefix.
     """
+    if dynamic_outputs not in (None, "generic_tool", "prompted"):
+        raise ForkReduceError("dynamic_outputs must be 'generic_tool', 'prompted', or None")
+    if output_mode == "tools" and (dynamic_outputs == "prompted" or (not outputs and dynamic_outputs is None)):
+        raise ForkReduceError("Dynamic output_mode='tools' requires dynamic_outputs='generic_tool'")
     if output_mode not in ("auto", "tools", "prompted"):
         raise ForkReduceError("output_mode must be 'auto', 'tools', or 'prompted'")
     if on_unforced_tools not in ("warn", "error", "ignore"):
         raise ForkReduceError("on_unforced_tools must be 'warn', 'error', or 'ignore'")
     settings = effective_model_settings(model, model_settings)
-    resolved = resolve_output_mode(model, settings) if output_mode == "auto" else output_mode
+    resolved = (
+        _resolve_session_output_mode(model, settings, outputs, dynamic_outputs)
+        if output_mode == "auto"
+        else output_mode
+    )
     if output_mode == "tools" and not forced_tools_available(model, settings):
         diagnose_unforced_tools(on_unforced_tools)
-    if not outputs:
-        raise ForkReduceError("outputs must register at least one pydantic model")
     index = coerce_documents(documents, meta_keys=meta_keys, meta_renderer=meta_renderer)
     chosen = policy if policy is not None else Policy()
     output_types: dict[str, type[BaseModel]] = {}
@@ -590,6 +656,8 @@ def build(
         if not inspect.isclass(output) or not issubclass(output, BaseModel):
             raise ForkReduceError(f"output {output!r} must be a pydantic BaseModel subclass")
         name = output.__name__
+        if name == DYNAMIC_OUTPUT_TOOL_NAME and dynamic_outputs == "generic_tool":
+            raise ForkReduceError(f"output name {name!r} is reserved for dynamic outputs")
         if name in output_types:
             raise ForkReduceError(f"duplicate output name {name!r}")
         description = inspect.getdoc(output) or f"Return a {name}."
@@ -599,6 +667,14 @@ def build(
                 "name": name,
                 "description": description,
                 "schema": output.model_json_schema(),
+            }
+        )
+    if dynamic_outputs == "generic_tool":
+        tool_specs.append(
+            {
+                "name": DYNAMIC_OUTPUT_TOOL_NAME,
+                "description": DYNAMIC_OUTPUT_TOOL_DESCRIPTION,
+                "schema": copy.deepcopy(DYNAMIC_OUTPUT_TOOL_SCHEMA),
             }
         )
     hashed = prefix_hash(
@@ -623,6 +699,7 @@ def build(
         model_settings=model_settings,
         activity_options=activity_options,
         output_validator=output_validator,
+        dynamic_outputs=dynamic_outputs,
     )
     notice = prefix_context_warning(
         chosen,
@@ -643,6 +720,8 @@ def _build_agent(
     descriptions: dict[str, str],
     output_feedback_retries: int = 0,
     output_validator: OutputValidator | None = None,
+    dynamic_outputs: DynamicOutputs | None = None,
+    dynamic_query: bool = False,
 ) -> Agent[None, Any]:
     if output_mode == "tools":
         # Native retries are opt-in; the default still raises after one payload.
@@ -650,11 +729,24 @@ def _build_agent(
             ToolOutput(cls, name=name, description=descriptions.get(name), max_retries=output_feedback_retries)
             for name, cls in output_types.items()
         ]
+        if dynamic_outputs == "generic_tool":
+            output_spec.append(
+                ToolOutput(
+                    StructuredDict(copy.deepcopy(DYNAMIC_OUTPUT_TOOL_SCHEMA)),
+                    name=DYNAMIC_OUTPUT_TOOL_NAME,
+                    description=DYNAMIC_OUTPUT_TOOL_DESCRIPTION,
+                    max_retries=output_feedback_retries,
+                    strict=False,
+                )
+            )
     else:
         # template=False keeps the union schema out of the instruction prefix.
         # Each call passes its own PromptedOutput so the tail schema is the one
         # that gets validated.
-        output_spec = PromptedOutput(list(output_types.values()), template=False)
+        if dynamic_query or not output_types:
+            output_spec = PromptedOutput(StructuredDict(copy.deepcopy(DYNAMIC_OUTPUT_TOOL_SCHEMA)), template=False)
+        else:
+            output_spec = PromptedOutput(list(output_types.values()), template=False)
     agent: Agent[None, Any] = Agent(
         model,
         output_type=output_spec,
@@ -665,3 +757,16 @@ def _build_agent(
     if output_validator is not None:
         agent.output_validator(output_validator)
     return agent
+
+
+def _resolve_session_output_mode(
+    model: Model,
+    settings: ModelSettings | None,
+    outputs: Sequence[type[BaseModel]] | dict[str, type[BaseModel]],
+    dynamic_outputs: DynamicOutputs | None,
+) -> ResolvedOutputMode:
+    if dynamic_outputs == "prompted" or (not outputs and dynamic_outputs != "generic_tool"):
+        return "prompted"
+    if dynamic_outputs == "generic_tool":
+        return "tools" if forced_tools_available(model, settings) else "prompted"
+    return resolve_output_mode(model, settings)

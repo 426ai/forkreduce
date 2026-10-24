@@ -4,6 +4,8 @@
 
 ### Added
 
+- Public serializable `OutputSpec` / `DynamicOutputs` support per-question JSON schemas and dictionary outputs, with JSON Schema validation, local refs/composition, and native output-feedback retries. Prompted schemas stay in tails; opt-in `dynamic_outputs="generic_tool"` adds one fixed permissive output tool rather than changing tools per query. Dynamic-only auto sessions without that tool use prompted mode. Both Temporal converters handle specs/follow-ups and frozen dynamic settings. Only enabling/changing the frozen tool/mode contract changes hashes; per-question schemas do not.
+
 - Public workflow primitives `plan_batches`, `batch_child_id`, `require_query_references`, `validate_query_references`, `query_failure`, and `execute_query` support application-owned orchestration. Built-in pipelines add `AfterQueryInput` / `AfterQueryDecision`, per-query `after_query_activity` with independent options, bounded repair rounds, safe `after_query_failed` records, and small copied `result_meta`. `batch_workflow` selects an application batch with the same input/output contract. Defaults and hashes are unchanged; repair IDs append `#r{round}`.
 
 - `MapQueriesInput.activity_concurrency`, `task_queue`, and `warmup="none"|"first"|"per_batch"` control direct/per-child query concurrency, child/activity queue routing, and deterministic warmup gates. A first returned failure releases warmup; raise/cancellation propagation remains unchanged. Default settings preserve fan-out/queue behavior and do not change prefix hashes or session execution fingerprints.
@@ -58,6 +60,8 @@ Public `QueryFailureKind` is exported from `forkreduce.contrib.temporal` as a `L
 | `unknown` | Ambiguous terminal application/SDK failure or failed child batch. |
 
 ### Upgrade notes
+
+- **Dynamic outputs:** restore `FrozenPrefix.dynamic_outputs` in factories. A static frozen tools session needs the generic tool declared up front before accepting dynamic schemas; otherwise choose a separate prompted/dynamic session. Remote schema references are rejected; both strict modes validate schema/types without coercion, with extra format/JSON checks in strict mode. Dictionary outputs need application validators/hooks for BaseModel-specific citation operations. Run real-model regressions before switching output modes; offline tests establish contracts, not model quality.
 
 - **Per-query hooks:** register the named hook on the selected queue and retain referenced histories through all repairs. `max_rounds` is an inclusive round index (initial zero); reaching the cap while still requesting repair yields a failed record. Hooked direct queries also require reference storage. Hook retries are independent of model retries; custom batches own their implementation of hook/concurrency/cancellation semantics. The additional synthetic failure type is `after_query_failed`; raw application types remain whitelisted separately.
 

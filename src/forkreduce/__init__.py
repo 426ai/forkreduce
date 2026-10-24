@@ -24,6 +24,7 @@ from forkreduce.failures import Failure, FailureKind
 from forkreduce.followup import AcceptLeads, GapFill, LeadReport, RoundState, Scope
 from forkreduce.models import openai_compatible_model
 from forkreduce.output_modes import OutputMode, ResolvedOutputMode
+from forkreduce.output_specs import DynamicOutputs, OutputSpec
 from forkreduce.plan import Plan, RoundRecord, RunResult
 from forkreduce.policy import Accept, Budget, BudgetReport, Drop, Fail, Policy, RequireReason, Retry
 from forkreduce.query import CheckFailure, Query, QueryResult
@@ -56,6 +57,7 @@ __all__ = [
     "DiscardExplanations",
     "Document",
     "Drop",
+    "DynamicOutputs",
     "Executor",
     "Fail",
     "Failure",
@@ -66,6 +68,7 @@ __all__ = [
     "LocalExecutor",
     "OutputMode",
     "OutputModeConflictError",
+    "OutputSpec",
     "OutputValidator",
     "Plan",
     "Policy",
