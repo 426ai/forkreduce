@@ -462,6 +462,14 @@ gap = GapFill(
 
 It asks once per scope, on the same prefix. Leads whose position (`block_id` by default) is already present on the merged output are skipped. A `LeadPolicy` then sees a `LeadReport` and may `Accept`, `Drop` specific positions, or `Fail`. The default is `AcceptLeads`.
 
+### Output validation feedback
+
+`Policy(output_feedback_retries=0)` preserves the single-request attempt. Opt into a bounded same-branch correction with `Policy(output_feedback_retries=1)` and `build(..., output_validator=validate_output)`. The validator accepts the parsed output, may be synchronous or asynchronous, returns the accepted/replaced value, and raises Pydantic AI `ModelRetry` to send an error back to the model. Schema and cross-field validation errors use the same feedback mechanism. Feedback is not a fresh query: the frozen instructions, document bytes and tool set stay unchanged, while retry messages extend this question's history.
+
+`QueryResult.feedback_retries_used` and `meta["feedback_retries_used"]` record actual feedback requests; local outer attempts aggregate this count. Request/token budgets are enforced before every request, including feedback. `Policy.retries` remains the separate outer retry budget. Feedback and validators do not change `prefix_hash`; non-default feedback/validator configuration changes the Temporal execution fingerprint.
+
+Temporal activities use the worker's registered or factory-created session, never a serialized callback. `FrozenPrefix.output_feedback_retries` records the numeric policy; factories should restore it with `Policy(output_feedback_retries=frozen.output_feedback_retries)` and install their worker-local validator. Activity results and safe failure metadata expose `feedback_retries_used` for the final activity attempt, not an inferred total across Temporal attempts. Keep sensitive data out of validation messages: feedback deliberately sends these messages to the model.
+
 ### Concurrency, retries, budget
 
 ```python

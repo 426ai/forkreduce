@@ -29,7 +29,7 @@ from forkreduce.policy import Accept, Budget, BudgetReport, Drop, Fail, Policy, 
 from forkreduce.query import CheckFailure, Query, QueryResult
 from forkreduce.reduce import ReduceItem, ReduceOutcome
 from forkreduce.schemas import CITATION_INSTRUCTIONS, Citation, DiscardExplanation, DiscardExplanations, Traced
-from forkreduce.session import Session, build
+from forkreduce.session import OutputValidator, Session, build
 from forkreduce.stats import UsageSummary
 from forkreduce.temporal_options import ActivityOptions
 
@@ -66,6 +66,7 @@ __all__ = [
     "LocalExecutor",
     "OutputMode",
     "OutputModeConflictError",
+    "OutputValidator",
     "Plan",
     "Policy",
     "PrefixMismatchWarning",

@@ -6,13 +6,14 @@ import copy
 import inspect
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel
 from pydantic_ai import Agent, PromptedOutput, ToolOutput, capture_run_messages
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
+from pydantic_ai.run import AgentRunResult
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RunUsage, UsageLimits
 
@@ -51,6 +52,16 @@ from forkreduce.temporal_options import ActivityOptions
 
 T = TypeVar("T")
 
+OutputValidator = Callable[[Any], Any | Awaitable[Any]]
+"""Worker-local output callback returning a value or raising ``ModelRetry``."""
+
+
+class _FeedbackBudgetExceeded(Exception):
+    def __init__(self, failure: Failure) -> None:
+        super().__init__(failure.message)
+        self.failure = failure
+
+
 _REQUEST_LIMIT = UsageLimits(request_limit=1)
 
 
@@ -81,6 +92,7 @@ class Session:
         executor: Executor | None,
         model_settings: ModelSettings | None = None,
         activity_options: ActivityOptions | None = None,
+        output_validator: OutputValidator | None = None,
     ) -> None:
         self.model = model
         copied = cast(ModelSettings, dict(model_settings)) if model_settings else None
@@ -95,6 +107,7 @@ class Session:
         self._forced_tools_available = forced_tools_available(model, effective_model_settings(model, copied))
         self.policy = policy
         self.activity_options = activity_options
+        self.output_validator = output_validator
         self.warmup = warmup
         self.prefix_hash = prefix_hash_value
         self.tool_specs = tool_specs
@@ -111,6 +124,8 @@ class Session:
             descriptions={
                 name: str(spec.get("description", "")) for name, spec in zip(output_types, tool_specs, strict=True)
             },
+            output_feedback_retries=policy.output_feedback_retries,
+            output_validator=output_validator,
         )
 
     @property
@@ -207,7 +222,7 @@ class Session:
         return list(await asyncio.gather(*(self._executor.run_query(self, query) for query in pending)))
 
     async def run_once(self, query: Query[T]) -> QueryResult[T]:
-        """One model call, with no library-level retry.
+        """One execution attempt, including opt-in output-feedback requests.
 
         Budget is checked here. Validation and transport errors come back as
         ``result.failure`` instead of being raised, except for caller errors
@@ -237,6 +252,8 @@ class Session:
                 # Copy so a later mutation of the caller's dict cannot change
                 # this request, and so pydantic-ai's in-place edits stay local.
                 kwargs["model_settings"] = dict(merged_settings)
+            if self.policy.output_feedback_retries or self.output_validator is not None:
+                return await self._run_with_feedback(query, messages, kwargs, started, notice)
             try:
                 with capture_run_messages() as captured:
                     try:
@@ -304,6 +321,122 @@ class Session:
                 elapsed_ms=elapsed,
                 context_warning=notice,
             )
+
+    async def _run_with_feedback(
+        self,
+        query: Query[T],
+        messages: list[ModelMessage],
+        kwargs: dict[str, Any],
+        started: float,
+        notice: ContextWarning | None,
+    ) -> QueryResult[T]:
+        """Drive native validation retries, accounting at each request boundary.
+
+        The caller already reserved the first request and holds the token gate.
+        Never bill this bundle again in ``run_once``: a later request must see
+        every completed response before its own reservation is considered.
+        """
+        agent = self._agent
+        retries = self.policy.output_feedback_retries
+        if self.resolved_output_mode == "prompted" and self.output_validator is not None:
+            # The SDK forbids per-run output_type with output validators. Build
+            # the expected type locally instead, retaining identical instructions
+            # and template=False so no schema enters the frozen prefix.
+            name = self.require_output(query.output)
+            agent = _build_agent(
+                self.model,
+                instructions=self.instructions,
+                output_types={name: self.output_types[name]},
+                output_mode="prompted",
+                descriptions={},
+                output_feedback_retries=retries,
+                output_validator=self.output_validator,
+            )
+            kwargs.pop("output_type", None)
+        usage = RunUsage()
+        requests = 0
+        completed: AgentRunResult[Any] | None = None
+        failure: Failure | None = None
+        with capture_run_messages() as captured:
+            try:
+                async with agent.iter(
+                    self.render_tail(query),
+                    message_history=messages,
+                    usage=usage,
+                    usage_limits=UsageLimits(request_limit=retries + 1),
+                    **kwargs,
+                ) as run:
+                    node = run.next_node
+                    while not Agent.is_end_node(node):
+                        if Agent.is_model_request_node(node):
+                            if requests:
+                                problem = await self._budget.try_reserve()
+                                if problem is not None:
+                                    denied = budget_action_failure(problem, self.policy)
+                                    if denied is not None:
+                                        raise _FeedbackBudgetExceeded(denied)
+                                    await self._budget.force_reserve()
+                            requests += 1
+                            input_before = usage.input_tokens
+                            output_before = usage.output_tokens
+                            try:
+                                node = await run.next(node)
+                            finally:
+                                # Also retain billed tokens if a request raises.
+                                await self._budget.add_usage(
+                                    RunUsage(
+                                        input_tokens=usage.input_tokens - input_before,
+                                        output_tokens=usage.output_tokens - output_before,
+                                    )
+                                )
+                        else:
+                            node = await run.next(node)
+                    completed = run.result
+            except _FeedbackBudgetExceeded as exc:
+                failure = exc.failure
+            except Exception as exc:
+                failure = classify_exception(exc)
+        elapsed = (time.perf_counter() - started) * 1000
+        feedback_used = max(0, requests - 1)
+        usage.requests = requests
+        if failure is not None:
+            return self._empty_result(
+                query,
+                failure,
+                messages=list(captured) or messages,
+                elapsed_ms=elapsed,
+                usage=usage,
+                context_warning=notice,
+                feedback_retries_used=feedback_used,
+            )
+        assert completed is not None
+        output = completed.output
+        transcript = list(completed.all_messages())
+        if not isinstance(output, query.output):
+            return self._empty_result(
+                query,
+                wrong_output_failure(query.output.__name__, type(output).__name__),
+                messages=transcript,
+                elapsed_ms=elapsed,
+                usage=usage,
+                context_warning=notice,
+                feedback_retries_used=feedback_used,
+            )
+        return QueryResult(
+            query_id=query.id or "",
+            output=output,
+            messages=transcript,
+            prefix_hash=self.prefix_hash,
+            resolved_output_mode=self.resolved_output_mode,
+            usage=usage,
+            cache_hit_tokens=cache_hit_tokens(usage),
+            attempts=1,
+            failure=None,
+            round=query.round,
+            elapsed_ms=elapsed,
+            context_warning=notice,
+            feedback_retries_used=feedback_used,
+        )
 
     def estimate_tokens(self, query: Query[Any]) -> int:
         """Estimated input tokens for one query, including the frozen prefix.
@@ -374,6 +507,7 @@ class Session:
         usage: RunUsage | None = None,
         attempts: int = 1,
         context_warning: ContextWarning | None = None,
+        feedback_retries_used: int = 0,
     ) -> QueryResult[Any]:
         recorded = usage if usage is not None else RunUsage()
         return QueryResult(
@@ -389,6 +523,7 @@ class Session:
             round=query.round,
             elapsed_ms=elapsed_ms,
             context_warning=context_warning,
+            feedback_retries_used=feedback_retries_used,
         )
 
 
@@ -405,6 +540,7 @@ def build(
     executor: Executor | None = None,
     model_settings: ModelSettings | None = None,
     activity_options: ActivityOptions | None = None,
+    output_validator: OutputValidator | None = None,
     meta_keys: Sequence[str] | None = None,
     meta_renderer: MetaRenderer | None = None,
 ) -> Session:
@@ -430,6 +566,11 @@ def build(
     Durations are seconds. It does not change local execution or the prefix;
     leaving it unset preserves the five-minute activity timeout and retries
     derived from ``policy``.
+
+    ``output_validator`` is a worker-local sync or async output-only callback.
+    Return the validated output, or raise ``pydantic_ai.ModelRetry`` to send its
+    error back on this branch when ``policy.output_feedback_retries`` is enabled.
+    The callback is never serialized and does not affect the frozen prefix.
     """
     if output_mode not in ("auto", "tools", "prompted"):
         raise ForkReduceError("output_mode must be 'auto', 'tools', or 'prompted'")
@@ -481,6 +622,7 @@ def build(
         executor=executor,
         model_settings=model_settings,
         activity_options=activity_options,
+        output_validator=output_validator,
     )
     notice = prefix_context_warning(
         chosen,
@@ -499,12 +641,13 @@ def _build_agent(
     output_types: dict[str, type[BaseModel]],
     output_mode: ResolvedOutputMode,
     descriptions: dict[str, str],
+    output_feedback_retries: int = 0,
+    output_validator: OutputValidator | None = None,
 ) -> Agent[None, Any]:
     if output_mode == "tools":
-        # max_retries=0 so a bad payload raises instead of spending a second
-        # model call inside pydantic-ai. forkreduce owns the retry budget.
+        # Native retries are opt-in; the default still raises after one payload.
         output_spec: Any = [
-            ToolOutput(cls, name=name, description=descriptions.get(name), max_retries=0)
+            ToolOutput(cls, name=name, description=descriptions.get(name), max_retries=output_feedback_retries)
             for name, cls in output_types.items()
         ]
     else:
@@ -512,10 +655,13 @@ def _build_agent(
         # Each call passes its own PromptedOutput so the tail schema is the one
         # that gets validated.
         output_spec = PromptedOutput(list(output_types.values()), template=False)
-    return Agent(
+    agent: Agent[None, Any] = Agent(
         model,
         output_type=output_spec,
         instructions=instructions,
-        retries=0,
+        retries=output_feedback_retries,
         name="forkreduce",
     )
+    if output_validator is not None:
+        agent.output_validator(output_validator)
+    return agent

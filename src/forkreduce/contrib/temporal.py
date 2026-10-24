@@ -149,6 +149,7 @@ class FrozenPrefix:
     resolved_output_mode: ResolvedOutputMode | None = None
     on_unforced_tools: UnforcedToolsPolicy = "warn"
     app_meta: dict[str, JSONValue] = field(default_factory=dict)
+    output_feedback_retries: int = 0
 
     @property
     def documents(self) -> list[Document]:
@@ -158,6 +159,12 @@ class FrozenPrefix:
     def validate(self) -> None:
         """Reject corrupt snapshots before invoking a worker factory."""
         _app_meta_json(self.app_meta)
+        if (
+            isinstance(self.output_feedback_retries, bool)
+            or not isinstance(self.output_feedback_retries, int)
+            or self.output_feedback_retries < 0
+        ):
+            raise ValueError("Frozen output_feedback_retries must be a non-negative integer")
         resolved = self.resolved_output_mode
         if resolved is None:
             if self.output_mode not in {"tools", "prompted"}:
@@ -207,6 +214,7 @@ async def freeze_prefix(
         resolved_output_mode=session.resolved_output_mode,
         on_unforced_tools=session.on_unforced_tools,
         app_meta=cast(dict[str, JSONValue], json.loads(_app_meta_json({} if app_meta is None else app_meta))),
+        output_feedback_retries=session.policy.output_feedback_retries,
     )
     snapshot.validate()
     encoded = json.dumps(asdict(snapshot), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -297,6 +305,10 @@ def execution_fingerprint(session: Session) -> str:
             "max_total_tokens": budget.max_total_tokens,
         },
     }
+    if policy.output_feedback_retries:
+        payload["output_feedback_retries"] = policy.output_feedback_retries
+    if session.output_validator is not None:
+        payload["output_validator"] = canonical_value(session.output_validator)
     return json.dumps(payload, sort_keys=True, default=str)
 
 
@@ -343,16 +355,19 @@ def _attempt_detail() -> dict[str, int]:
     return {"forkreduce_attempt": activity.info().attempt if activity.in_activity() else 1}
 
 
-def to_application_error(failure: Failure) -> ApplicationError:
+def to_application_error(failure: Failure, *, feedback_retries_used: int = 0) -> ApplicationError:
     """Map a classified failure onto a Temporal application error.
 
     Validation and transport failures stay retryable. Permanent failures and
     budget exhaustion are ``non_retryable``.
     """
+    detail = _attempt_detail()
+    if feedback_retries_used:
+        detail["feedback_retries_used"] = feedback_retries_used
     return ApplicationError(
         failure.message,
         failure.kind.value,
-        _attempt_detail(),
+        detail,
         type=failure.kind.value,
         non_retryable=not failure.retryable,
     )
@@ -498,6 +513,8 @@ class QueryActivityOutput:
     failure_kind: QueryFailureKind | None = None
     failure_message: str | None = None
     failure_type: str | None = None
+    feedback_retries_used: int = 0
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 def _permanent(message: str) -> ApplicationError:
@@ -665,7 +682,7 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
     except ForkReduceError as exc:
         raise _permanent(str(exc)) from exc
     if result.failure is not None:
-        raise to_application_error(result.failure)
+        raise to_application_error(result.failure, feedback_retries_used=result.feedback_retries_used)
     dumped = ModelMessagesTypeAdapter.dump_json(result.messages)
     messages_ref: str | None = None
     messages_json: str | None = None
@@ -703,6 +720,8 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
         messages_json=messages_json,
         output_ref=output_ref,
         resolved_output_mode=result.resolved_output_mode,
+        feedback_retries_used=result.feedback_retries_used,
+        meta={"feedback_retries_used": result.feedback_retries_used},
     )
 
 
@@ -763,6 +782,7 @@ _FAILURE_TYPES = frozenset(
 def _failure_output(payload: QueryActivityInput, error: ActivityError | ChildWorkflowError) -> QueryActivityOutput:
     cause = error.__cause__
     attempts = 0
+    feedback_retries_used = 0
     details = (
         ()
         if isinstance(error, ChildWorkflowError)
@@ -777,6 +797,9 @@ def _failure_output(payload: QueryActivityInput, error: ActivityError | ChildWor
             attempt = detail.get("forkreduce_attempt")
             if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 0:
                 attempts = attempt
+            feedback = detail.get("feedback_retries_used")
+            if isinstance(feedback, int) and not isinstance(feedback, bool) and feedback >= 0:
+                feedback_retries_used = feedback
     kind: QueryFailureKind
     if isinstance(error, ChildWorkflowError):
         kind = "unknown"
@@ -813,6 +836,8 @@ def _failure_output(payload: QueryActivityInput, error: ActivityError | ChildWor
             if isinstance(cause, ApplicationError) and cause.type in _FAILURE_TYPES
             else None
         ),
+        feedback_retries_used=feedback_retries_used,
+        meta={"feedback_retries_used": feedback_retries_used},
     )
 
 

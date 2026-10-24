@@ -462,6 +462,14 @@ gap = GapFill(
 
 每个 scope 在同一前缀上问一次。位置（默认 `block_id`）已经出现在归并结果里的线索会被跳过。`LeadPolicy` 看到 `LeadReport` 后可以 `Accept`、按位置 `Drop`，或 `Fail`。默认是 `AcceptLeads`。
 
+### 输出校验错误回喂
+
+`Policy(output_feedback_retries=0)` 保持单次请求行为。启用 `Policy(output_feedback_retries=1)` 并在 `build(..., output_validator=validate_output)` 传入校验器，可在同一题历史上有界续写。校验器接收解析后的输出，支持同步或异步，返回接受/替换后的值，通过 Pydantic AI `ModelRetry` 将错误回喂模型。schema 与跨字段校验失败也走同一机制。回喂不会重建共享前缀：instructions、文档字节、工具集合不变，仅给本题历史追加 retry 消息。
+
+`QueryResult.feedback_retries_used` 和 `meta["feedback_retries_used"]` 记录实际回喂次数；本地外层重试会累加该数。每次实际请求（含回喂）之前都检查请求数/token 预算。`Policy.retries` 仍是独立的外层重试上限。回喂和校验器不改变 `prefix_hash`，非默认配置会改变 Temporal execution fingerprint。
+
+Temporal activity 使用 worker 登记或 factory 构建的 session，不序列化函数。`FrozenPrefix.output_feedback_retries` 保存数值策略；factory 应以 `Policy(output_feedback_retries=frozen.output_feedback_retries)` 恢复，并安装 worker 本地校验器。activity 成功/安全失败结果记录最后一次 activity attempt 的 `feedback_retries_used`，不猜测跨 Temporal attempt 的总数。校验错误会发送给模型，勿将敏感内容放入错误信息。
+
 ### 并发、重试、预算
 
 ```python

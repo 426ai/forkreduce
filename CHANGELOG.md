@@ -4,6 +4,8 @@
 
 ### Added
 
+- Bounded same-branch output feedback via `Policy(output_feedback_retries=0)` and worker-local `build(output_validator=...)` sync/async callbacks raising `ModelRetry`. Schema/cross-field errors share native Pydantic AI retry semantics; every actual request is budgeted. Results expose `feedback_retries_used` and matching metadata; frozen snapshots preserve the numeric setting, not callbacks. Default zero retains old request behavior and hashes; opt-in feedback/validators change execution fingerprints, not prefix hashes.
+
 - SDK-independent, JSON-serializable `ActivityOptions`, available on `build`, individual Temporal query payloads, and `MapQueriesInput`: start-to-close, heartbeat, schedule-to-close, total attempts, and exponential-backoff settings. Defaults remain five minutes and `Policy.retries + 1` attempts. Configured heartbeats cover the full asynchronous query activity, with cancellation cleanup.
 - Optional bounded child batching via `MapQueriesInput(batch_size=..., child_concurrency=...)` and `QueryBatchWorkflow`. Ordered results and deterministic child IDs include parent workflow ID, prefix hash, and batch index; IDs survive workflow retries that change run ID. Single-workflow/list-input mode stays the default.
 - `PrefixStore`, `FrozenPrefix`, `freeze_prefix`, `set_prefix_store`, and worker-local `register_session_factory` support document reconstruction from references. Batched mode requires external transcript/result storage and returns `messages_ref` / `output_ref`, keeping transcript and structured-output bodies out of parent history. The in-memory store remains test-only, not a durable backend.
@@ -50,6 +52,8 @@ Public `QueryFailureKind` is exported from `forkreduce.contrib.temporal` as a `L
 | `unknown` | Ambiguous terminal application/SDK failure or failed child batch. |
 
 ### Upgrade notes
+
+- **Output feedback:** restore `FrozenPrefix.output_feedback_retries` and worker-local validators in session factories. Feedback is bounded within one local/activity attempt; the existing outer/Temporal retry budget remains separate. Validation messages are intentionally sent to the model and must not contain secrets. Temporal failure counts describe the final observed attempt rather than a guessed cross-attempt total.
 
 - **Provider dependencies:** applications relying on previously transitive vendor SDKs must install `forkreduce[full]` or their provider's slim extra explicitly. `forkreduce[temporal]` continues to install the Temporal SDK; official Pydantic AI plugin users must satisfy that plugin's own optional dependencies.
 

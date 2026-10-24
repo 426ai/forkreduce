@@ -71,6 +71,11 @@ class QueryResult(Generic[T]):
 
     ``resolved_output_mode`` records the actual session mode on successes and
     failures. ``None`` is retained only for legacy/manually constructed results.
+
+    ``feedback_retries_used`` counts additional model requests sent for native
+    output validation, summed across local executor attempts. ``attempts`` keeps
+    its outer-attempt meaning. ``meta`` always contains the same feedback count;
+    session-created metadata does not copy query text or caller query metadata.
     """
 
     query_id: str
@@ -88,3 +93,8 @@ class QueryResult(Generic[T]):
     check_failures: list[CheckFailure] = field(default_factory=list)
     context_warning: ContextWarning | None = None
     resolved_output_mode: ResolvedOutputMode | None = None
+    feedback_retries_used: int = 0
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.meta = {**self.meta, "feedback_retries_used": self.feedback_retries_used}

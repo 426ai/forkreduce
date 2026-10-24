@@ -112,6 +112,11 @@ class Policy:
 
     The output is never discarded silently; dropped and failing items stay on the
     run report.
+
+    ``output_feedback_retries`` allows this many native output-validation
+    retries on the same branch within each execution attempt. It defaults to
+    zero; ``retries`` still bounds the executor's separate outer attempts.
+    Every feedback request consumes the same session budget as an initial call.
     """
 
     concurrency: int = 8
@@ -123,12 +128,15 @@ class Policy:
     budget_policy: Callable[[BudgetReport], Action] | None = None
     context_limit: int | None = None
     context_reserve: int | None = None
+    output_feedback_retries: int = 0
 
     def __post_init__(self) -> None:
         if self.concurrency < 1:
             raise ValueError("concurrency must be >= 1")
         if self.retries < 0:
             raise ValueError("retries must be >= 0")
+        if self.output_feedback_retries < 0:
+            raise ValueError("output_feedback_retries must be >= 0")
         if self.retry_backoff < 0 or self.max_backoff < 0:
             raise ValueError("backoff must be >= 0")
         if self.repair_failure not in {"needs_review", "drop", "fail"}:
