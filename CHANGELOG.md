@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add a source-tree-only CUAD benchmark with three method adapters, offline FunctionModel/TestModel coverage, provider-response usage accounting, span/citation metrics, contract-cluster confidence intervals, and real-data cost estimation. Paid execution requires separate estimate approval; benchmark dependencies and downloaded data stay outside the core wheel.
+
 ## 0.1.1
 
 Backward compatible. Calls that do not opt in to rendering `Block.meta` keep the same prefix hash as 0.1.0.

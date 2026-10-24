@@ -578,8 +578,8 @@ set_message_store(InMemoryMessageStore())
 From a checkout:
 
 ```bash
-pip install -e ".[dev]"
-ruff check src tests examples && ruff format --check src tests examples
+pip install -e ".[dev]" -r benchmarks/requirements.txt
+ruff check src tests examples benchmarks && ruff format --check src tests examples benchmarks
 mypy
 pytest
 ```
@@ -597,6 +597,13 @@ OPENAI_API_KEY=... OPENAI_MODEL=... OPENAI_BASE_URL=... python examples/run_live
 ```
 
 `FORKREDUCE_MODEL` is accepted as another name for the model.
+
+The source-tree [CUAD benchmark](benchmarks/README.md) compares fork/reduce,
+multi-step tool use, and one-shot answering. `python -m benchmarks estimate`
+downloads public data and estimates costs without model calls;
+`python -m benchmarks smoke` exercises all adapters with a local `FunctionModel`.
+Paid execution requires separate approval of the estimate and explicit opt-in.
+
 
 ## Releasing
 
