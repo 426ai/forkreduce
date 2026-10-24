@@ -613,6 +613,14 @@ Batch mode requires a `MessageStore` and returns `messages_ref` plus `output_ref
 
 `MessageStore` / `PrefixStore` retain the legacy async `put(key, bytes)` / `get(ref)` protocol. A `ContextMessageStore` instead accepts keyword-only `context: StoreContext` on both methods. The adapter inspects signatures before calling; it never retries a write after `TypeError`. Implement shared durable storage for production; `InMemoryMessageStore` is process-local and test-only.
 
+#### Concurrency, queues and cache warmup
+
+`MapQueriesInput(activity_concurrency=None, task_queue=None, warmup="none")` preserves the default fan-out and inherited queue. Set a positive `activity_concurrency` to bound in-flight queries in each child batch, or in the entire direct map when batching is off; `1` is serial. With batches, the upper bound is `child_concurrency * min(batch_size, activity_concurrency)` when a limit is set. Worker capacity and service limits can reduce it further.
+
+`task_queue="model-work"` routes both children and query activities to that queue. Register the child workflow and activity there; the parent workflow may run on a separate queue. Leaving it `None` inherits the current workflow queue.
+
+`warmup="first"` completes the first query before releasing any others. In batched mode, the parent awaits a singleton child at batch index zero, then schedules remaining batches from index one. `warmup="per_batch"` completes each batch's first query before releasing its remaining queries; a direct map is one batch. A returned query/child failure also opens the gate; raise mode still propagates failure and workflow cancellation always propagates. Warmup preserves result order and deterministic IDs but cannot guarantee provider cache hits. These orchestration settings do not change prefix hashes or session execution fingerprints.
+
 #### Worker-restart-safe integration
 
 This runnable storage implementation persists across local worker restarts. Use a shared object store/database for distributed workers; every worker must resolve the same references. Application credentials and output classes remain local. `model`, `session`, `Answer`, `questions`, and `client` below are the application objects from the recipe above.

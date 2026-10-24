@@ -740,6 +740,9 @@ class MapQueriesInput:
     child_concurrency: int = 4
     activity_options: ActivityOptions | None = None
     on_query_failure: Literal["raise", "return"] = "raise"
+    activity_concurrency: int | None = None
+    task_queue: str | None = None
+    warmup: Literal["none", "first", "per_batch"] = "none"
 
 
 def activity_timeout_options(options: ActivityOptions | None) -> dict[str, Any]:
@@ -845,6 +848,8 @@ async def _execute_activity(
     payload: QueryActivityInput,
     retry_policy: RetryPolicy,
     on_query_failure: Literal["raise", "return"] = "raise",
+    *,
+    task_queue: str | None = None,
 ) -> QueryActivityOutput:
     if workflow.in_workflow():
         parent = workflow.info().parent
@@ -855,12 +860,44 @@ async def _execute_activity(
             payload,
             activity_id=activity_id(payload.prefix_hash, payload.query_id),
             retry_policy=retry_policy,
+            task_queue=task_queue,
             **activity_timeout_options(payload.activity_options),
         )
     except ActivityError as exc:
         if on_query_failure == "raise" or (workflow.in_workflow() and workflow.cancellation_reason() is not None):
             raise
         return _failure_output(payload, exc)
+
+
+def _validate_scheduling(config: MapQueriesInput) -> None:
+    limit = config.activity_concurrency
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise _permanent("activity_concurrency must be a positive integer or None")
+    if config.warmup not in {"none", "first", "per_batch"}:
+        raise _permanent("warmup must be 'none', 'first', or 'per_batch'")
+
+
+async def _run_queries(queries: list[QueryActivityInput], config: MapQueriesInput) -> list[QueryActivityOutput]:
+    """Hold a slot through each query; warmup gates only the selected scope."""
+    _validate_scheduling(config)
+    slots = asyncio.Semaphore(config.activity_concurrency) if config.activity_concurrency is not None else None
+
+    async def execute(query: QueryActivityInput) -> QueryActivityOutput:
+        return await _execute_activity(
+            query, activity_retry_policy(query), config.on_query_failure, task_queue=config.task_queue
+        )
+
+    async def bounded(query: QueryActivityInput) -> QueryActivityOutput:
+        if slots is None:
+            return await execute(query)
+        async with slots:
+            return await execute(query)
+
+    first: list[QueryActivityOutput] = []
+    if config.warmup != "none" and queries:
+        first.append(await bounded(queries[0]))
+        queries = queries[1:]
+    return [*first, *await asyncio.gather(*(bounded(query) for query in queries))]
 
 
 @workflow.defn(name="forkreduce.query_batch")
@@ -879,11 +916,7 @@ class QueryBatchWorkflow:
             )
             for query in inputs.queries
         ]
-        outputs = list(
-            await asyncio.gather(
-                *(_execute_activity(query, activity_retry_policy(query), inputs.on_query_failure) for query in queries)
-            )
-        )
+        outputs = await _run_queries(queries, inputs)
         if any(
             output.messages_json is not None
             or output.messages_ref is None
@@ -907,19 +940,13 @@ class MapQueriesWorkflow:
     @workflow.run
     async def run(self, inputs: list[QueryActivityInput] | MapQueriesInput) -> list[QueryActivityOutput]:
         config = MapQueriesInput(queries=inputs) if isinstance(inputs, list) else inputs
+        _validate_scheduling(config)
         queries = [
             replace(query, activity_options=config.activity_options or query.activity_options)
             for query in config.queries
         ]
         if config.batch_size is None:
-            return list(
-                await asyncio.gather(
-                    *(
-                        _execute_activity(query, activity_retry_policy(query), config.on_query_failure)
-                        for query in queries
-                    )
-                )
-            )
+            return await _run_queries(queries, config)
         if isinstance(config.batch_size, bool) or not isinstance(config.batch_size, int) or config.batch_size < 1:
             raise _permanent("batch_size must be a positive integer")
         if (
@@ -937,12 +964,14 @@ class MapQueriesWorkflow:
                 try:
                     return await workflow.execute_child_workflow(
                         QueryBatchWorkflow.run,
-                        MapQueriesInput(
+                        replace(
+                            config,
                             queries=items,
-                            activity_options=config.activity_options,
-                            on_query_failure=config.on_query_failure,
+                            batch_size=None,
+                            warmup="per_batch" if config.warmup == "per_batch" else "none",
                         ),
                         id=child_workflow_id(items[0].prefix_hash, index),
+                        task_queue=config.task_queue,
                     )
                 except ChildWorkflowError as exc:
                     if config.on_query_failure == "raise" or (
@@ -951,10 +980,17 @@ class MapQueriesWorkflow:
                         raise
                     return [_failure_output(query, exc) for query in items]
 
+        first: list[QueryActivityOutput] = []
+        batch_offset = 0
+        if config.warmup == "first" and queries:
+            first = await batch(0, queries[:1])
+            queries = queries[1:]
+            batch_offset = 1
+
         batches = await asyncio.gather(
             *(
-                batch(index, queries[start : start + config.batch_size])
+                batch(index + batch_offset, queries[start : start + config.batch_size])
                 for index, start in enumerate(range(0, len(queries), config.batch_size))
             )
         )
-        return [output for outputs in batches for output in outputs]
+        return [*first, *(output for outputs in batches for output in outputs)]

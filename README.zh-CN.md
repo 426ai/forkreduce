@@ -613,6 +613,14 @@ Temporal 默认 converter 和 `PydanticAIPlugin` 安装的 `PydanticAIPayloadCon
 
 `MessageStore` / `PrefixStore` 保留旧异步 `put(key, bytes)` / `get(ref)` 协议；新 `ContextMessageStore` 在两者上接受 keyword-only `context: StoreContext`。适配器先检测签名，绝不捕获 `TypeError` 后重复写入。生产应接所有 worker 共享的持久存储；`InMemoryMessageStore` 只适合单进程测试。
 
+#### 并发、队列与缓存预热
+
+`MapQueriesInput(activity_concurrency=None, task_queue=None, warmup="none")` 保持默认并发调度及队列继承。正整数 `activity_concurrency` 限制每个 child batch 的在途题数；未分批时限制整个直接 map，`1` 表示串行。设限后分批总并发上界为 `child_concurrency * min(batch_size, activity_concurrency)`，worker 容量和服务限制还可能降低实际并发。
+
+`task_queue="model-work"` 同时将 child 和 query activity 路由到该队列，须在那里注册批 workflow 与 activity；父 workflow 可运行在另一个队列。`None` 继承当前 workflow 队列。
+
+`warmup="first"` 先完整完成第一题再放开其余题；分批时父 workflow 先等待 batch index zero 的单题 child，后续批从 index one 调度。`warmup="per_batch"` 各批先完成本批第一题，直接 map 视作一批。return 模式的失败结果也会打开预热门，raise 模式仍向上抛错，workflow 取消始终传播。结果顺序及 ID 确定性不变；预热不保证供应商缓存命中。这些编排选项不改变 prefix hash 或 session execution fingerprint。
+
 #### Worker 重启安全的接入示例
 
 下面的 SQLite store 可跨本地 worker 重启保留引用；分布式 worker 应改用共享对象存储或数据库，确保每个 worker 都能读取同一引用。凭证和输出类始终留在应用进程内。`model`、`session`、`Answer`、`questions`、`client` 沿用上面的应用配置。

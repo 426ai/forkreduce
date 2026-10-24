@@ -4,6 +4,8 @@
 
 ### Added
 
+- `MapQueriesInput.activity_concurrency`, `task_queue`, and `warmup="none"|"first"|"per_batch"` control direct/per-child query concurrency, child/activity queue routing, and deterministic warmup gates. A first returned failure releases warmup; raise/cancellation propagation remains unchanged. Default settings preserve fan-out/queue behavior and do not change prefix hashes or session execution fingerprints.
+
 - Bounded same-branch output feedback via `Policy(output_feedback_retries=0)` and worker-local `build(output_validator=...)` sync/async callbacks raising `ModelRetry`. Schema/cross-field errors share native Pydantic AI retry semantics; every actual request is budgeted. Results expose `feedback_retries_used` and matching metadata; frozen snapshots preserve the numeric setting, not callbacks. Default zero retains old request behavior and hashes; opt-in feedback/validators change execution fingerprints, not prefix hashes.
 
 - SDK-independent, JSON-serializable `ActivityOptions`, available on `build`, individual Temporal query payloads, and `MapQueriesInput`: start-to-close, heartbeat, schedule-to-close, total attempts, and exponential-backoff settings. Defaults remain five minutes and `Policy.retries + 1` attempts. Configured heartbeats cover the full asynchronous query activity, with cancellation cleanup.
@@ -52,6 +54,8 @@ Public `QueryFailureKind` is exported from `forkreduce.contrib.temporal` as a `L
 | `unknown` | Ambiguous terminal application/SDK failure or failed child batch. |
 
 ### Upgrade notes
+
+- **Scheduling:** workers on an explicit `task_queue` must register child workflows and activities there. `activity_concurrency` is per batch, not a global distributed semaphore. First warmup uses a singleton first child when batching; changing orchestration for existing executions requires draining/versioning and replay as described below.
 
 - **Output feedback:** restore `FrozenPrefix.output_feedback_retries` and worker-local validators in session factories. Feedback is bounded within one local/activity attempt; the existing outer/Temporal retry budget remains separate. Validation messages are intentionally sent to the model and must not contain secrets. Temporal failure counts describe the final observed attempt rather than a guessed cross-attempt total.
 
