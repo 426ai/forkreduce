@@ -86,7 +86,9 @@ from pydantic import BaseModel, Field
 from pydantic_ai.models.test import TestModel
 
 from forkreduce import (
+    CITATION_INSTRUCTIONS,
     Block,
+    Citation,
     CitationCheck,
     CitationRepair,
     Document,
@@ -96,12 +98,10 @@ from forkreduce import (
 )
 
 
-class Answer(BaseModel):
+class Answer(Citation):
     """One fact from the notice."""
 
     text: str
-    quote: str
-    block_id: str
 
 
 class Finding(Traced):
@@ -131,7 +131,7 @@ async def main() -> None:
     session = build(
         TestModel(custom_output_args={"text": "see notice", "quote": "Eligible titles", "block_id": "titles"}),
         documents=notice,
-        instructions="Answer only from the notice. Cite a quote and its block_id.",
+        instructions="Answer only from the notice. " + CITATION_INSTRUCTIONS,
         outputs=[Answer, FindingList],
     )
     result = await (
@@ -244,7 +244,7 @@ session = build(
     documents=notice,               # str, sequence of str, Block, Document, or a sequence of those
     instructions="...",
     outputs=[Answer, FindingList],  # unique BaseModel subclasses; tool name is the class name
-    output_mode="tools",            # or "prompted"
+    output_mode="auto",             # default; or explicitly "tools" / "prompted"
     policy=Policy(concurrency=8, retries=2),
     warmup=True,
     executor=None,                  # default LocalExecutor(policy)
@@ -252,7 +252,35 @@ session = build(
 )
 ```
 
-`session.prefix_hash` is a SHA-256 of a canonical JSON document: version, output mode, instructions, cleaned documents, and each tool's name, description, and schema. Rebuilding the same session produces the same hash. Changing a tool schema, the instructions, or the document text changes the hash.
+`session.prefix_hash` is a SHA-256 of a canonical JSON document: version, **resolved** output mode, instructions, cleaned documents, and each tool's name, description, and schema. Rebuilding the same session produces the same hash. Changing a tool schema, the instructions, or the document text changes the hash. The hash algorithm is unchanged: default `"auto"` resolving to tools preserves the old tools hash; resolving to prompted changes the old default hash. Explicit tools/prompted hashes remain stable. There is no `"auto"` marker in the hash.
+
+`build()` defaults to `output_mode="auto"`: it chooses tools only when the resolved model profile and effective settings support **forced output-tool use**, otherwise prompted JSON validated against the same registered Pydantic type. `session.output_mode` retains the requested mode (`"auto"`, `"tools"`, or `"prompted"`); `session.resolved_output_mode` is `"tools"` or `"prompted"`. Every actual `QueryResult`, including failures and combined reduce results, records `resolved_output_mode`; `None` is only the legacy/manual-construction default. This is a build-time capability decision, not a fallback after a failed provider request. Tools mode never silently accepts JSON text or switches modes after a response. Registered schemas remain part of `prefix_hash` in prompted mode, although their JSON is sent only in query tails, not in the provider's shared prompt prefix.
+
+Explicit modes are honored. Explicit `"tools"` without effective forced-tool support emits `UnforcedToolsWarning` by default; `on_unforced_tools="error"` raises `UnforcedToolsError`, and `"ignore"` suppresses this diagnostic (neither setting adds provider capability). The policy applies at build and when query settings change capability. For an auto session, a `Query.model_settings` override that would change the resolved mode raises `OutputModeConflictError` before budget reservation or a provider call: build a new session with those settings instead. Settings merge shallowly in order: model defaults, build settings, query overrides; a query `extra_body` replaces the whole session value.
+
+The limitation can belong to the **model/vendor API**, especially in thinking mode, rather than a gateway. [MiMo's OpenAI-compatible API reference](https://mimo.mi.com/docs/en-US/api/chat/openai-api) documents that non-`auto` `tool_choice` values are removed and behave as `auto`; [DeepSeek issue #1376](https://github.com/deepseek-ai/DeepSeek-V3/issues/1376) reports HTTP 400 for forced choices while thinking is enabled. [Pydantic AI PR #7450](https://github.com/pydantic/pydantic-ai/pull/7450) describes request-dependent forcing and implicit downgrades to `auto`. These sources do not establish that every model or endpoint has the same restriction. Supply an accurate `profile` for a custom endpoint; `supports_tools=True` alone does not promise forced output.
+
+In installed Pydantic AI 2.61, the public `ModelProfile` fields all exist with these defaults:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `supports_tools` | `True` | Can use tools at all. |
+| `supports_forced_tool_choice` | `True` | Accepts required/named forced tool choice. When false, SDK-generated forcing can become `auto`; explicit forcing raises an SDK `UserError`. |
+| `supports_forced_tool_choice_with_thinking` | `True` | Forcing remains supported while this request thinks. |
+| `thinking_enabled_by_default` | `False` | Thinks when no setting overrides it; does not mean thinking is impossible to disable. |
+| `supports_thinking` | `False` | Supports unified thinking configuration; when false the SDK ignores unified `thinking`. |
+| `thinking_always_enabled` | `False` | Thinking cannot be disabled; implies thinking support, and `thinking=False` only selects the lowest accepted effort. |
+| `forced_tool_choice_disables_thinking` | `False` | Forcing would suppress thinking; while thinking is active, the SDK avoids its implicit output-tool forcing. |
+
+`default_structured_output_mode="tool"` is the SDK's preference, not a capability guarantee. forkreduce's auto rule selects only tools or prompted output, never native structured output.
+
+The exact rule requires both tools and forced-tool support; while thinking is active it also requires `supports_forced_tool_choice_with_thinking=True` and `forced_tool_choice_disables_thinking=False`. `thinking_always_enabled` always wins. Recognized provider controls take precedence over unified `thinking`: `openai_reasoning_effort` / `extra_body.reasoning_effort` (`none` disables); `anthropic_thinking.type` / `extra_body.thinking.type` (enabled/adaptive enables, disabled disables); boolean `extra_body.chat_template_kwargs.enable_thinking` (also in top-level `chat_template_kwargs`); and `google_thinking_config.thinking_budget` (zero disables, other values including -1 enable) or `thinking_level` (minimal/low/medium/high all enable). Conflicting controls conservatively mean active thinking. Otherwise unified `thinking` is honored only with `supports_thinking=True`, then the rule falls back to `thinking_enabled_by_default`. Unknown non-`None` thinking/reasoning-shaped settings, including malformed recognized controls, raise `ForkReduceError` with code `unknown_thinking_control` in auto; explicit tools treats forcing as unavailable and applies the warning policy, while explicit prompted is honored. Display-only `include_thoughts`, `openai_reasoning_summary`, and `openai_reasoning_generate_summary` do not enable thinking. There are no model-name guesses.
+
+Thinking controls are inspected only when they can change forcing capability: if tools or forcing are unsupported, auto resolves directly to prompted; if forcing works with thinking and does not disable it, auto resolves directly to tools. These unconditional profiles do not reject irrelevant unknown thinking controls. The unknown-control error and conservative explicit-tools diagnostic above apply only to conditional profiles.
+
+Give reasoning models output headroom: a provider's completion cap can include both reasoning tokens and the visible answer. A small `max_tokens` may be exhausted before any JSON or tool arguments appear. For example, pass `model_settings={"max_tokens": 8192}` to `build()` (or `max_tokens=8192` to `openai_compatible_model()`) and size it for your workload and provider; 8,192 is an example, not a guarantee against truncation or a billing limit. Do not assume a gateway supports reasoning-effort controls without checking its contract.
+
+[MiMo's deep-thinking guide](https://mimo.mi.com/docs/en-US/quick-start/usage-guide/text-generation/deep-thinking) also documents that its listed thinking models ignore requested `temperature`/`top_p` and use `1.0`/`0.95`. Thus requesting `temperature=0` does not guarantee deterministic output in that mode.
 
 `documents` accepts a string (one block, id `b1`), a sequence of strings (`b1`, `b2`, ...), or `Block` / `Document` values. Text is stripped of control characters before it is rendered or hashed. The rendered prefix ends with a line `===END_FIXED_DOCUMENTS===`.
 
@@ -320,7 +348,11 @@ Passing a `history` that does not start with the rendered documents emits `Prefi
 
 Matching is case-sensitive.
 
-`CitationRepair(max_rounds=2, allowed_fields=("quote", "block_id"))` continues the same branch and asks for the same output type. Whatever the model returns, `apply` deep-copies the original object and copies only the allowed fields at each failing path. Other fields stay as they were. There is no separate repair schema, so the tool set does not change.
+`Citation` is a reusable Pydantic model with described `quote` and `block_id` fields: use it in a list or inherit it to add answer fields, as above. Each quote must be one contiguous passage entirely inside the single referenced block. Text appearing elsewhere in the document is not a valid quote for that block. Split evidence crossing block boundaries into separate citations with their own block IDs; do not concatenate blocks into one quote.
+
+Append the opt-in `CITATION_INSTRUCTIONS` string to your session instructions when asking for citations. Nothing is injected into unrelated sessions, and the schema and instructions do not replace `CitationCheck`. Adopting `Citation` changes the registered output schema and hence `prefix_hash`; appending the instructions also changes the frozen prompt and hash. Existing custom schemas and instructions retain their previous hashes. Reduce and repair guidance changes only query tails, not the frozen prefix or hash.
+
+`CitationRepair(max_rounds=2, allowed_fields=("quote", "block_id"))` continues the same branch and asks for the same output type. Its instructions repeat the single-block rule; under the default field restriction, repair must shorten a quote or correct its block ID rather than add or split output entries. Whatever the model returns, `apply` deep-copies the original object and copies only the allowed fields at each failing path. Other fields stay as they were. There is no separate repair schema, so the tool set does not change.
 
 ```python
 session.map(queries).check(
@@ -350,7 +382,9 @@ Predicates are AND-ed. A rejected output remains on `RunResult.results` and is n
 
 ### Semantic reduce and coverage
 
-A reduce is a normal query on the same session, so it hits the same prefix. The tail lists each input as `id: ...` plus its JSON, and asks for `source_ids` copied from those ids.
+A reduce is a normal query on the same session, so it hits the same prefix. The tail lists each input as `id: ...` plus its JSON and an explicit allowed source-ID list. `source_ids` must identify those input items (for map results, the query/fork IDs), not document or block IDs found inside their values. Replace inherited `source_ids` with the current batch's input IDs; do not mix in evidence addresses.
+
+When inputs contain string `question_id` fields, including nested models, dictionaries, lists, and tuples, the tail also maps each question to its allowed input IDs, for example `{"opening": ["fork:0"], "closing": ["fork:1"]}`. Repeated questions collect all matching input IDs. This is generic guidance, not a domain-specific validator; the provenance check below remains unchanged. Inputs without question IDs work as before, and tree batches use their current alias IDs before final expansion.
 
 ```python
 class ExplainUncovered:
@@ -516,30 +550,96 @@ The OpenAI client is constructed with `max_retries=0`. forkreduce does the retry
 
 ### Temporal (optional)
 
-`import forkreduce` does not import `temporalio`. The adapter is `forkreduce.contrib.temporal` and needs `pip install "forkreduce[temporal]"`.
+Install `forkreduce[temporal]`; core imports never load `temporalio`. Each `forkreduce.run_query` activity calls `Session.run_once` exactly once. Temporal owns retries: validation/transport failures remain retryable, permanent/budget failures do not. Defaults are unchanged: one `forkreduce.map_queries` workflow, five-minute start-to-close, no heartbeat timeout, and `Policy.retries + 1` total attempts.
 
-Each query is one activity. The activity calls `Session.run_once` (a single attempt) and raises `ApplicationError`. `non_retryable` follows `Failure.retryable`: validation and transport stay retryable; permanent failures and budget exhaustion do not. `temporal_retry_policy(policy)` sets `maximum_attempts` to `policy.retries + 1`.
+#### Options and plugin worker
 
-The idempotency key is `forkreduce:{prefix_hash}:{query_id}` via `activity_id`. Register the built session on the worker with `register_session(session)` before the workflow runs. Registering another session with the same prefix hash but a different model, request-body settings, model profile, or policy raises `ForkReduceError`; call `unregister_session` first. The same fingerprint may replace the session. `timeout` and `extra_headers` are not part of the fingerprint. A per-query `model_settings` override is not either; pass it to `query_activity_input(..., model_settings=...)` so the worker applies it for that activity. The workflow payload carries the prefix hash, the tail, the output name, and the retry budget (`max_attempts`, backoff), not the model. `MapQueriesWorkflow` uses that budget. `query_activity_input(session, ...)` copies `Policy.retries + 1` into `max_attempts`. Without a message store, pass the previous activity's `messages_json` back as `history_json` to continue a branch.
+`ActivityOptions` durations are **seconds**. Set them on `build`, override one payload's `activity_options`, or replace them for the whole workflow via `MapQueriesInput.activity_options`. Unspecified retry fields inherit the payload's policy-derived budget/backoff; `maximum_attempts` includes the first attempt. Recipe: **2 attempts / 3 minutes / 30-second heartbeat**.
 
-Large transcripts should not be activity return values. Pass a `MessageStore` to `set_message_store`. With a store, the activity returns `messages_ref` and leaves `messages_json` empty. Without one, messages are inlined, which is fine for tests and a poor fit for real histories. `InMemoryMessageStore` is process-local.
+```python
+from forkreduce import ActivityOptions, build
+from forkreduce.contrib.temporal import (
+    MapQueriesInput, MapQueriesWorkflow, QueryBatchWorkflow,
+    query_activity_input, register_session, run_query_activity,
+)
+from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
+from temporalio.client import Client
+from temporalio.worker import Worker
 
-`MapQueriesWorkflow` fans the activities out. It does not call the model itself. Deterministic decisions (coverage math, lead filtering) can run in the workflow after the activities return; model calls stay in activities.
+session = build(
+    model, documents=document, instructions="Answer from the document.", outputs=[Answer],
+    activity_options=ActivityOptions(
+        start_to_close=180, heartbeat_timeout=30, maximum_attempts=2,
+        # schedule_to_close=600, retry_backoff=1, max_backoff=8, backoff_coefficient=2,
+    ),
+)
+register_session(session)  # every activity worker process
+client = await Client.connect("localhost:7233", plugins=[PydanticAIPlugin()])
+async with Worker(
+    client, task_queue="extraction",
+    workflows=[MapQueriesWorkflow, QueryBatchWorkflow],
+    activities=[run_query_activity],  # inherits the client's plugin
+):
+    results = await client.execute_workflow(
+        MapQueriesWorkflow.run,
+        [query_activity_input(session, query_id="q1", tail="What is required?", output_name="Answer")],
+        id="extraction-run-1", task_queue="extraction",
+    )
+```
+
+Both Temporal's default converter and `PydanticAIPlugin`'s `PydanticAIPayloadConverter` have offline workflow/replay coverage. forkreduce's per-query activities coexist with official `TemporalDurability` agents on the same worker: register those agents/workflows normally, without wrapping these activity calls in another retry loop. Install Pydantic AI's `[temporal]` extra for its official integration. For a default-converter worker, set `workflow_runner=SandboxedWorkflowRunner(restrictions=SandboxRestrictions.default.with_passthrough_modules("forkreduce", "pydantic_ai"))`; both classes come from `temporalio.worker.workflow_sandbox`. This avoids reimporting model dependencies inside the sandbox.
+
+When configured, periodic heartbeats continue while awaiting the model. They signal liveness, not business progress. Blocking the event loop prevents heartbeats: move CPU work to a thread/separate activity and keep a finite start-to-close timeout. Local execution ignores `ActivityOptions`; they never change prefix bytes/hash.
+
+Registration is process-local. Payloads carry hashes, tails, output names, options, and optional per-query `model_settings`, never model instances or Python classes. Conflicting model/request-body settings/profile/policy registrations raise `ForkReduceError`; unregister before replacement. `timeout`/`extra_headers` remain outside the fingerprint. Settings must be JSON-serializable. `activity_id(prefix_hash, query_id)` remains `forkreduce:{prefix_hash}:{query_id}`. Inline single-workflow continuations still accept the previous `messages_json` as `history_json`.
+
+#### Bounded batches and references
+
+`MapQueriesInput(queries=payloads, batch_size=15, child_concurrency=4)` runs bounded child workflows; register **both** `MapQueriesWorkflow` and `QueryBatchWorkflow`. Results preserve input order. Child IDs derive from the parent workflow ID, prefix hash, and batch index. They stay stable on replay and workflow retries that change the run ID; distinct parent workflow IDs do not collide. This is orchestration identity, not exactly-once provider billing.
+
+Batch mode requires a `MessageStore` and returns `messages_ref` plus `output_ref`, not transcript/structured-output bodies. Parent history is independent of transcript size, but query tails, metadata, and reference lists still occupy history. Keep them small. Batch continuations require `history_ref`, not inline `history_json`. Single-workflow/list-input mode keeps inline behavior for small cases.
+
+`MessageStore` and `PrefixStore` use async `put(key, bytes) -> ref` / `get(ref) -> bytes`. Implement durable object storage/database access shared by every worker; `InMemoryMessageStore` is process-local, for examples/tests only. Freeze large prefixes outside workflow code, e.g. in an application's `prepare` activity, returning only references and small query payloads:
 
 ```python
 from forkreduce.contrib.temporal import (
-    InMemoryMessageStore,
-    MapQueriesWorkflow,
-    QueryActivityInput,
-    register_session,
-    run_query_activity,
-    set_message_store,
-    temporal_retry_policy,
+    freeze_prefix, register_session_factory, set_prefix_store, set_message_store,
 )
 
-register_session(session)
-set_message_store(InMemoryMessageStore())
+# Client or prepare activity; store is your durable implementation.
+prefix_ref = await freeze_prefix(session, store)
+payloads = [
+    query_activity_input(
+        session, query_id=f"q{i}", tail=question, output_name="Answer", prefix_ref=prefix_ref,
+    )
+    for i, question in enumerate(questions)
+]
+
+# Every worker: model credentials and output classes stay local.
+def restore(frozen):
+    return build(
+        model, documents=frozen.documents, instructions=frozen.instructions,
+        outputs=[Answer], output_mode=frozen.output_mode,
+        on_unforced_tools=frozen.on_unforced_tools,
+    )
+
+set_prefix_store(store)
+set_message_store(store)
+register_session_factory(session.prefix_hash, restore)
+# Execute while the worker above is running:
+results = await client.execute_workflow(
+    MapQueriesWorkflow.run,
+    MapQueriesInput(queries=payloads, batch_size=15, child_concurrency=4),
+    id="extraction-run-2", task_queue="extraction",
+)
+answer = Answer.model_validate_json(await store.get(results[0].output_ref))
+# Continue with history_ref=results[0].messages_ref.
 ```
+
+`FrozenPrefix` stores documents, instructions, rendered prefix and tool identity, not executable model/schema objects. Reconstruction verifies the prefix hash: use matching schemas/rendering configuration. Configure factories at worker startup and retain blobs through retry/continuation lifetimes. Persist references and final application results; completed workflow streams are not a replayable archive. Drain in-flight workflows or use worker versioning/new task queues for incompatible orchestration changes, and replay representative old histories before migrating. Converter tests are not a guarantee that arbitrary old workflow code replays after orchestration changes.
+`FrozenPrefix.output_mode` retains the requested mode, including `"auto"`; `FrozenPrefix.resolved_output_mode` records the actual mode (`None` for legacy snapshots), and `on_unforced_tools` preserves the diagnostic policy. Restore the requested mode and policy as above, and supply the same thinking-related model/session settings in the factory. Workers verify the reconstructed resolved mode and prefix hash: changed capabilities/settings must fail rather than silently restore a different output contract. The factory still owns model/settings; settings that may contain transport credentials are not serialized into the snapshot.
+Factories run per activity attempt by default; this avoids silently sharing mutable session budgets across workflows. For worker-local reuse, the factory may return an explicitly managed cached session or call `register_session`. Applications own that cache's synchronization, lifetime, and budget scope.
+
 
 ## Caching caveats
 
@@ -553,9 +653,9 @@ set_message_store(InMemoryMessageStore())
 
 **History.** Continuing a branch sends the prior question and answer as well as the prefix. That also hits a prefix cache, including the earlier turns, as long as those bytes are unchanged. Timestamps and run ids are not part of the prefix check; the check compares the rendered document text.
 
-**Prompted mode.** `output_mode="prompted"` puts no tools on the agent. The schema of the expected type is appended to the tail only, so different queries can use different registered types without busting the prefix. The tool-mode cache is more stable when every call shares one tool list, which is why `"tools"` is the default.
+**Prompted mode.** A session resolved to `"prompted"` puts no tools on the agent. The schema of the expected type is appended to the tail only, so different queries can use different registered types without busting the prefix. Tools mode keeps one stable tool list when forced output-tool use is supported; default `"auto"` selects it only in that case.
 
-**Sampling and transport.** `temperature`, `top_p`, `max_tokens`, `seed`, penalties, `stop_sequences`, `timeout`, and `extra_headers` do not change the frozen prefix, so they do not bust a provider prefix cache. `extra_body` does not change those bytes either. Sampling parameters and `extra_body` do change the JSON body, so Temporal treats a different value as a different execution and `register_session` rejects it. `timeout` and `extra_headers` are transport options and are left out of that fingerprint.
+**Sampling and transport.** `temperature`, `top_p`, `max_tokens`, `seed`, penalties, `stop_sequences`, `timeout`, and `extra_headers` do not change the frozen prefix, so they do not bust a provider prefix cache. `extra_body` does not change those bytes either, except that thinking settings can change auto's resolved output mode when building a session (and therefore its hash); query overrides cannot flip that mode. Sampling parameters and `extra_body` do change the JSON body, so Temporal treats a different value as a different execution and `register_session` rejects it. `timeout` and `extra_headers` are transport options and are left out of that fingerprint.
 
 **Profile and block meta.** A model `profile` can change how tools or schemas are rendered on the wire. That can miss the provider cache even when `prefix_hash` is unchanged, which is why the resolved profile is part of the execution fingerprint. `Block.meta` is omitted unless you pass `meta_keys` or `meta_renderer`. Opting in writes meta into the document text, which changes `prefix_hash` and the cached prefix.
 
@@ -583,6 +683,8 @@ ruff check src tests examples && ruff format --check src tests examples
 mypy
 pytest
 ```
+
+The 0.2.0 development checks cover Pydantic AI 2.61.0 / OpenAI 3.37.0 with Temporal SDK 1.33.0 and 1.34.0. Requirements remain `pydantic-ai>=2.57,<3` and optional `temporalio>=1.9`; the official plugin has its own extra requirements. Temporal tests start a real time-skipping server and use only offline models. Set `TEMPORAL_TEST_SERVER=/path/to/temporal-test-server` to reuse an existing binary in network-isolated environments; otherwise the SDK downloads it.
 
 Examples run offline with no key:
 

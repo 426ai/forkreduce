@@ -11,6 +11,7 @@ from pydantic_ai.usage import RunUsage
 
 from forkreduce.context import ContextWarning
 from forkreduce.failures import Failure
+from forkreduce.output_modes import ResolvedOutputMode
 
 T = TypeVar("T")
 
@@ -40,6 +41,8 @@ class Query(Generic[T]):
     ``model_settings`` overrides the session settings for this call only.
     pydantic-ai merges the two shallowly: a key set here replaces that key,
     and ``extra_body`` is replaced as a whole rather than merged key by key.
+    In an auto session, overrides that would change the resolved output mode
+    raise ``OutputModeConflictError`` before budget reservation or model calls.
     """
 
     tail: str
@@ -65,6 +68,9 @@ class QueryResult(Generic[T]):
     ``context_warning`` is set when the local token estimate exceeds
     ``Policy.context_limit``. The call was still sent. A provider rejection is
     ``failure`` with code ``context_overflow``, not this field.
+
+    ``resolved_output_mode`` records the actual session mode on successes and
+    failures. ``None`` is retained only for legacy/manually constructed results.
     """
 
     query_id: str
@@ -81,3 +87,4 @@ class QueryResult(Generic[T]):
     dropped: bool = False
     check_failures: list[CheckFailure] = field(default_factory=list)
     context_warning: ContextWarning | None = None
+    resolved_output_mode: ResolvedOutputMode | None = None

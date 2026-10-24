@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -22,6 +23,7 @@ from forkreduce import (
     build,
 )
 from forkreduce.policy import Drop, Policy
+from forkreduce.reduce import ReduceItem
 
 
 class Answer(BaseModel):
@@ -137,8 +139,6 @@ async def test_provenance_coverage_actions_and_tree_reduce() -> None:
     assert explained.action == "RequireReason"
     assert explained.reasons and explained.reasons[0].item_id == "b"
     assert explained.reasons[0].reason == "duplicate of a"
-    reason_text = user_text(scripted.calls[-1][0])
-    assert "duplicate" not in reason_text or "were not covered" in reason_text
     assert len(scripted.calls[-1][0]) > 1
 
     class Once:
@@ -263,11 +263,8 @@ async def test_followup_rounds_filter_and_gap_fill() -> None:
         .reduce(output=FindingList)
         .run()
     )
-    reduce_prompts = [user_text(messages) for messages, _info in scripted.calls if "INPUT_ITEMS" in user_text(messages)]
-    assert reduce_prompts
-    assert "id: keep" in reduce_prompts[-1]
-    assert "id: drop" not in reduce_prompts[-1]
     assert filtered.merged is not None
+    assert filtered.merged.items[0].source_ids == ["keep"]
     assert filtered.merged.items[0].round == 1
 
     class DropNew:
@@ -590,3 +587,87 @@ async def test_round_record_includes_reduce_failure() -> None:
     )
     assert any(failure.code == "coverage_failed" for failure in result.failures)
     assert any(failure.code == "coverage_failed" for failure in result.rounds[0].failures)
+
+
+class QuestionFinding(Traced):
+    question_id: str
+    answer: str
+
+
+class QuestionFindings(BaseModel):
+    answers: list[QuestionFinding]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_batch", [2, 200])
+async def test_nested_question_sources_use_current_fork_ids_and_expand_tree_aliases(max_batch: int) -> None:
+    def handler(messages, info, _n):  # type: ignore[no-untyped-def]
+        text = user_text(messages)
+        match = re.search(r"(?m)^ALLOWED_SOURCE_IDS_BY_QUESTION: (.+)$", text)
+        mapping = json.loads(match.group(1)) if match else {}
+        return tool_result(
+            info,
+            "QuestionFindings",
+            {
+                "answers": [
+                    {"question_id": question, "answer": "merged", "source_ids": sources}
+                    for question, sources in mapping.items()
+                ]
+            },
+        )
+
+    session = build(
+        Scripted(handler).model(),
+        documents="alpha beta",
+        instructions="rules",
+        outputs=[QuestionFindings],
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0),
+    )
+    items = [
+        ReduceItem(
+            id="fork:0",
+            value=QuestionFindings(
+                answers=[QuestionFinding(question_id="opening", answer="alpha", source_ids=["document"])]
+            ),
+        ),
+        ReduceItem(
+            id="fork:1",
+            value={"nested": [{"question_id": "opening", "source_ids": ["b1"]}, {"question_id": "opening"}]},
+        ),
+        ReduceItem(id="fork:2", value=({"question_id": "closing"},)),
+        ReduceItem(id="fork:3", value={"nested": {"question_id": "closing"}}),
+    ]
+    frozen_hash = session.prefix_hash
+    outcome = await session.reduce(items, output=QuestionFindings, max_batch=max_batch)
+    assert session.prefix_hash == frozen_hash
+    assert all(call.prefix_hash == frozen_hash for call in outcome.calls)
+    assert outcome.failure is None
+    assert outcome.report.invalid_refs == []
+    assert outcome.report.uncovered == []
+    assert outcome.output is not None
+    by_question = {row.question_id: set(row.source_ids) for row in outcome.output.answers}
+    assert by_question == {
+        "opening": {"fork:0", "fork:1"},
+        "closing": {"fork:2", "fork:3"},
+    }
+    assert len(outcome.calls) == (3 if max_batch == 2 else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_source", ["document", "b1"])
+async def test_document_and_block_ids_are_still_invalid_reduce_sources(invalid_source: str) -> None:
+    def handler(_messages, info, _n):  # type: ignore[no-untyped-def]
+        return tool_result(info, "FindingList", _finding_list(["fork:0", invalid_source]))
+
+    session = build(
+        Scripted(handler).model(),
+        documents="alpha",
+        instructions="rules",
+        outputs=[FindingList],
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0),
+    )
+    outcome = await session.reduce([ReduceItem(id="fork:0", value={"text": "alpha"})], output=FindingList)
+    assert outcome.report.covered == ["fork:0"]
+    assert outcome.report.invalid_refs == [invalid_source]

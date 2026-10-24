@@ -7,7 +7,7 @@ import inspect
 import json
 import time
 from collections.abc import Sequence
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel
 from pydantic_ai import Agent, PromptedOutput, ToolOutput, capture_run_messages
@@ -26,9 +26,18 @@ from forkreduce.context import (
     request_text,
 )
 from forkreduce.documents import DocumentIndex, DocumentsInput, MetaRenderer, coerce_documents
-from forkreduce.errors import ForkReduceError, UnregisteredOutputError
+from forkreduce.errors import ForkReduceError, OutputModeConflictError, UnregisteredOutputError
 from forkreduce.executor import BudgetLedger, Executor, LocalExecutor, budget_action_failure
 from forkreduce.failures import Failure, classify_exception, wrong_output_failure
+from forkreduce.output_modes import (
+    OutputMode,
+    ResolvedOutputMode,
+    UnforcedToolsPolicy,
+    diagnose_unforced_tools,
+    effective_model_settings,
+    forced_tools_available,
+    resolve_output_mode,
+)
 from forkreduce.policy import Policy
 from forkreduce.prefix import (
     history_matches_prefix,
@@ -38,9 +47,9 @@ from forkreduce.prefix import (
 )
 from forkreduce.query import Query, QueryResult
 from forkreduce.stats import cache_hit_tokens, usage_from_messages
+from forkreduce.temporal_options import ActivityOptions
 
 T = TypeVar("T")
-OutputMode = Literal["tools", "prompted"]
 
 _REQUEST_LIMIT = UsageLimits(request_limit=1)
 
@@ -51,6 +60,8 @@ class Session:
     Build one with :func:`forkreduce.build`. Queries share ``instructions``,
     the rendered documents, and (in ``tools`` mode) the whole output tool set.
     The per-query text is only the tail.
+    ``activity_options`` configures only the optional Temporal adapter; duration
+    values are seconds and do not change local execution or prefix identity.
     """
 
     def __init__(
@@ -61,12 +72,15 @@ class Session:
         documents: DocumentIndex,
         output_types: dict[str, type[BaseModel]],
         output_mode: OutputMode,
+        resolved_output_mode: ResolvedOutputMode,
+        on_unforced_tools: UnforcedToolsPolicy,
         policy: Policy,
         warmup: bool,
         prefix_hash_value: str,
         tool_specs: list[dict[str, Any]],
         executor: Executor | None,
         model_settings: ModelSettings | None = None,
+        activity_options: ActivityOptions | None = None,
     ) -> None:
         self.model = model
         copied = cast(ModelSettings, dict(model_settings)) if model_settings else None
@@ -76,7 +90,11 @@ class Session:
         self.rendered_documents = documents.rendered
         self.output_types = dict(output_types)
         self.output_mode: OutputMode = output_mode
+        self.resolved_output_mode: ResolvedOutputMode = resolved_output_mode
+        self.on_unforced_tools: UnforcedToolsPolicy = on_unforced_tools
+        self._forced_tools_available = forced_tools_available(model, effective_model_settings(model, copied))
         self.policy = policy
+        self.activity_options = activity_options
         self.warmup = warmup
         self.prefix_hash = prefix_hash_value
         self.tool_specs = tool_specs
@@ -89,7 +107,7 @@ class Session:
             model,
             instructions=instructions,
             output_types=self.output_types,
-            output_mode=output_mode,
+            output_mode=resolved_output_mode,
             descriptions={
                 name: str(spec.get("description", "")) for name, spec in zip(output_types, tool_specs, strict=True)
             },
@@ -116,6 +134,7 @@ class Session:
     def prepare_query(self, query: Query[Any]) -> None:
         """Assign an id, reject unknown outputs, and warn on a broken continuation."""
         self.require_output(query.output)
+        self._check_output_mode(query, diagnose=False)
         if not query.id:
             self._ids += 1
             query.id = f"q{self._ids}"
@@ -124,6 +143,20 @@ class Session:
             self.rendered_documents,
             prefix_hash_value=self.prefix_hash,
         )
+
+    def _check_output_mode(self, query: Query[Any], *, diagnose: bool = True) -> None:
+        settings = effective_model_settings(self.model, self.model_settings, query.model_settings)
+        if self.output_mode == "auto":
+            actual = resolve_output_mode(self.model, settings)
+            if actual != self.resolved_output_mode:
+                raise OutputModeConflictError(
+                    f"Query settings would change the frozen output mode from {self.resolved_output_mode!r} "
+                    f"to {actual!r}. Build a separate session for these settings or choose an explicit output_mode.",
+                    code="output_mode_conflict",
+                )
+        elif diagnose and self.output_mode == "tools" and self._forced_tools_available:
+            if not forced_tools_available(self.model, settings):
+                diagnose_unforced_tools(self.on_unforced_tools)
 
     def history_for(self, query: Query[Any]) -> list[ModelMessage]:
         """Prefix messages, or a copy of the continuation history."""
@@ -135,7 +168,7 @@ class Session:
         """Query text that follows the frozen prefix. Schema lives here in prompted mode."""
         name = self.require_output(query.output)
         parts = [query.tail.rstrip(), "", f"Use the `{name}` output and no other output type."]
-        if self.output_mode == "prompted":
+        if self.resolved_output_mode == "prompted":
             schema = json.dumps(
                 query.output.model_json_schema(),
                 sort_keys=True,
@@ -181,6 +214,7 @@ class Session:
         such as an unregistered output type.
         """
         self.require_output(query.output)
+        self._check_output_mode(query)
         if not query.id:
             self.prepare_query(query)
         notice = request_context_warning(self.policy, self.estimate_tokens(query))
@@ -196,7 +230,7 @@ class Session:
             started = time.perf_counter()
             messages: list[ModelMessage] = self.history_for(query)
             kwargs: dict[str, Any] = {}
-            if self.output_mode == "prompted":
+            if self.resolved_output_mode == "prompted":
                 kwargs["output_type"] = PromptedOutput(query.output, template=False)
             merged_settings = merge_model_settings(self.model_settings, query.model_settings)
             if merged_settings:
@@ -247,6 +281,7 @@ class Session:
                     output=None,
                     messages=transcript,
                     prefix_hash=self.prefix_hash,
+                    resolved_output_mode=self.resolved_output_mode,
                     usage=result.usage,
                     cache_hit_tokens=hits,
                     attempts=1,
@@ -260,6 +295,7 @@ class Session:
                 output=output,
                 messages=transcript,
                 prefix_hash=self.prefix_hash,
+                resolved_output_mode=self.resolved_output_mode,
                 usage=result.usage,
                 cache_hit_tokens=hits,
                 attempts=1,
@@ -345,6 +381,7 @@ class Session:
             output=None,
             messages=messages if messages is not None else self.history_for(query),
             prefix_hash=self.prefix_hash,
+            resolved_output_mode=self.resolved_output_mode,
             usage=recorded,
             cache_hit_tokens=cache_hit_tokens(recorded),
             attempts=attempts,
@@ -361,11 +398,13 @@ def build(
     documents: DocumentsInput,
     instructions: str,
     outputs: Sequence[type[BaseModel]],
-    output_mode: OutputMode = "tools",
+    output_mode: OutputMode = "auto",
+    on_unforced_tools: UnforcedToolsPolicy = "warn",
     warmup: bool = True,
     policy: Policy | None = None,
     executor: Executor | None = None,
     model_settings: ModelSettings | None = None,
+    activity_options: ActivityOptions | None = None,
     meta_keys: Sequence[str] | None = None,
     meta_renderer: MetaRenderer | None = None,
 ) -> Session:
@@ -375,17 +414,31 @@ def build(
     session will ask for. Adding one later is refused: a new tool schema would
     invalidate the provider prefix cache.
 
-    ``output_mode="tools"`` (the default) registers every output as a tool on
-    every call. ``output_mode="prompted"`` keeps tools out of the prefix and
-    appends only the expected output's JSON schema to the query tail.
+    ``output_mode="auto"`` (the default) freezes tools when the model profile
+    and effective thinking settings permit forced output tools, otherwise
+    prompted mode. Explicit ``"tools"`` registers every output on every call;
+    ``"prompted"`` appends only the expected output's JSON schema to the tail.
+    ``on_unforced_tools`` controls diagnostics for explicit tools when forcing
+    is unavailable: ``"warn"`` (default), ``"error"``, or ``"ignore"``.
 
     ``model_settings`` is sent on every call. A :class:`~forkreduce.query.Query`
     may override individual keys. Sampling parameters and timeouts do not change
     the frozen prefix. ``meta_keys`` or ``meta_renderer`` do: rendered block
     meta becomes part of the prefix and its hash. The default renders no meta.
+
+    ``activity_options`` sets Temporal-only activity timeouts and retry options.
+    Durations are seconds. It does not change local execution or the prefix;
+    leaving it unset preserves the five-minute activity timeout and retries
+    derived from ``policy``.
     """
-    if output_mode not in {"tools", "prompted"}:
-        raise ForkReduceError("output_mode must be 'tools' or 'prompted'")
+    if output_mode not in ("auto", "tools", "prompted"):
+        raise ForkReduceError("output_mode must be 'auto', 'tools', or 'prompted'")
+    if on_unforced_tools not in ("warn", "error", "ignore"):
+        raise ForkReduceError("on_unforced_tools must be 'warn', 'error', or 'ignore'")
+    settings = effective_model_settings(model, model_settings)
+    resolved = resolve_output_mode(model, settings) if output_mode == "auto" else output_mode
+    if output_mode == "tools" and not forced_tools_available(model, settings):
+        diagnose_unforced_tools(on_unforced_tools)
     if not outputs:
         raise ForkReduceError("outputs must register at least one pydantic model")
     index = coerce_documents(documents, meta_keys=meta_keys, meta_renderer=meta_renderer)
@@ -408,7 +461,7 @@ def build(
             }
         )
     hashed = prefix_hash(
-        output_mode=output_mode,
+        output_mode=resolved,
         instructions=instructions,
         rendered_documents=index.rendered,
         tools=tool_specs,
@@ -419,12 +472,15 @@ def build(
         documents=index,
         output_types=output_types,
         output_mode=output_mode,
+        resolved_output_mode=resolved,
+        on_unforced_tools=on_unforced_tools,
         policy=chosen,
         warmup=warmup,
         prefix_hash_value=hashed,
         tool_specs=tool_specs,
         executor=executor,
         model_settings=model_settings,
+        activity_options=activity_options,
     )
     notice = prefix_context_warning(
         chosen,
@@ -441,7 +497,7 @@ def _build_agent(
     *,
     instructions: str,
     output_types: dict[str, type[BaseModel]],
-    output_mode: OutputMode,
+    output_mode: ResolvedOutputMode,
     descriptions: dict[str, str],
 ) -> Agent[None, Any]:
     if output_mode == "tools":
