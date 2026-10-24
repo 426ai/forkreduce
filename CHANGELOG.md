@@ -4,6 +4,11 @@
 
 ### Added
 
+- Referenced dynamic schemas via `OutputSpecWriter(store).store(spec, ref_namespace=...) -> OutputSpecRef`: content-addressed preparation, per-writer deduplication, namespace/context-aware reads, digest/name verification, missing-blob errors and per-activity resolution caching. Inline specs and existing default payload bytes remain unchanged. Complete `run_spec_refs_offline.py` uses activity-generated bounded batches/public orchestration for 300 large distinct schemas, both converters and replay; no `queries_ref` field or new default activity registration.
+- Opt-in `FollowUpQuery(query, history="fresh")` restarts repairs from the shared prefix; default `continue` retains history inheritance. Tail-only repairs retain their schema; changing schemas requires a full follow-up query. No prefix-hash/default behavior change.
+- `build(query_separator=QUERY_SEPARATOR, dynamic_output_instructions=True)` supports exact caller-owned dynamic bytes. Only nondefault separators enter prefix hashes/fingerprints; suppressing dynamic guidance affects tails/fingerprints, not prefix hashes. Nondefault frozen layouts use `ConfiguredFrozenPrefix` / `QueryLayout`, preserving plain snapshot fields/bytes; factories restore both options. Static tails are unaffected.
+- Validators may accept `(output, OutputValidationContext(query_id, round, meta))`; copied context is query-local, supports sync/async/native feedback, and has no prefix-hash impact. Existing one-argument callbacks remain supported.
+
 - Opt-in `document_format="raw"` preserves exact text/control characters without framework wrappers/end markers; `message_layout="single"` combines the initial prefix and tail with exported `QUERY_SEPARATOR`, retaining the head across continuations/feedback. `DocumentFormat` / `MessageLayout` are public aliases, snapshots restore both settings, and raw mode explicitly rejects built-in block/citation operations. Only nondefaults enter the hash/fingerprint encoding; literal v0.1.1 defaults remain byte/hash identical.
 - Complete `examples/run_temporal_offline.py` and bilingual integration recipes combine default factories, bounded metadata, namespace-routed immutable SQLite references, return-mode hook repairs, dynamic schemas, warmup/queues, prefixed sandbox definitions, tracing and raw/single layouts. It requires a cached local server and disables provider requests; both converters support replay.
 
@@ -66,6 +71,8 @@ Public `QueryFailureKind` is exported from `forkreduce.contrib.temporal` as a `L
 | `unknown` | Ambiguous terminal application/SDK failure or failed child batch. |
 
 ### Upgrade notes
+
+- **References and refinements:** configure the message store for spec reads; retain immutable schema blobs through retries/repairs and set query routing metadata. Reuse preparation writers for deduplication; cross-process deduplication requires content-addressed storage. Keep generated batches bounded rather than returning a giant list. Restore `frozen.query_separator` and `frozen.dynamic_output_instructions`; nondefault separators change identity, suppressed guidance is tail-only and callers supply their own instructions. Use full follow-up queries for schema changes and `FollowUpQuery(..., history="fresh")` for resets. With feedback, size `start_to_close >= single_call_time * (output_feedback_retries + 1)` plus I/O/validation overhead; outer attempts are independent.
 
 - **Document/message layout:** defaults remain blocks/split and preserve the legacy identity encoding. Raw/single opt-ins change prefix hashes and execution fingerprints; restore both frozen flags in factories and version/drain incompatible in-flight work. Raw metadata rendering and framework block/citation operations are unsupported; applications own deterministic bytes and provider acceptance. The new complete offline example needs the checkout dev/Temporal extras for in-memory OpenTelemetry support and never downloads its test server.
 

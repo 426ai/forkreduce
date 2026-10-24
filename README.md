@@ -318,6 +318,10 @@ session = build(
 
 Raw mode deliberately does not sanitize controls or add application delimiters: ensure deterministic input bytes and provider acceptance yourself. Metadata rendering options are rejected in raw mode. There are no framework block addresses: `DocumentIndex.block_text`, `CitationCheck`, and plans using built-in citation checking/repair reject raw mode. Use application-owned addressing/validation instead. Snapshots retain both flags; factories must restore them before hash verification.
 
+For exact caller-owned dynamic tails, set `query_separator="<custom boundary>"` and `dynamic_output_instructions=False` on `build` with raw/single layout. The initial user part is exactly `raw_prefix + query_separator + query.tail`, preserving whitespace/control characters. No output instruction sentence, description, schema or trimming is added; callers supply their own instructions. Schema validation still runs. Only nondefault separators enter prefix hashes; suppressing dynamic guidance is tail-only (fingerprint changes, prefix hash does not). Static tails are unaffected.
+
+Default snapshot fields/bytes remain unchanged. Nondefault layouts use `ConfiguredFrozenPrefix` with `QueryLayout`. On either snapshot type, factories read `frozen.query_separator` and `frozen.dynamic_output_instructions` and pass them to `build`; forgotten opt-in reconstruction is rejected, including cached sessions.
+
 ### Query and QueryResult
 
 ```python
@@ -386,7 +390,35 @@ Prompted mode puts only this question's schema in its tail. `dynamic_outputs="ge
 
 For dynamic-capable auto sessions, a supported forced-output profile plus `generic_tool` selects tools; otherwise prompted is selected. Use `dynamic_outputs="prompted"` to declare that intent explicitly; `outputs=[]` without a generic tool also selects prompted in auto. Existing fixed-output auto sessions retain their previous resolution. A frozen static-tools session without the generic tool cannot accept dynamic schemas: build a separate prompted/dynamic session instead of changing its cached tool list. Explicit tools requires the generic option for dynamic queries.
 
-Temporal accepts `query_activity_input(..., output_spec=count)` (optional matching `output_name`); snapshots retain `dynamic_outputs`, and factories restore it. Both converters reconstruct specs in queries and follow-ups; dictionary results use the same JSON/reference fields as static models. Schema bytes live in query/history payloads, not the shared prefix, so keep them bounded operationally. Built-in BaseModel citation checking/repair is not a dictionary-schema validator: use `output_validator` or a reference-aware hook for dynamic dictionaries. **Before switching an application's output mode, run a real-model regression; these tests are offline and do not establish provider extraction quality.**
+Temporal accepts `query_activity_input(..., output_spec=count)` (optional matching `output_name`), or an `OutputSpecRef` for large schemas. Both converters reconstruct inline specs/references in queries and follow-ups; factories restore frozen dynamic settings. Dictionary results use existing JSON/reference fields. Inline schemas still enter workflow history: use references and bounded generation below when scaling. Built-in BaseModel citation checking/repair is not a dictionary-schema validator; use validators/reference-aware hooks. **Run real-model regressions before switching output modes; offline tests do not establish provider extraction quality.**
+
+#### Referenced schemas and large query collections
+
+Prepare outside workflows with a client/activity-owned writer and the existing store:
+
+```python
+from forkreduce.contrib.temporal import OutputSpecWriter, query_activity_input
+
+writer = OutputSpecWriter(store)  # retain one writer for the preparation job
+spec_ref = await writer.store(count, ref_namespace="demo-run")
+payload = query_activity_input(
+    session, query_id="count", tail="Return the count.", output_spec=spec_ref,
+    prefix_ref=prefix_ref, ref_namespace="demo-run",
+)
+```
+
+`OutputSpecRef(name, ref, sha256, namespace=None)` contains no schema and occupies the existing `output_spec` slot: default/inline payload shapes and bytes remain unchanged. Query inputs, full follow-ups and `AfterQueryInput.query` carry just the reference. Workers use `set_message_store(store)` to resolve/verify digest, name and namespace once per activity attempt; feedback reuses that local spec. Missing blobs fail clearly and non-retryably; differing nonempty routing namespaces use existing `ref_namespace_mismatch`. Set the query namespace for initial prefix routing too. I/O uses `StoreContext.kind="output_spec"`; preparation has no prefix association (`prefix_hash=""`), while reads carry query/activity context.
+
+Keys are content-addressed and namespace-scoped. One retained writer deduplicates equal/concurrent specs even for legacy stores with opaque refs; content-addressed backends also deduplicate across writers/processes. Keep blobs immutable and retained through retries/repairs; do not delete them while reusing the writer cache. Writer state is never serialized.
+
+The official large-list pattern is **activity-generated bounded batches**, not an unbounded `MapQueriesInput` or a resolver returning one giant list. The complete [offline generation example](examples/run_spec_refs_offline.py) sends a small job/range, prepares batches/spec refs in an activity, then composes public `plan_batches` / `execute_query` in a workflow. Both preparation results and model-activity inputs stay bounded. It exercises 300 different synthetic schemas, each over 11 KB, with every workflow/activity input and generation result below 512 KiB, both converters and replay. No workflow storage I/O, `queries_ref` field or new default activity registration is introduced. Applications replace the generation activity's data source while retaining its bounded input/output contract.
+
+```bash
+PYTHONPATH=src:. python examples/run_spec_refs_offline.py
+PYTHONPATH=src:. python examples/run_spec_refs_offline.py --plugin
+```
+
+These require an existing `TEMPORAL_TEST_SERVER` binary and checkout dev/Temporal extras; no download, real provider request or telemetry export occurs.
 
 ### Check and repair
 
@@ -515,6 +547,10 @@ It asks once per scope, on the same prefix. Leads whose position (`block_id` by 
 `QueryResult.feedback_retries_used` and `meta["feedback_retries_used"]` record actual feedback requests; local outer attempts aggregate this count. Request/token budgets are enforced before every request, including feedback. `Policy.retries` remains the separate outer retry budget. Feedback and validators do not change `prefix_hash`; non-default feedback/validator configuration changes the Temporal execution fingerprint.
 
 Temporal activities use the worker's registered or factory-created session, never a serialized callback. `FrozenPrefix.output_feedback_retries` records the numeric policy; factories should restore it with `Policy(output_feedback_retries=frozen.output_feedback_retries)` and install their worker-local validator. Activity results and safe failure metadata expose `feedback_retries_used` for the final activity attempt, not an inferred total across Temporal attempts. Keep sensitive data out of validation messages: feedback deliberately sends these messages to the model.
+
+A validator can instead accept `(output, context: OutputValidationContext)`, imported from `forkreduce`. An explicit second positional parameter opts in; context contains `query_id`, `round`, and deep-copied `meta`. Sync/async/native `ModelRetry` work identically. Binding is per query, not on a shared Agent, so concurrent queries cannot overwrite identities. Callbacks remain worker-local and have no prefix-hash impact; one-argument callbacks retain their behavior.
+
+With `output_feedback_retries > 0`, **one activity may make multiple model calls**. Set `start_to_close >= single_call_time * (output_feedback_retries + 1)`, plus factory/store I/O and validation headroom. Two feedback retries with a 60-second single-call bound require at least 180 seconds before overhead. `maximum_attempts` is the independent Temporal outer retry budget; heartbeat timeout does not replace a sufficiently long start-to-close window.
 
 ### Concurrency, retries, budget
 
@@ -763,6 +799,19 @@ For the built-in per-question pipeline, set `after_query_activity="app.review"`,
 
 Return `AfterQueryDecision(action="done"|"failed"|"follow_up", follow_up_tail=None, follow_up_query=None, result_meta=None)`. A follow-up tail continues from the previous `messages_ref`; a replacement query must keep the prefix hash. IDs become `original_id#r{round}` and round increments automatically. `max_rounds` is the maximum **inclusive round index**: initial round zero, default one permits one repair. A failed decision or another follow-up at the cap becomes `permanent` / `after_query_failed`, not an unapproved success. The last non-None `result_meta` is JSON-copied unchanged into the final result, replaces rather than merges previous metadata, and must fit 16 KiB compact UTF-8 JSON.
 
+`follow_up_tail` retains the current output specification. Switching schemas requires a complete `follow_up_query` (inline or referenced spec). Wrap a replacement as `FollowUpQuery(query, history="fresh")` to restart from the shared prefix, clearing both history fields. The wrapper defaults to `history="continue"`, preserving legacy explicit/inherited history. Prefix retention, automatic round/ID assignment and repair caps still apply. For example, inside a hook:
+
+```python
+from dataclasses import replace
+from forkreduce.contrib.temporal import AfterQueryDecision, FollowUpQuery
+
+decision = AfterQueryDecision("follow_up", follow_up_query=FollowUpQuery(
+    replace(data.query, tail="Re-evaluate independently.",
+            output_spec=next_spec_ref, output_name=next_spec_ref.name),
+    history="fresh",
+))
+```
+
 Hook activity errors propagate in raise mode; return mode produces `unknown` / synthetic `after_query_failed`. The complete synthetic failure-type additions are `batch_failed` and `after_query_failed`; neither is an arbitrary raw application-type passthrough. Hook retry/timeouts use their own options (default one attempt, five minutes) on the configured queue. Parent cancellation always propagates. These hooks/round limits do not change prefix hashes or default execution behavior.
 
 Stores must return immutable references: writing new bytes under a reused logical key must not change earlier results or continuation history. The SQLite recipe below uses a content digest in the reference and insert-only writes; identical bytes may reuse a reference. Keep content-addressed references private if equality disclosure is sensitive; a production store may instead allocate opaque unique references.
@@ -830,6 +879,8 @@ def restore(frozen):
         on_unforced_tools=frozen.on_unforced_tools,
         dynamic_outputs=frozen.dynamic_outputs,
         document_format=frozen.document_format, message_layout=frozen.message_layout,
+        query_separator=frozen.query_separator,
+        dynamic_output_instructions=frozen.dynamic_output_instructions,
         policy=Policy(output_feedback_retries=frozen.output_feedback_retries),
         instrument=InstrumentationSettings(include_content=False),
     )
@@ -904,6 +955,8 @@ def restore(frozen):
         FunctionModel(reply), documents=frozen.documents, instructions=frozen.instructions, outputs=[],
         output_mode=frozen.output_mode, dynamic_outputs=frozen.dynamic_outputs,
         document_format=frozen.document_format, message_layout=frozen.message_layout,
+        query_separator=frozen.query_separator,
+        dynamic_output_instructions=frozen.dynamic_output_instructions,
         on_unforced_tools=frozen.on_unforced_tools,
         policy=Policy(retries=0, output_feedback_retries=frozen.output_feedback_retries),
         instrument=instrumentation, warmup=False,

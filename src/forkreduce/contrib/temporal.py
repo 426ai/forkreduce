@@ -46,6 +46,8 @@ with workflow.unsafe.imports_passed_through():
     from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
     from pydantic_ai.settings import ModelSettings, merge_model_settings
 
+    from forkreduce.contrib._temporal_specs import OutputSpecRef as OutputSpecRef
+    from forkreduce.contrib._temporal_specs import OutputSpecWriter as OutputSpecWriter
     from forkreduce.contrib._temporal_store import (
         ContextMessageStore as ContextMessageStore,
     )
@@ -78,7 +80,7 @@ with workflow.unsafe.imports_passed_through():
     from forkreduce.output_modes import OutputMode, ResolvedOutputMode, UnforcedToolsPolicy
     from forkreduce.output_specs import DynamicOutputs, OutputSpec
     from forkreduce.policy import Policy
-    from forkreduce.prefix import MessageLayout
+    from forkreduce.prefix import QUERY_SEPARATOR, MessageLayout
     from forkreduce.prefix import prefix_hash as compute_prefix_hash
     from forkreduce.query import Query
     from forkreduce.session import Session
@@ -157,6 +159,14 @@ class FrozenPrefix:
     message_layout: MessageLayout = "split"
 
     @property
+    def query_separator(self) -> str:
+        return QUERY_SEPARATOR
+
+    @property
+    def dynamic_output_instructions(self) -> bool:
+        return True
+
+    @property
     def documents(self) -> list[Document]:
         """Fresh document objects suitable for ``build(documents=...)``."""
         return [Document.model_validate(item) for item in json.loads(self.documents_json)]
@@ -164,6 +174,8 @@ class FrozenPrefix:
     def validate(self) -> None:
         """Reject corrupt snapshots before invoking a worker factory."""
         _app_meta_json(self.app_meta)
+        if not isinstance(self.query_separator, str) or not isinstance(self.dynamic_output_instructions, bool):
+            raise ValueError("Invalid frozen query layout options")
         if self.document_format not in {"blocks", "raw"} or self.message_layout not in {"split", "single"}:
             raise ValueError("Invalid document format or message layout in frozen prefix")
         if self.dynamic_outputs not in {None, "generic_tool", "prompted"}:
@@ -190,11 +202,35 @@ class FrozenPrefix:
             tools=json.loads(self.tools_json),
             document_format=self.document_format,
             message_layout=self.message_layout,
+            query_separator=self.query_separator,
         )
         if actual != self.prefix_hash:
             raise ValueError("Frozen prefix hash does not match its contents")
         for item in json.loads(self.documents_json):
             Document.model_validate(item)
+
+
+@dataclass(frozen=True)
+class QueryLayout:
+    """Opt-in tail layout configuration; absent from legacy frozen payloads."""
+
+    query_separator: str = QUERY_SEPARATOR
+    dynamic_output_instructions: bool = True
+
+
+@dataclass(frozen=True)
+class ConfiguredFrozenPrefix(FrozenPrefix):
+    """Nondefault layout snapshot; plain FrozenPrefix keeps its original fields."""
+
+    layout_options: QueryLayout = field(kw_only=True)
+
+    @property
+    def query_separator(self) -> str:
+        return self.layout_options.query_separator
+
+    @property
+    def dynamic_output_instructions(self) -> bool:
+        return self.layout_options.dynamic_output_instructions
 
 
 SessionFactory = Callable[[FrozenPrefix], Session | Awaitable[Session]]
@@ -230,6 +266,11 @@ async def freeze_prefix(
         document_format=session.document_format,
         message_layout=session.message_layout,
     )
+    if session.query_separator != QUERY_SEPARATOR or not session.dynamic_output_instructions:
+        snapshot = ConfiguredFrozenPrefix(
+            **asdict(snapshot),
+            layout_options=QueryLayout(session.query_separator, session.dynamic_output_instructions),
+        )
     snapshot.validate()
     encoded = json.dumps(asdict(snapshot), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return await store_put(
@@ -329,6 +370,10 @@ def execution_fingerprint(session: Session) -> str:
         payload["document_format"] = session.document_format
     if session.message_layout != "split":
         payload["message_layout"] = session.message_layout
+    if session.query_separator != QUERY_SEPARATOR:
+        payload["query_separator"] = session.query_separator
+    if not session.dynamic_output_instructions:
+        payload["dynamic_output_instructions"] = False
     return json.dumps(payload, sort_keys=True, default=str)
 
 
@@ -431,7 +476,7 @@ class QueryActivityInput:
     activity_options: ActivityOptions | None = None
     require_references: bool = False
     parent_workflow_id: str | None = None
-    output_spec: OutputSpec | None = None
+    output_spec: OutputSpec | OutputSpecRef | None = None
 
 
 def query_activity_input(
@@ -447,7 +492,7 @@ def query_activity_input(
     model_settings: ModelSettings | None = None,
     prefix_ref: str | None = None,
     ref_namespace: str | None = None,
-    output_spec: OutputSpec | None = None,
+    output_spec: OutputSpec | OutputSpecRef | None = None,
 ) -> QueryActivityInput:
     """Build an activity payload that carries this session's retry policy.
 
@@ -463,7 +508,10 @@ def query_activity_input(
     if output_spec is not None:
         if output_name is not None and output_name != output_spec.name:
             raise ValueError("output_name must match output_spec.name")
-        session.require_output(output_spec)
+        if isinstance(output_spec, OutputSpec):
+            session.require_output(output_spec)
+        elif session.resolved_output_mode == "tools" and session.dynamic_outputs != "generic_tool":
+            raise ValueError("OutputSpec references require a frozen generic tool or prompted session")
         output_name = output_spec.name
         output_spec = replace(output_spec)
     if output_name is None:
@@ -564,18 +612,33 @@ class AfterQueryInput:
 
 
 @dataclass
+class FollowUpQuery:
+    """A replacement query with explicit continuation or fresh-history semantics.
+
+    ``continue`` preserves explicit history or inherits the preceding result's
+    messages reference. ``fresh`` clears both history fields before execution.
+    The prefix remains fixed; a complete query may select a different output
+    specification without changing the frozen prefix.
+    """
+
+    query: QueryActivityInput
+    history: Literal["continue", "fresh"] = "continue"
+
+
+@dataclass
 class AfterQueryDecision:
     """Finish, reject, or repair a query.
 
     A repair supplies exactly one tail or complete query, retains the prefix,
-    and receives ``root_id#r{round}`` automatically. Missing history references
-    inherit the preceding result's messages reference. ``result_meta`` must be a
-    JSON object fitting in 16 KiB of compact UTF-8 JSON.
+    and receives ``root_id#r{round}`` automatically. Tails retain the current
+    output specification. Complete queries may switch it and inherit missing
+    history references unless wrapped in :class:`FollowUpQuery` with ``fresh``.
+    ``result_meta`` must be a JSON object fitting in 16 KiB of compact UTF-8 JSON.
     """
 
     action: Literal["done", "failed", "follow_up"]
     follow_up_tail: str | None = None
-    follow_up_query: QueryActivityInput | None = None
+    follow_up_query: FollowUpQuery | QueryActivityInput | None = None
     result_meta: dict[str, Any] | None = None
 
 
@@ -601,15 +664,18 @@ async def _load_prefix(payload: QueryActivityInput) -> FrozenPrefix | None:
         if _PREFIX_STORE is None:
             raise _permanent("prefix_ref was set but this worker has no prefix store")
         try:
-            snapshot = FrozenPrefix(
-                **json.loads(
-                    await store_get(
-                        _PREFIX_STORE,
-                        payload.prefix_ref,
-                        context=_query_store_context("prefix", payload, ref_namespace(payload.meta)),
-                    )
+            raw = json.loads(
+                await store_get(
+                    _PREFIX_STORE,
+                    payload.prefix_ref,
+                    context=_query_store_context("prefix", payload, ref_namespace(payload.meta)),
                 )
             )
+            if "layout_options" in raw:
+                raw["layout_options"] = QueryLayout(**raw["layout_options"])
+                snapshot = ConfiguredFrozenPrefix(**raw)
+            else:
+                snapshot = FrozenPrefix(**raw)
             snapshot.validate()
             if snapshot.prefix_hash != payload.prefix_hash:
                 raise ValueError("prefix_ref does not match the requested prefix_hash")
@@ -628,11 +694,20 @@ async def _load_prefix(payload: QueryActivityInput) -> FrozenPrefix | None:
     return snapshot
 
 
+def _validate_session_layout(session: Session, snapshot: FrozenPrefix | None) -> None:
+    if isinstance(snapshot, ConfiguredFrozenPrefix) and (
+        session.query_separator != snapshot.query_separator
+        or session.dynamic_output_instructions != snapshot.dynamic_output_instructions
+    ):
+        raise _permanent("Worker session query layout does not match the frozen configuration")
+
+
 async def _resolve_session(payload: QueryActivityInput, *, snapshot: FrozenPrefix | None = None) -> Session:
     if snapshot is None:
         snapshot = await _load_prefix(payload)
     session = _SESSIONS.get(payload.prefix_hash)
     if session is not None:
+        _validate_session_layout(session, snapshot)
         return session
     factory = _FACTORIES.get(payload.prefix_hash)
     if factory is None:
@@ -658,11 +733,13 @@ async def _resolve_session(payload: QueryActivityInput, *, snapshot: FrozenPrefi
             tools=session.tool_specs,
             document_format=session.document_format,
             message_layout=session.message_layout,
+            query_separator=session.query_separator,
         )
         if session.prefix_hash != payload.prefix_hash or actual != payload.prefix_hash:
             raise ValueError("Reconstructed session does not match the frozen prefix hash")
     except (ForkReduceError, ValueError, TypeError) as exc:
         raise _permanent(f"Cannot reconstruct frozen prefix: {exc}") from exc
+    _validate_session_layout(session, snapshot)
     return session
 
 
@@ -697,6 +774,48 @@ async def execute_query_activity(payload: QueryActivityInput) -> QueryActivityOu
     )
 
 
+def _check_spec_namespace(left: str | None, right: str | None) -> None:
+    if left and right and left != right:
+        raise ApplicationError(
+            "Query and output specification reference namespaces do not match",
+            "ref_namespace_mismatch",
+            _attempt_detail(),
+            type="ref_namespace_mismatch",
+            non_retryable=True,
+        )
+
+
+async def _resolve_output_spec(payload: QueryActivityInput, namespace: str | None) -> OutputSpec | None:
+    reference = payload.output_spec
+    if not isinstance(reference, OutputSpecRef):
+        return reference
+    _check_spec_namespace(namespace, reference.namespace)
+    if _STORE is None:
+        raise _permanent("OutputSpec references require a message store on this worker")
+    try:
+        encoded = await store_get(
+            _STORE,
+            reference.ref,
+            context=_query_store_context("output_spec", payload, namespace or reference.namespace),
+        )
+    except KeyError as exc:
+        raise _permanent("OutputSpec reference blob is missing") from exc
+    try:
+        if hashlib.sha256(encoded).hexdigest() != reference.sha256:
+            raise ValueError("OutputSpec reference digest does not match its blob")
+        raw = json.loads(encoded)
+        _check_spec_namespace(namespace, raw["namespace"])
+        _check_spec_namespace(reference.namespace, raw["namespace"])
+        if raw["namespace"] != reference.namespace:
+            raise ValueError("OutputSpec reference namespace does not match its blob")
+        spec = OutputSpec(**raw["spec"])
+        if spec.name != reference.name:
+            raise ValueError("OutputSpec reference name does not match its blob")
+        return spec
+    except (KeyError, ValueError, TypeError) as exc:
+        raise _permanent("Invalid OutputSpec reference blob or identity") from exc
+
+
 async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityOutput:
     """Activity work inside the single outer heartbeat lifetime."""
     if payload.require_references and _STORE is None:
@@ -712,7 +831,9 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
         else None
     )
     session = await _resolve_session(payload, snapshot=snapshot)
-    output_type = payload.output_spec or session.output_types.get(payload.output_name)
+    # Resolve once per attempt; native feedback reuses this local specification.
+    spec = await _resolve_output_spec(payload, namespace)
+    output_type = spec or session.output_types.get(payload.output_name)
     if output_type is None:
         raise _permanent(f"Output {payload.output_name!r} is not registered on this session")
     if payload.output_spec is not None and payload.output_spec.name != payload.output_name:
@@ -1098,10 +1219,22 @@ async def _query_pipeline(query: QueryActivityInput, config: MapQueriesInput) ->
             ):
                 raise ValueError("follow_up requires exactly one tail or query")
             next_query = decision.follow_up_query
+            history = "continue"
+            if isinstance(next_query, FollowUpQuery):
+                history = next_query.history
+                if history not in {"continue", "fresh"}:
+                    raise ValueError("follow_up history must be 'continue' or 'fresh'")
+                if not isinstance(next_query.query, QueryActivityInput):
+                    raise TypeError("follow_up_query must contain a QueryActivityInput")
+                next_query = next_query.query
             if next_query is None:
                 next_query = replace(current, tail=cast(str, decision.follow_up_tail), history_ref=output.messages_ref)
+            elif not isinstance(next_query, QueryActivityInput):
+                raise TypeError("follow_up_query must contain a QueryActivityInput")
             elif next_query.prefix_hash != current.prefix_hash:
                 raise ValueError("follow_up must retain the same prefix_hash")
+            elif history == "fresh":
+                next_query = replace(next_query, history_ref=None, history_json=None)
             elif next_query.history_ref is None:
                 next_query = replace(next_query, history_ref=output.messages_ref)
             current = require_query_references(

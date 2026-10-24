@@ -18,6 +18,19 @@ T = TypeVar("T")
 
 
 @dataclass(frozen=True)
+class OutputValidationContext:
+    """Worker-local query identity passed to contextual output validators.
+
+    ``meta`` is a deep copy of the caller's query metadata. This context is
+    serializable independently of the worker-local validator callback.
+    """
+
+    query_id: str
+    round: int
+    meta: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class CheckFailure:
     """One problem found by a :class:`forkreduce.checks.Check`."""
 

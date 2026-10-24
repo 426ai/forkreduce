@@ -56,14 +56,14 @@ from forkreduce.prefix import (
     prefix_messages,
     warn_if_prefix_mismatch,
 )
-from forkreduce.query import Query, QueryResult
+from forkreduce.query import OutputValidationContext, Query, QueryResult
 from forkreduce.stats import cache_hit_tokens, usage_from_messages
 from forkreduce.temporal_options import ActivityOptions
 
 T = TypeVar("T")
 
-OutputValidator = Callable[[Any], Any | Awaitable[Any]]
-"""Worker-local output callback returning a value or raising ``ModelRetry``."""
+OutputValidator = Callable[[Any], Any | Awaitable[Any]] | Callable[[Any, OutputValidationContext], Any | Awaitable[Any]]
+"""Worker-local callback accepting output and optionally its query context."""
 
 
 class _FeedbackBudgetExceeded(Exception):
@@ -106,7 +106,13 @@ class Session:
         dynamic_outputs: DynamicOutputs | None = None,
         instrument: bool | InstrumentationSettings = False,
         message_layout: MessageLayout = "split",
+        query_separator: str = QUERY_SEPARATOR,
+        dynamic_output_instructions: bool = True,
     ) -> None:
+        if not isinstance(query_separator, str):
+            raise ForkReduceError("query_separator must be a string")
+        if not isinstance(dynamic_output_instructions, bool):
+            raise ForkReduceError("dynamic_output_instructions must be a bool")
         self.model = model
         copied = cast(ModelSettings, dict(model_settings)) if model_settings else None
         self.model_settings: ModelSettings | None = copied
@@ -115,6 +121,8 @@ class Session:
         self.rendered_documents = documents.rendered
         self.document_format: DocumentFormat = documents.document_format
         self.message_layout: MessageLayout = message_layout
+        self.query_separator = query_separator
+        self.dynamic_output_instructions = dynamic_output_instructions
         self.output_types = dict(output_types)
         self.output_mode: OutputMode = output_mode
         self.resolved_output_mode: ResolvedOutputMode = resolved_output_mode
@@ -124,6 +132,7 @@ class Session:
         self.policy = policy
         self.activity_options = activity_options
         self.output_validator = output_validator
+        self._validator_with_context = _validator_accepts_context(output_validator)
         self.instrument = instrument
         self.warmup = warmup
         self.prefix_hash = prefix_hash_value
@@ -140,7 +149,7 @@ class Session:
             output_mode=resolved_output_mode,
             descriptions={str(spec["name"]): str(spec.get("description", "")) for spec in tool_specs},
             output_feedback_retries=policy.output_feedback_retries,
-            output_validator=output_validator,
+            output_validator=None,
             dynamic_outputs=dynamic_outputs,
             instrument=instrument,
         )
@@ -183,6 +192,7 @@ class Session:
             self.rendered_documents,
             prefix_hash_value=self.prefix_hash,
             message_layout=self.message_layout,
+            query_separator=self.query_separator,
         )
 
     def _check_output_mode(self, query: Query[Any], *, diagnose: bool = True) -> None:
@@ -206,6 +216,7 @@ class Session:
                 self.rendered_documents,
                 message_layout=self.message_layout,
                 tail=self.render_tail(query) if self.message_layout == "single" else None,
+                query_separator=self.query_separator,
             )
         return copy.deepcopy(query.history)
 
@@ -219,6 +230,8 @@ class Session:
         """Query text that follows the frozen prefix. Schema lives here in prompted mode."""
         name = self.require_output(query.output)
         dynamic = isinstance(query.output, OutputSpec)
+        if dynamic and not self.dynamic_output_instructions:
+            return query.tail
         tool_name = DYNAMIC_OUTPUT_TOOL_NAME if dynamic and self.resolved_output_mode == "tools" else name
         parts = [query.tail.rstrip(), "", f"Use the `{tool_name}` output and no other output type."]
         if isinstance(query.output, OutputSpec) and query.output.description:
@@ -383,16 +396,31 @@ class Session:
         """
         agent = self._agent
         retries = self.policy.output_feedback_retries
+        validator = self.output_validator
+        context = (
+            OutputValidationContext(query_id=query.id or "", round=query.round, meta=copy.deepcopy(query.meta))
+            if validator is not None and self._validator_with_context
+            else None
+        )
+
+        async def validate_output(output: Any) -> Any:
+            if validator is None:
+                return output
+            if context is not None:
+                contextual = cast(Callable[[Any, OutputValidationContext], Any | Awaitable[Any]], validator)
+                validated = contextual(output, context)
+            else:
+                output_only = cast(Callable[[Any], Any | Awaitable[Any]], validator)
+                validated = output_only(output)
+            if inspect.isawaitable(validated):
+                validated = await validated
+            return validated
+
         if isinstance(query.output, OutputSpec):
             spec = query.output
 
             async def validate_dynamic(output: Any) -> Any:
-                validated: Any = spec.validate_output(output)
-                if self.output_validator is not None:
-                    validated = self.output_validator(validated)
-                    if inspect.isawaitable(validated):
-                        validated = await validated
-                return validated
+                return await validate_output(spec.validate_output(output))
 
             # Keep the entire registered tool list and the original instructions.
             # Only this worker-local callback knows the per-query schema.
@@ -409,19 +437,20 @@ class Session:
                 instrument=self.instrument,
             )
             kwargs.pop("output_type", None)
-        elif self.resolved_output_mode == "prompted" and self.output_validator is not None:
-            # The SDK forbids per-run output_type with output validators. Build
-            # the expected type locally instead, retaining identical instructions
-            # and template=False so no schema enters the frozen prefix.
+        elif validator is not None:
+            # Validators are bound to this query, never attached to the shared
+            # agent. Prompted validators also require a fixed local output type
+            # because the SDK forbids overriding it per run with validators.
+            prompted = self.resolved_output_mode == "prompted"
             name = self.require_output(query.output)
             agent = _build_agent(
                 self.model,
                 instructions=self.instructions,
-                output_types={name: self.output_types[name]},
-                output_mode="prompted",
-                descriptions={},
+                output_types={name: self.output_types[name]} if prompted else self.output_types,
+                output_mode=self.resolved_output_mode,
+                descriptions={str(item["name"]): str(item.get("description", "")) for item in self.tool_specs},
                 output_feedback_retries=retries,
-                output_validator=self.output_validator,
+                output_validator=validate_output,
                 dynamic_outputs=self.dynamic_outputs,
                 instrument=self.instrument,
             )
@@ -525,13 +554,18 @@ class Session:
                 tool_specs=self.tool_specs,
                 tail=self.render_tail(query),
                 history=query.history,
-                separator=QUERY_SEPARATOR if self.message_layout == "single" and query.history is None else "\n",
+                separator=self.query_separator if self.message_layout == "single" and query.history is None else "\n",
             )
         )
 
     def starts_with_prefix(self, messages: Sequence[ModelMessage]) -> bool:
         """Whether a transcript still begins with this session's documents."""
-        return history_matches_prefix(messages, self.rendered_documents, message_layout=self.message_layout)
+        return history_matches_prefix(
+            messages,
+            self.rendered_documents,
+            message_layout=self.message_layout,
+            query_separator=self.query_separator,
+        )
 
     async def reduce(
         self,
@@ -622,6 +656,8 @@ def build(
     meta_renderer: MetaRenderer | None = None,
     document_format: DocumentFormat = "blocks",
     message_layout: MessageLayout = "split",
+    query_separator: str = QUERY_SEPARATOR,
+    dynamic_output_instructions: bool = True,
 ) -> Session:
     """Freeze a shared prefix and the output tool set.
 
@@ -653,6 +689,9 @@ def build(
     is not block-addressable and cannot use citation checks or repairs.
     ``message_layout="single"`` puts the documents, :data:`QUERY_SEPARATOR` and
     the initial query tail into one user part. Continuations append only a tail.
+    ``query_separator`` replaces that separator literally, including whitespace.
+    ``dynamic_output_instructions=False`` leaves an ``OutputSpec`` query's tail
+    untouched; the caller supplies any necessary schema or output instructions.
     The defaults retain the original block rendering and split user parts.
 
     ``activity_options`` sets Temporal-only activity timeouts and retry options.
@@ -660,7 +699,8 @@ def build(
     leaving it unset preserves the five-minute activity timeout and retries
     derived from ``policy``.
 
-    ``output_validator`` is a worker-local sync or async output-only callback.
+    ``output_validator`` is a worker-local sync or async callback accepting the
+    output alone, or the output followed by :class:`OutputValidationContext`.
     Return the validated output, or raise ``pydantic_ai.ModelRetry`` to send its
     error back on this branch when ``policy.output_feedback_retries`` is enabled.
     The callback is never serialized and does not affect the frozen prefix.
@@ -671,6 +711,10 @@ def build(
     """
     if message_layout not in ("split", "single"):
         raise ForkReduceError("message_layout must be 'split' or 'single'")
+    if not isinstance(query_separator, str):
+        raise ForkReduceError("query_separator must be a string")
+    if not isinstance(dynamic_output_instructions, bool):
+        raise ForkReduceError("dynamic_output_instructions must be a bool")
     if dynamic_outputs not in (None, "generic_tool", "prompted"):
         raise ForkReduceError("dynamic_outputs must be 'generic_tool', 'prompted', or None")
     if output_mode == "tools" and (dynamic_outputs == "prompted" or (not outputs and dynamic_outputs is None)):
@@ -725,6 +769,7 @@ def build(
         tools=tool_specs,
         document_format=document_format,
         message_layout=message_layout,
+        query_separator=query_separator,
     )
     session = Session(
         model=model,
@@ -745,6 +790,8 @@ def build(
         dynamic_outputs=dynamic_outputs,
         instrument=instrument,
         message_layout=message_layout,
+        query_separator=query_separator,
+        dynamic_output_instructions=dynamic_output_instructions,
     )
     notice = prefix_context_warning(
         chosen,
@@ -756,6 +803,29 @@ def build(
     return session
 
 
+def _validator_accepts_context(validator: OutputValidator | None) -> bool:
+    """Inspect once without invoking callbacks or swallowing their TypeErrors."""
+    if validator is None:
+        return False
+    try:
+        signature = inspect.signature(validator)
+    except (TypeError, ValueError):
+        # Some extension callables have no inspectable signature. Preserve the
+        # existing output-only invocation for those callbacks.
+        return False
+    positional = sum(
+        parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        for parameter in signature.parameters.values()
+    )
+    if positional < 2:
+        return False
+    try:
+        signature.bind(None, None)
+    except TypeError:
+        return False
+    return True
+
+
 def _build_agent(
     model: Model,
     *,
@@ -764,7 +834,7 @@ def _build_agent(
     output_mode: ResolvedOutputMode,
     descriptions: dict[str, str],
     output_feedback_retries: int = 0,
-    output_validator: OutputValidator | None = None,
+    output_validator: Callable[[Any], Any | Awaitable[Any]] | None = None,
     dynamic_outputs: DynamicOutputs | None = None,
     dynamic_query: bool = False,
     instrument: bool | InstrumentationSettings = False,

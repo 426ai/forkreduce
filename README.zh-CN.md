@@ -318,6 +318,10 @@ session = build(
 
 raw 模式有意不清洗控制字符或添加应用分隔符，由应用保证输入字节确定及供应商可接受。raw 下拒绝 metadata 渲染选项，也没有框架 block 地址：`DocumentIndex.block_text`、`CitationCheck` 和使用内置引用检查/修复的 Plan 会明确拒绝。应使用应用自有定位/校验。快照保存两项配置，factory 必须恢复后再做 hash 校验。
 
+需要调用者完全控制动态尾巴时，在 raw/single 的 `build` 上设置 `query_separator="<custom boundary>"`、`dynamic_output_instructions=False`。首次 user part 精确等于 `raw_prefix + query_separator + query.tail`，保留所有空白/控制字符；不添加输出指令句、description、schema，也不裁剪，由应用提供指令。schema 校验仍执行。仅非默认 separator 参与 prefix hash；关闭动态指引只改尾巴/fingerprint，不改 prefix hash。静态输出尾巴不受影响。
+
+默认快照字段/字节不变。非默认布局使用带 `QueryLayout` 的 `ConfiguredFrozenPrefix`。factory 对两类快照均可读取 `frozen.query_separator`、`frozen.dynamic_output_instructions` 并传回 `build`；遗漏非默认恢复会被拒绝，已缓存 session 也不能绕过。
+
 ### Query 与 QueryResult
 
 ```python
@@ -386,7 +390,35 @@ prompted 模式仅将本题 schema 放在尾巴。`dynamic_outputs="generic_tool
 
 动态能力 session 的 auto 规则：支持强制输出且启用 generic_tool 时为 tools，否则为 prompted。可用 `dynamic_outputs="prompted"` 显式声明该意图；`outputs=[]` 且没有 generic tool 时 auto 也选 prompted。旧静态输出 auto session 保持原规则。已经冻结的静态 tools session 未启用 generic tool 时不能接动态 schema：应新建 prompted/dynamic session，不能中途改变缓存工具集合。显式 tools 的动态题必须启用 generic option。
 
-Temporal 用 `query_activity_input(..., output_spec=count)`，可选的 `output_name` 必须相同；快照保存 `dynamic_outputs`，factory 须恢复。两种 converter 都支持 query/follow-up 中的 spec，字典结果使用相同 JSON/引用字段。schema 字节仍进入 query/history，不是共享前缀，应用需控制体积。内置 BaseModel 引文检查/修复不是字典 schema 校验器，动态字典应接 `output_validator` 或读取引用的钩子。**切换输出方式前，应用应使用真实模型做回归；本项目离线测试不证明供应商的抽取质量。**
+Temporal 接受 `query_activity_input(..., output_spec=count)`（可选同名 `output_name`），大 schema 可传 `OutputSpecRef`。两种 converter 支持 query/follow-up 中的内联 spec 或引用，factory 恢复冻结动态配置；字典结果沿用现有 JSON/引用字段。内联 schema 仍进入 workflow history，规模大时使用下面的引用和有界生成模式。内置 BaseModel 引文检查/修复不是字典 schema 校验器，应使用 validator/读取引用的钩子。**切换输出方式前应由应用做真实模型回归；离线测试不证明供应商抽取质量。**
+
+#### 引用 schema 与大查询列表
+
+在 workflow 之外，用客户端/activity 自有 writer 和现有 store 准备：
+
+```python
+from forkreduce.contrib.temporal import OutputSpecWriter, query_activity_input
+
+writer = OutputSpecWriter(store)  # 整个准备任务复用一个 writer
+spec_ref = await writer.store(count, ref_namespace="demo-run")
+payload = query_activity_input(
+    session, query_id="count", tail="Return the count.", output_spec=spec_ref,
+    prefix_ref=prefix_ref, ref_namespace="demo-run",
+)
+```
+
+`OutputSpecRef(name, ref, sha256, namespace=None)` 不含 schema，放入既有 `output_spec` 字段，因此默认/内联 payload 形状及字节不变。query、完整 follow-up、`AfterQueryInput.query` 仅携带引用。worker 通过 `set_message_store(store)` 每个 activity attempt 仅解析/验证 digest、name、namespace 一次，反馈复用本地 spec。缺 blob 为清晰的不可重试错误；不同非空路由 namespace 使用既有 `ref_namespace_mismatch`。首次 prefix 路由也应在 query 上设置 namespace。I/O 使用 `StoreContext.kind="output_spec"`；准备时不属于某个 prefix（`prefix_hash=""`），读取时含 query/activity 上下文。
+
+key 内容寻址且按 namespace 隔离。同一 writer 对相同/并发 spec 去重，即使旧 store 返回 opaque ref；内容寻址后端还可跨 writer/进程去重。blob 须不可变、保留到重试/修复结束；复用 writer cache 时不要删除其 blob。writer 状态不序列化。
+
+大列表的正式模式是 **activity 按批生成**，不向 `MapQueriesInput` 塞无界列表，也不让 resolver 一次返回巨型列表。完整 [离线生成示例](examples/run_spec_refs_offline.py) 只传小型 job/范围，由 activity 准备每批 query/spec ref，workflow 用公开 `plan_batches` / `execute_query` 组合。准备结果和模型 activity 输入均须有界。示例覆盖 300 个不同合成 schema、每个超过 11 KB，所有 workflow/activity 输入及生成结果低于 512 KiB，含双 converter 和 replay。workflow 不做存储 I/O，不新增 `queries_ref` 字段或改变默认 activity 注册。应用替换生成 activity 数据源时保留有界输入/输出合同。
+
+```bash
+PYTHONPATH=src:. python examples/run_spec_refs_offline.py
+PYTHONPATH=src:. python examples/run_spec_refs_offline.py --plugin
+```
+
+运行需已有 `TEMPORAL_TEST_SERVER` 二进制和 checkout 的 dev/Temporal extras，不下载、不调用真实 provider、不导出遥测。
 
 ### 检查与修复
 
@@ -515,6 +547,10 @@ gap = GapFill(
 `QueryResult.feedback_retries_used` 和 `meta["feedback_retries_used"]` 记录实际回喂次数；本地外层重试会累加该数。每次实际请求（含回喂）之前都检查请求数/token 预算。`Policy.retries` 仍是独立的外层重试上限。回喂和校验器不改变 `prefix_hash`，非默认配置会改变 Temporal execution fingerprint。
 
 Temporal activity 使用 worker 登记或 factory 构建的 session，不序列化函数。`FrozenPrefix.output_feedback_retries` 保存数值策略；factory 应以 `Policy(output_feedback_retries=frozen.output_feedback_retries)` 恢复，并安装 worker 本地校验器。activity 成功/安全失败结果记录最后一次 activity attempt 的 `feedback_retries_used`，不猜测跨 Temporal attempt 的总数。校验错误会发送给模型，勿将敏感内容放入错误信息。
+
+校验器也可接受 `(output, context: OutputValidationContext)`，类型从 `forkreduce` 导出。显式第二个位置参数表示启用，context 包含 `query_id`、`round` 和深拷贝的 `meta`；同步/异步、原生 `ModelRetry` 行为相同。按 query 绑定，不修改共享 Agent，并发题目不会串身份。回调仍由 worker 持有，不改变 prefix hash；原有单参数行为不变。
+
+`output_feedback_retries > 0` 时，**一个 activity 可能调用模型多次**。须设置 `start_to_close >= single_call_time * (output_feedback_retries + 1)`，另加 factory/store I/O、校验余量。例如单次上界 60 秒、最多两次反馈，至少需 180 秒再加额外开销。`maximum_attempts` 为独立 Temporal 外层尝试次数；heartbeat timeout 不能代替足够长的 start-to-close。
 
 ### 并发、重试、预算
 
@@ -763,6 +799,19 @@ class AppBatch:
 
 钩子返回 `AfterQueryDecision(action="done"|"failed"|"follow_up", follow_up_tail=None, follow_up_query=None, result_meta=None)`。follow-up 尾巴沿用上轮 `messages_ref`；替换 query 必须保持 prefix hash。ID 自动变为 `original_id#r{round}`，round 自增。`max_rounds` 是**包含上界的 round 序号**：初答为零，默认一允许一次修复。failed 决定或达到上限后仍要求 follow-up，会生成 `permanent` / `after_query_failed`，不会静默返回未经批准的成功。最后一个非 None 的 `result_meta` 经 JSON 复制后原样放入最终结果，替换而不合并历史 metadata，限制为 16 KiB compact UTF-8 JSON。
 
+`follow_up_tail` 保留当前输出 spec；切换 schema 必须提供完整 `follow_up_query`（内联或引用）。将替换 query 包装为 `FollowUpQuery(query, history="fresh")` 即从共享前缀重启，清空两项 history。包装器默认 `history="continue"`，保留既有显式/继承历史语义；prefix 限制、自动 round/ID 和修复上限仍生效。例如钩子内部：
+
+```python
+from dataclasses import replace
+from forkreduce.contrib.temporal import AfterQueryDecision, FollowUpQuery
+
+decision = AfterQueryDecision("follow_up", follow_up_query=FollowUpQuery(
+    replace(data.query, tail="Re-evaluate independently.",
+            output_spec=next_spec_ref, output_name=next_spec_ref.name),
+    history="fresh",
+))
+```
+
 钩子 activity 异常在 raise 模式传播，return 模式为 `unknown` / 合成 `after_query_failed`。完整合成 failure_type 为 `batch_failed`、`after_query_failed`，均不作为任意原始 application type 透传。钩子在配置队列上使用独立 ActivityOptions，默认一次尝试、五分钟。父取消始终传播。这些钩子/轮次配置不改变 prefix hash 或默认执行行为。
 
 store 返回的引用必须不可变：相同逻辑 key 写入新内容不能改变之前返回的结果或续问历史。下面 SQLite 示例把内容摘要放入 ref，使用只插入写入；同内容可复用引用。若内容相等性本身敏感，须保护内容寻址 ref，生产 store 也可改为不透明的唯一引用。
@@ -830,6 +879,8 @@ def restore(frozen):
         on_unforced_tools=frozen.on_unforced_tools,
         dynamic_outputs=frozen.dynamic_outputs,
         document_format=frozen.document_format, message_layout=frozen.message_layout,
+        query_separator=frozen.query_separator,
+        dynamic_output_instructions=frozen.dynamic_output_instructions,
         policy=Policy(output_feedback_retries=frozen.output_feedback_retries),
         instrument=InstrumentationSettings(include_content=False),
     )
@@ -904,6 +955,8 @@ def restore(frozen):
         FunctionModel(reply), documents=frozen.documents, instructions=frozen.instructions, outputs=[],
         output_mode=frozen.output_mode, dynamic_outputs=frozen.dynamic_outputs,
         document_format=frozen.document_format, message_layout=frozen.message_layout,
+        query_separator=frozen.query_separator,
+        dynamic_output_instructions=frozen.dynamic_output_instructions,
         on_unforced_tools=frozen.on_unforced_tools,
         policy=Policy(retries=0, output_feedback_retries=frozen.output_feedback_retries),
         instrument=instrumentation, warmup=False,

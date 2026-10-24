@@ -140,6 +140,8 @@ async def main(*, plugin: bool = False) -> None:
             dynamic_outputs=frozen.dynamic_outputs,
             document_format=frozen.document_format,
             message_layout=frozen.message_layout,
+            query_separator=frozen.query_separator,
+            dynamic_output_instructions=frozen.dynamic_output_instructions,
             on_unforced_tools=frozen.on_unforced_tools,
             policy=Policy(retries=0, output_feedback_retries=frozen.output_feedback_retries),
             instrument=instrumentation,

@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 from temporalio import activity
 
-StoreKind = Literal["prefix", "messages", "output", "history"]
+StoreKind = Literal["prefix", "messages", "output", "history", "output_spec"]
 
 
 @dataclass(frozen=True)

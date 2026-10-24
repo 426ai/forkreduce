@@ -28,7 +28,7 @@ from forkreduce.output_specs import DynamicOutputs, OutputSpec
 from forkreduce.plan import Plan, RoundRecord, RunResult
 from forkreduce.policy import Accept, Budget, BudgetReport, Drop, Fail, Policy, RequireReason, Retry
 from forkreduce.prefix import QUERY_SEPARATOR, MessageLayout
-from forkreduce.query import CheckFailure, Query, QueryResult
+from forkreduce.query import CheckFailure, OutputValidationContext, Query, QueryResult
 from forkreduce.reduce import ReduceItem, ReduceOutcome
 from forkreduce.schemas import CITATION_INSTRUCTIONS, Citation, DiscardExplanation, DiscardExplanations, Traced
 from forkreduce.session import OutputValidator, Session, build
@@ -73,6 +73,7 @@ __all__ = [
     "OutputMode",
     "OutputModeConflictError",
     "OutputSpec",
+    "OutputValidationContext",
     "OutputValidator",
     "Plan",
     "Policy",
