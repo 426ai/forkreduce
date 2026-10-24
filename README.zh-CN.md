@@ -86,7 +86,9 @@ from pydantic import BaseModel, Field
 from pydantic_ai.models.test import TestModel
 
 from forkreduce import (
+    CITATION_INSTRUCTIONS,
     Block,
+    Citation,
     CitationCheck,
     CitationRepair,
     Document,
@@ -96,12 +98,10 @@ from forkreduce import (
 )
 
 
-class Answer(BaseModel):
+class Answer(Citation):
     """从公告里抽出的一条事实。"""
 
     text: str
-    quote: str
-    block_id: str
 
 
 class Finding(Traced):
@@ -131,7 +131,7 @@ async def main() -> None:
     session = build(
         TestModel(custom_output_args={"text": "see notice", "quote": "Eligible titles", "block_id": "titles"}),
         documents=notice,
-        instructions="Answer only from the notice. Cite a quote and its block_id.",
+        instructions="Answer only from the notice. " + CITATION_INSTRUCTIONS,
         outputs=[Answer, FindingList],
     )
     result = await (
@@ -254,6 +254,10 @@ session = build(
 
 `session.prefix_hash` 是一份规范 JSON 的 SHA-256：版本、输出模式、说明、清洗后的文档，以及每个工具的名称、描述和 schema。同样的内容重建 session，哈希不变。改工具 schema、说明或文档正文，哈希就会变。
 
+如果 OpenAI 兼容网关忽略必选的 `tool_choice`，只返回 JSON 文本而不调用输出工具，请显式选择 `output_mode="prompted"`。该模式仍按同一个已注册的 Pydantic 输出类型解析 JSON；tools 模式不会悄悄接受文本，也不会自动切换模式。切换输出模式会改变 session 身份。即使使用 prompted 模式，已注册 schema 仍参与 `prefix_hash`，只是 schema 的 JSON 只放在查询尾部，不在供应商共享的提示前缀里。
+
+给推理模型留足输出余量：供应商的 completion 上限可能同时计算推理 token 和可见答案。`max_tokens` 太小，可能还没生成任何 JSON 或工具参数就已经耗尽。可以给 `build()` 传 `model_settings={"max_tokens": 8192}`，或给 `openai_compatible_model()` 传 `max_tokens=8192`，再按工作负载和供应商调整；8,192 只是示例，不保证不会截断，也不是账单上限。不要未经核实就假设网关支持 reasoning-effort 控制。
+
 `documents` 可以是一个字符串（单个块，id 为 `b1`）、一串字符串（`b1`、`b2`……），或 `Block` / `Document`。渲染和哈希之前会去掉控制字符。渲染结果以单独一行 `===END_FIXED_DOCUMENTS===` 结束。
 
 `Block.meta` 会保存下来，默认不渲染，因此已有的前缀哈希不变。需要时用 `meta_keys`（按给出的键顺序渲染）或 `meta_renderer`（一个可调用对象）。渲染出来的 meta 属于前缀，也会进入哈希。两者只能传一个。
@@ -320,7 +324,11 @@ results = await session.fork([query, other])
 
 比较区分大小写。
 
-`CitationRepair(max_rounds=2, allowed_fields=("quote", "block_id"))` 延续同一条分支，并要求同一个输出类型。无论模型返回什么，`apply` 都会深拷贝原对象，只在每个失败路径上抄回允许的字段。其他字段保持原样。没有单独的修复 schema，工具集因此不会变。
+`Citation` 是可复用的 Pydantic 模型，`quote` 和 `block_id` 字段都带说明。可以放进列表，也可以像上面的例子一样继承后添加答案字段。每条引文必须是完整包含在所引用单块内的连续片段；仅在文档其他位置出现，不代表该块支持这条引文。证据跨块时，应拆成各自带块 ID 的多条引用，不能把多个块拼成一条引文。
+
+需要模型输出引用时，可把显式启用的 `CITATION_INSTRUCTIONS` 字符串追加到 session 说明中。框架不会向无关 session 注入这些说明；schema 和说明也不能替代 `CitationCheck`。采用 `Citation` 会改变已注册的输出 schema，因此改变 `prefix_hash`；追加说明也会改变冻结提示和哈希。保留原有自定义 schema 和说明的调用，哈希不变。归并和修复的新指引仅改变查询尾部，不改变冻结前缀或哈希。
+
+`CitationRepair(max_rounds=2, allowed_fields=("quote", "block_id"))` 延续同一条分支，并要求同一个输出类型。修复说明会重申单块边界；默认字段限制下，应缩短引文或纠正块 ID，不能通过添加、拆分输出条目来修复。无论模型返回什么，`apply` 都会深拷贝原对象，只在每个失败路径上抄回允许的字段。其他字段保持原样。没有单独的修复 schema，工具集因此不会变。
 
 ```python
 session.map(queries).check(
@@ -350,7 +358,9 @@ session.map(queries).check(
 
 ### 语义归并与覆盖
 
-归并就是同一 session 上的普通查询，所以命中同一前缀。尾巴把每条输入写成 `id: ...` 加 JSON，并要求 `source_ids` 从这些 id 里抄。
+归并就是同一 session 上的普通查询，所以命中同一前缀。尾巴把每条输入写成 `id: ...` 加 JSON，并显式列出允许使用的来源 ID。`source_ids` 必须标识这些输入条目（map 结果使用查询／fork ID），不能使用输入内容里的文档 ID 或块 ID。应以当前批次的输入 ID 替换原有 `source_ids`，不要混入证据地址。
+
+如果输入带有字符串 `question_id` 字段，包括嵌套模型、字典、列表和元组，尾巴还会逐题列出允许使用的输入 ID，例如 `{"opening": ["fork:0"], "closing": ["fork:1"]}`。同一问题出现多次时会收集所有匹配的输入 ID。这是通用提示指引，不是业务专属校验；下面的来源检查规则不变。没有问题 ID 的通用输入仍然可用，树形归并的各批次使用当前别名 ID，最终再展开。
 
 ```python
 class ExplainUncovered:
@@ -516,30 +526,94 @@ OpenAI 客户端以 `max_retries=0` 构造。重试由 forkreduce 做。`timeout
 
 ### Temporal（可选）
 
-`import forkreduce` 不会导入 `temporalio`。适配器在 `forkreduce.contrib.temporal`，需要 `pip install "forkreduce[temporal]"`。
+安装 `forkreduce[temporal]`；核心导入不加载 `temporalio`。每个 `forkreduce.run_query` activity 只调用一次 `Session.run_once`，重试由 Temporal 负责：校验/传输失败可重试，永久错误/预算耗尽不可重试。默认不变：一个 `forkreduce.map_queries` workflow、5 分钟 start-to-close、不设置 heartbeat timeout、总尝试次数为 `Policy.retries + 1`。
 
-每个查询是一个 activity。activity 调用 `Session.run_once`（只尝试一次），然后抛出 `ApplicationError`。`non_retryable` 跟随 `Failure.retryable`：校验和传输失败可以重试；永久失败和预算用尽不可以。`temporal_retry_policy(policy)` 把 `maximum_attempts` 设为 `policy.retries + 1`。
+#### 配置与插件 worker
 
-幂等键是 `forkreduce:{prefix_hash}:{query_id}`，由 `activity_id` 生成。工作流启动前，在 worker 里用 `register_session(session)` 登记建好的 session。同一个前缀哈希如果换成另一个模型、另一份会改变请求体的设置、另一份模型 profile，或另一套策略，会抛出 `ForkReduceError`；先调用 `unregister_session`。执行指纹相同则可以替换。`timeout` 和 `extra_headers` 不计入指纹。单次查询的 `model_settings` 也不计入；把它传给 `query_activity_input(..., model_settings=...)`，worker 只在这次 activity 里套用。工作流载荷带的是前缀哈希、尾巴、输出类型名和重试预算（`max_attempts`、退避），不是模型对象。`MapQueriesWorkflow` 使用这份预算。`query_activity_input(session, ...)` 把 `Policy.retries + 1` 抄进 `max_attempts`。没有消息存储时，把上一个 activity 的 `messages_json` 作为 `history_json` 传回去，就能延续分支。
+`ActivityOptions` 的时长单位是**秒**。可在 `build` 设置，在单个 payload 的 `activity_options` 覆盖，或在 `MapQueriesInput.activity_options` 为整个工作流整对象替换。未指定的重试字段继承 payload 内的策略预算/退避；`maximum_attempts` 包含首次执行。**2 次尝试 / 3 分钟 / 30 秒心跳**配置：
 
-很长的对话记录不适合作为 activity 的返回值。用 `set_message_store` 接一个 `MessageStore`。有存储时，activity 返回 `messages_ref`，`messages_json` 为空。没有存储时，消息会内联返回，测试方便，真实历史不合适。`InMemoryMessageStore` 只活在当前进程里。
+```python
+from forkreduce import ActivityOptions, build
+from forkreduce.contrib.temporal import (
+    MapQueriesInput, MapQueriesWorkflow, QueryBatchWorkflow,
+    query_activity_input, register_session, run_query_activity,
+)
+from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
+from temporalio.client import Client
+from temporalio.worker import Worker
 
-`MapQueriesWorkflow` 把 activity 扇出。它自己不调用模型。确定性的决定（覆盖计算、线索过滤）可以在 activity 返回后放在 workflow 里；模型调用留在 activity 里。
+session = build(
+    model, documents=document, instructions="Answer from the document.", outputs=[Answer],
+    activity_options=ActivityOptions(
+        start_to_close=180, heartbeat_timeout=30, maximum_attempts=2,
+        # schedule_to_close=600, retry_backoff=1, max_backoff=8, backoff_coefficient=2,
+    ),
+)
+register_session(session)  # 每个 activity worker 进程都要登记
+client = await Client.connect("localhost:7233", plugins=[PydanticAIPlugin()])
+async with Worker(
+    client, task_queue="extraction",
+    workflows=[MapQueriesWorkflow, QueryBatchWorkflow],
+    activities=[run_query_activity],  # 继承 client 的插件
+):
+    results = await client.execute_workflow(
+        MapQueriesWorkflow.run,
+        [query_activity_input(session, query_id="q1", tail="What is required?", output_name="Answer")],
+        id="extraction-run-1", task_queue="extraction",
+    )
+```
+
+Temporal 默认 converter 和 `PydanticAIPlugin` 安装的 `PydanticAIPayloadConverter` 均有离线 workflow/replay 覆盖。forkreduce 的逐查询 activity 可以与官方 `TemporalDurability` agent 在同一 worker 共存；照常登记其 agent/workflow，不要再给这些 activity 外包一层模型重试循环。使用官方集成时安装 Pydantic AI 的 `[temporal]` extra。默认 converter 的 worker 请设置 `workflow_runner=SandboxedWorkflowRunner(restrictions=SandboxRestrictions.default.with_passthrough_modules("forkreduce", "pydantic_ai"))`；两个类都来自 `temporalio.worker.workflow_sandbox`，避免在沙箱重新导入模型依赖。
+
+设置 heartbeat timeout 后，等待模型期间定期发送心跳；这是存活信号，不代表业务进度。阻塞事件循环也会阻塞心跳：CPU 工作放线程或独立 activity，并保留有限 start-to-close。LocalExecutor 不使用这些选项；它们不改变前缀字节/哈希。
+
+登记仅对本进程有效。payload 只带哈希、问题尾巴、输出类型名、选项和可选单题 `model_settings`，不带模型实例或 Python 类。相同前缀登记不同模型/请求体设置/profile/policy 会抛出 `ForkReduceError`，替换前先 unregister。`timeout`/`extra_headers` 仍不计入指纹；设置必须能 JSON 序列化。`activity_id(prefix_hash, query_id)` 仍是 `forkreduce:{prefix_hash}:{query_id}`。单工作流内联续问仍可把前次 `messages_json` 传入 `history_json`。
+
+#### 有界子工作流与引用传递
+
+`MapQueriesInput(queries=payloads, batch_size=15, child_concurrency=4)` 启用有界子工作流；worker 必须同时登记 `MapQueriesWorkflow` 与 `QueryBatchWorkflow`。结果保持输入顺序。child ID 从父 workflow ID、prefix hash、batch index 推导，重放以及改变 run ID 的 workflow 重试均保持稳定；不同父 workflow ID 不碰撞。它不是供应商计费的 exactly-once 保证。
+
+分批模式要求 `MessageStore`，返回 `messages_ref` 和 `output_ref`，不把 transcript 或结构化结果正文带回父历史。父历史与 transcript 大小无关，但问题尾巴、meta 和结果引用列表仍占用空间，须保持精简。分批续问必须用 `history_ref`，不能用内联 `history_json`。默认列表输入/单工作流模式仍支持小载荷内联。
+
+`MessageStore` 与 `PrefixStore` 使用异步 `put(key, bytes) -> ref` / `get(ref) -> bytes` 接口。生产实现应为所有 worker 可访问的对象存储/数据库；`InMemoryMessageStore` 只适合单进程示例/测试。大前缀在 workflow 之外冻结，例如应用的 `prepare` activity，只返回引用和小问题载荷：
 
 ```python
 from forkreduce.contrib.temporal import (
-    InMemoryMessageStore,
-    MapQueriesWorkflow,
-    QueryActivityInput,
-    register_session,
-    run_query_activity,
-    set_message_store,
-    temporal_retry_policy,
+    freeze_prefix, register_session_factory, set_prefix_store, set_message_store,
 )
 
-register_session(session)
-set_message_store(InMemoryMessageStore())
+# client 或 prepare activity；store 为应用提供的持久存储。
+prefix_ref = await freeze_prefix(session, store)
+payloads = [
+    query_activity_input(
+        session, query_id=f"q{i}", tail=question, output_name="Answer", prefix_ref=prefix_ref,
+    )
+    for i, question in enumerate(questions)
+]
+
+# 每个 worker 启动时配置，凭证与 Python 输出类留在进程内。
+def restore(frozen):
+    return build(
+        model, documents=frozen.documents, instructions=frozen.instructions,
+        outputs=[Answer], output_mode=frozen.output_mode,
+    )
+
+set_prefix_store(store)
+set_message_store(store)
+register_session_factory(session.prefix_hash, restore)
+# 在上方 worker 运行期间执行：
+results = await client.execute_workflow(
+    MapQueriesWorkflow.run,
+    MapQueriesInput(queries=payloads, batch_size=15, child_concurrency=4),
+    id="extraction-run-2", task_queue="extraction",
+)
+answer = Answer.model_validate_json(await store.get(results[0].output_ref))
+# 续问使用 history_ref=results[0].messages_ref。
 ```
+
+`FrozenPrefix` 存文档、说明、渲染前缀与工具身份，不序列化可执行模型/schema 类。worker 会校验重建后的 prefix hash；须保持 schema/渲染配置一致。worker 启动时登记 factory，引用对象保留到重试/续问生命周期结束。最终结果与引用应持久化，已结束 workflow 的实时流不能当归档重放接口。编排存在不兼容变更时，排空在途执行或使用 worker versioning/新队列，并重放实际迁移所需历史；converter 测试不保证任意旧工作流代码在编排变更后仍能重放。
+factory 默认每个 activity attempt 调用一次，避免无意中跨工作流共享可变 session 预算。需要 worker 内复用时，factory 可返回应用显式管理的缓存 session，或调用 `register_session`；缓存同步、生命周期与预算范围由应用负责。
+
 
 ## 缓存注意事项
 
@@ -583,6 +657,8 @@ ruff check src tests examples && ruff format --check src tests examples
 mypy
 pytest
 ```
+
+0.2.0 开发验证组合：Pydantic AI 2.61.0 / OpenAI 3.37.0，配合 Temporal SDK 1.33.0 与 1.34.0。依赖范围仍为 `pydantic-ai>=2.57,<3` 和可选 `temporalio>=1.9`；官方插件另有自身 extra 要求。Temporal 测试启动真实 time-skipping server，只调用离线模型。无网络环境可设置 `TEMPORAL_TEST_SERVER=/path/to/temporal-test-server` 复用已有二进制，否则 SDK 会下载。
 
 示例不需要密钥，完全离线：
 

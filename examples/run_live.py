@@ -45,7 +45,7 @@ async def main() -> int:
             ]
         )
         .check(CitationCheck(), repair=CitationRepair(max_rounds=2))
-        .reduce(output=FindingList, instructions="Merge the cited facts. Keep source_ids.")
+        .reduce(output=FindingList, instructions="Merge the cited facts using the current input ids.")
         .run()
     )
     print(f"failures={len(result.failures)} cache_hit_rate={result.cache_hit_rate:.2f}")

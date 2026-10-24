@@ -38,6 +38,7 @@ from forkreduce.prefix import (
 )
 from forkreduce.query import Query, QueryResult
 from forkreduce.stats import cache_hit_tokens, usage_from_messages
+from forkreduce.temporal_options import ActivityOptions
 
 T = TypeVar("T")
 OutputMode = Literal["tools", "prompted"]
@@ -51,6 +52,8 @@ class Session:
     Build one with :func:`forkreduce.build`. Queries share ``instructions``,
     the rendered documents, and (in ``tools`` mode) the whole output tool set.
     The per-query text is only the tail.
+    ``activity_options`` configures only the optional Temporal adapter; duration
+    values are seconds and do not change local execution or prefix identity.
     """
 
     def __init__(
@@ -67,6 +70,7 @@ class Session:
         tool_specs: list[dict[str, Any]],
         executor: Executor | None,
         model_settings: ModelSettings | None = None,
+        activity_options: ActivityOptions | None = None,
     ) -> None:
         self.model = model
         copied = cast(ModelSettings, dict(model_settings)) if model_settings else None
@@ -77,6 +81,7 @@ class Session:
         self.output_types = dict(output_types)
         self.output_mode: OutputMode = output_mode
         self.policy = policy
+        self.activity_options = activity_options
         self.warmup = warmup
         self.prefix_hash = prefix_hash_value
         self.tool_specs = tool_specs
@@ -366,6 +371,7 @@ def build(
     policy: Policy | None = None,
     executor: Executor | None = None,
     model_settings: ModelSettings | None = None,
+    activity_options: ActivityOptions | None = None,
     meta_keys: Sequence[str] | None = None,
     meta_renderer: MetaRenderer | None = None,
 ) -> Session:
@@ -383,6 +389,11 @@ def build(
     may override individual keys. Sampling parameters and timeouts do not change
     the frozen prefix. ``meta_keys`` or ``meta_renderer`` do: rendered block
     meta becomes part of the prefix and its hash. The default renders no meta.
+
+    ``activity_options`` sets Temporal-only activity timeouts and retry options.
+    Durations are seconds. It does not change local execution or the prefix;
+    leaving it unset preserves the five-minute activity timeout and retries
+    derived from ``policy``.
     """
     if output_mode not in {"tools", "prompted"}:
         raise ForkReduceError("output_mode must be 'tools' or 'prompted'")
@@ -425,6 +436,7 @@ def build(
         tool_specs=tool_specs,
         executor=executor,
         model_settings=model_settings,
+        activity_options=activity_options,
     )
     notice = prefix_context_warning(
         chosen,

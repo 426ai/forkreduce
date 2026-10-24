@@ -20,22 +20,26 @@ from forkreduce.plan import Plan, RoundRecord, RunResult
 from forkreduce.policy import Accept, Budget, BudgetReport, Drop, Fail, Policy, RequireReason, Retry
 from forkreduce.query import CheckFailure, Query, QueryResult
 from forkreduce.reduce import ReduceItem, ReduceOutcome
-from forkreduce.schemas import DiscardExplanation, DiscardExplanations, Traced
+from forkreduce.schemas import CITATION_INSTRUCTIONS, Citation, DiscardExplanation, DiscardExplanations, Traced
 from forkreduce.session import Session, build
 from forkreduce.stats import UsageSummary
+from forkreduce.temporal_options import ActivityOptions
 
 __version__ = "0.1.1"
 
 __all__ = [
     "END_MARKER",
+    "CITATION_INSTRUCTIONS",
     "Accept",
     "AcceptLeads",
     "AcceptUncovered",
+    "ActivityOptions",
     "Block",
     "Budget",
     "BudgetReport",
     "CheckFailure",
     "CheckReport",
+    "Citation",
     "ContextEstimateWarning",
     "ContextWarning",
     "CitationCheck",

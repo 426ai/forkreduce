@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -562,14 +562,52 @@ def _render_reduce_tail(items: Sequence[ReduceItem], instructions: str, hint: st
     lines = [
         "Merge the input items into the requested output.",
         "Every output entry must include source_ids copied from the input ids below.",
-        "Do not invent source ids.",
+        "Replace any source_ids in the input values with ids from this batch; do not copy old source_ids.",
+        "Document ids and block ids are evidence addresses, not source_ids. "
+        "Never add them to source_ids unless they are themselves listed as input ids.",
+        "ALLOWED_SOURCE_IDS: " + json.dumps([item.id for item in items], ensure_ascii=False),
     ]
+    question_sources = _question_source_ids(items)
+    if question_sources:
+        lines.extend(
+            [
+                "For each question_id, use only its mapped input ids as source_ids; "
+                "do not mix sources belonging to other questions.",
+                "ALLOWED_SOURCE_IDS_BY_QUESTION: " + json.dumps(question_sources, ensure_ascii=False),
+            ]
+        )
     if instructions.strip():
         lines.extend(["", instructions.strip()])
     if hint.strip():
         lines.extend(["", f"Hint: {hint.strip()}"])
     lines.extend(["", "INPUT_ITEMS", rendered])
     return "\n".join(lines)
+
+
+def _question_source_ids(items: Sequence[ReduceItem]) -> dict[str, list[str]]:
+    """Map nested question ids to the current batch ids, including tree aliases."""
+    sources: dict[str, list[str]] = {}
+    for item in items:
+        for question_id in dict.fromkeys(_iter_question_ids(item.value)):
+            sources.setdefault(question_id, []).append(item.id)
+    return sources
+
+
+def _iter_question_ids(value: Any) -> Iterator[str]:
+    if isinstance(value, BaseModel):
+        for name in type(value).model_fields:
+            child = getattr(value, name)
+            if name == "question_id" and isinstance(child, str) and child:
+                yield child
+            yield from _iter_question_ids(child)
+    elif isinstance(value, Mapping):
+        for key, child in value.items():
+            if key == "question_id" and isinstance(child, str) and child:
+                yield child
+            yield from _iter_question_ids(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _iter_question_ids(child)
 
 
 def _render_reason_tail(item_ids: Sequence[str]) -> str:

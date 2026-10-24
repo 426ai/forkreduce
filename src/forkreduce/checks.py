@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from forkreduce.documents import DocumentIndex
 from forkreduce.errors import ForkReduceError
 from forkreduce.query import CheckFailure, Query, QueryResult
+from forkreduce.schemas import CITATION_INSTRUCTIONS
 from forkreduce.textutil import normalize_whitespace
 
 _PATH_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\]")
@@ -154,6 +155,9 @@ class CitationRepair:
             "Return the same output type.",
             "You may change only these fields: " + ", ".join(self.allowed_fields) + ".",
             "Keep every other field identical to your previous answer.",
+            CITATION_INSTRUCTIONS,
+            "When only citation fields may change, shorten the quote to a passage inside one block "
+            "or correct its block_id; do not change the output structure to split citations.",
             "",
             "Failures:",
         ]
