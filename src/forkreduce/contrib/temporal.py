@@ -33,7 +33,8 @@ from temporalio.exceptions import ApplicationError
 with workflow.unsafe.imports_passed_through():
     from collections.abc import Awaitable, Callable, Mapping
 
-    from pydantic import BaseModel
+    from pydantic import BaseModel, TypeAdapter
+    from pydantic import JsonValue as JSONValue
     from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
     from pydantic_ai.settings import ModelSettings, merge_model_settings
 
@@ -90,6 +91,18 @@ class InMemoryMessageStore:
 _SESSIONS: dict[str, Session] = {}
 _FINGERPRINTS: dict[str, str] = {}
 _STORE: MessageStore | None = None
+_APP_META_ADAPTER = TypeAdapter(dict[str, JSONValue])
+_APP_META_MAX_BYTES = 16 * 1024
+
+
+def _app_meta_json(app_meta: Mapping[str, JSONValue]) -> str:
+    if not isinstance(app_meta, Mapping):
+        raise ValueError("Frozen prefix app_meta must be a JSON object")
+    validated = _APP_META_ADAPTER.validate_python(dict(app_meta), strict=True)
+    encoded = json.dumps(validated, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    if len(encoded.encode("utf-8")) > _APP_META_MAX_BYTES:
+        raise ValueError("Frozen prefix app_meta must not exceed 16 KiB of compact UTF-8 JSON")
+    return encoded
 
 
 @dataclass(frozen=True)
@@ -100,6 +113,10 @@ class FrozenPrefix:
     preserves the exact prefix, including any custom metadata rendering.
     A factory must reproduce custom metadata rendering as well as the model and
     output schemas: the reconstructed session's complete prefix is verified.
+
+    ``app_meta`` is application-owned reconstruction metadata, not prompt content.
+    It must fit in 16 KiB of compact UTF-8 JSON and never changes prefix or
+    execution identity. Older snapshots without it receive an independent dict.
     """
 
     prefix_hash: str
@@ -110,6 +127,7 @@ class FrozenPrefix:
     tools_json: str
     resolved_output_mode: ResolvedOutputMode | None = None
     on_unforced_tools: UnforcedToolsPolicy = "warn"
+    app_meta: dict[str, JSONValue] = field(default_factory=dict)
 
     @property
     def documents(self) -> list[Document]:
@@ -118,6 +136,7 @@ class FrozenPrefix:
 
     def validate(self) -> None:
         """Reject corrupt snapshots before invoking a worker factory."""
+        _app_meta_json(self.app_meta)
         resolved = self.resolved_output_mode
         if resolved is None:
             if self.output_mode not in {"tools", "prompted"}:
@@ -145,8 +164,18 @@ _DEFAULT_FACTORY: SessionFactory | None = None
 _PREFIX_STORE: PrefixStore | None = None
 
 
-async def freeze_prefix(session: Session, store: PrefixStore) -> str:
-    """Persist a prefix without serializing the model or Python output classes."""
+async def freeze_prefix(
+    session: Session,
+    store: PrefixStore,
+    *,
+    app_meta: Mapping[str, JSONValue] | None = None,
+) -> str:
+    """Persist a prefix without serializing the model or Python output classes.
+
+    Optional ``app_meta`` is JSON-copied for the worker factory and limited to
+    16 KiB of compact UTF-8 JSON. It does not affect the prefix hash or execution
+    fingerprint. Store only application metadata safe to persist with the prefix.
+    """
     snapshot = FrozenPrefix(
         prefix_hash=session.prefix_hash,
         instructions=session.instructions,
@@ -156,9 +185,11 @@ async def freeze_prefix(session: Session, store: PrefixStore) -> str:
         tools_json=json.dumps(session.tool_specs),
         resolved_output_mode=session.resolved_output_mode,
         on_unforced_tools=session.on_unforced_tools,
+        app_meta=cast(dict[str, JSONValue], json.loads(_app_meta_json({} if app_meta is None else app_meta))),
     )
     snapshot.validate()
-    return await store.put(f"prefix:{session.prefix_hash}", json.dumps(asdict(snapshot)).encode())
+    encoded = json.dumps(asdict(snapshot), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return await store.put(f"prefix:{session.prefix_hash}", encoded)
 
 
 def set_prefix_store(store: PrefixStore | None) -> None:

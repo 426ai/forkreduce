@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from dataclasses import asdict
+from types import MappingProxyType
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue
 from pydantic_ai.models.test import TestModel
 from temporalio.exceptions import ApplicationError
 
@@ -144,3 +147,141 @@ async def test_default_factory_requires_snapshot_reference() -> None:
         await adapter.execute_query_activity(payload_for(session))
     assert caught.value.non_retryable is True
     assert caught.value.type == "permanent"
+
+
+@pytest.mark.parametrize("exact", [False, True])
+async def test_factory_receives_independent_application_metadata(exact: bool) -> None:
+    assert adapter.JSONValue is JsonValue
+    session = make_session()
+    prefix_hash = session.prefix_hash
+    fingerprint = adapter.execution_fingerprint(session)
+    metadata: dict[str, adapter.JSONValue] = {
+        "deployment": "offline",
+        "options": {"labels": ["original"], "enabled": True, "limit": 3, "ratio": 0.5, "extra": None},
+    }
+    original = json.loads(json.dumps(metadata))
+    store = adapter.InMemoryMessageStore()
+    ref = await adapter.freeze_prefix(session, store, app_meta=MappingProxyType(metadata))
+    options = metadata["options"]
+    assert isinstance(options, dict)
+    options["labels"] = ["caller changed"]
+    metadata["deployment"] = "caller changed"
+    seen: list[dict[str, adapter.JSONValue]] = []
+
+    def restore(snapshot: adapter.FrozenPrefix) -> Session:
+        assert snapshot.app_meta == original
+        snapshot.validate()
+        seen.append(snapshot.app_meta)
+        snapshot.app_meta["deployment"] = "factory changed"
+        nested = snapshot.app_meta["options"]
+        assert isinstance(nested, dict)
+        nested["labels"] = ["factory changed"]
+        return session
+
+    adapter.set_prefix_store(store)
+    if exact:
+        adapter.register_session_factory(session.prefix_hash, restore)
+    else:
+        adapter.set_default_session_factory(restore)
+    for _ in range(2):
+        assert await adapter._resolve_session(payload_for(session, ref)) is session
+    assert seen[0] is not seen[1]
+    assert metadata["deployment"] == "caller changed"
+    assert options["labels"] == ["caller changed"]
+    assert session.prefix_hash == prefix_hash
+    assert adapter.execution_fingerprint(session) == fingerprint
+    frozen = adapter.FrozenPrefix(**json.loads(await store.get(ref)))
+    assert frozen.prefix_hash == prefix_hash and frozen.app_meta == original
+
+
+async def test_legacy_and_default_metadata_dicts_are_independent() -> None:
+    session = make_session()
+    store = adapter.InMemoryMessageStore()
+    ref = await adapter.freeze_prefix(session, store)
+    record = json.loads(await store.get(ref))
+    assert record.pop("app_meta") == {}
+    first = adapter.FrozenPrefix(**record)
+    second = adapter.FrozenPrefix(**record)
+    first.app_meta["only_first"] = True
+    assert second.app_meta == {}
+    first.validate()
+    second.validate()
+    assert first.prefix_hash == second.prefix_hash == session.prefix_hash
+    legacy_ref = await store.put("legacy", json.dumps(record).encode())
+    seen: list[dict[str, adapter.JSONValue]] = []
+
+    def restore(snapshot: adapter.FrozenPrefix) -> Session:
+        seen.append(snapshot.app_meta)
+        return session
+
+    adapter.set_prefix_store(store)
+    adapter.set_default_session_factory(restore)
+    assert await adapter._resolve_session(payload_for(session, legacy_ref)) is session
+    assert seen == [{}]
+    explicit_ref = await adapter.freeze_prefix(session, store, app_meta=None)
+    assert json.loads(await store.get(explicit_ref))["app_meta"] == {}
+
+
+@pytest.mark.parametrize("character", ["x", "é", "界", "🦊"])
+async def test_metadata_limit_counts_compact_utf8_bytes(character: str) -> None:
+    session = make_session()
+    store = adapter.InMemoryMessageStore()
+    limit = 16 * 1024
+    overhead = len(json.dumps({"text": ""}, separators=(",", ":")).encode("utf-8"))
+    count, remainder = divmod(limit - overhead, len(character.encode("utf-8")))
+    metadata: dict[str, adapter.JSONValue] = {"text": character * count + "x" * remainder}
+    compact = json.dumps(metadata, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(compact) == limit
+    ref = await adapter.freeze_prefix(session, store, app_meta=metadata)
+    frozen = adapter.FrozenPrefix(**json.loads(await store.get(ref)))
+    frozen.validate()
+    assert frozen.app_meta == metadata
+    assert character.encode("utf-8") in await store.get(ref)
+    assert isinstance(metadata["text"], str)
+    metadata["text"] += "x"
+    with pytest.raises(ValueError, match="16 KiB"):
+        await adapter.freeze_prefix(session, store, app_meta=metadata)
+    # Validation must also reject oversized metadata attached to a valid prefix.
+    record = asdict(frozen)
+    record["app_meta"] = metadata
+    with pytest.raises(ValueError, match="16 KiB"):
+        adapter.FrozenPrefix(**record).validate()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"invalid": object()},
+        {"invalid": (1, 2)},
+        {1: "non-string key"},
+        {"invalid": float("nan")},
+        {"invalid": float("inf")},
+        ["not an object"],
+    ],
+)
+async def test_freeze_rejects_non_json_metadata(metadata: Mapping[str, adapter.JSONValue]) -> None:
+    with pytest.raises((ValueError, TypeError)):
+        await adapter.freeze_prefix(make_session(), adapter.InMemoryMessageStore(), app_meta=metadata)
+
+
+@pytest.mark.parametrize("metadata", [None, ["not an object"], {"text": "x" * (16 * 1024)}, {"bad": float("nan")}])
+async def test_worker_validates_metadata_before_factory(metadata: adapter.JSONValue) -> None:
+    session = make_session()
+    store = adapter.InMemoryMessageStore()
+    ref = await adapter.freeze_prefix(session, store)
+    record = json.loads(await store.get(ref))
+    record["app_meta"] = metadata
+    corrupt_ref = await store.put("corrupt", json.dumps(record).encode())
+    calls: list[str] = []
+
+    def restore(snapshot: adapter.FrozenPrefix) -> Session:
+        calls.append(snapshot.prefix_hash)
+        return session
+
+    adapter.set_prefix_store(store)
+    adapter.set_default_session_factory(restore)
+    with pytest.raises(ApplicationError) as caught:
+        await adapter.execute_query_activity(payload_for(session, corrupt_ref))
+    assert caught.value.non_retryable is True
+    assert caught.value.type == "permanent"
+    assert not calls
