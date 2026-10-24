@@ -4,6 +4,9 @@
 
 ### Added
 
+- Opt-in `document_format="raw"` preserves exact text/control characters without framework wrappers/end markers; `message_layout="single"` combines the initial prefix and tail with exported `QUERY_SEPARATOR`, retaining the head across continuations/feedback. `DocumentFormat` / `MessageLayout` are public aliases, snapshots restore both settings, and raw mode explicitly rejects built-in block/citation operations. Only nondefaults enter the hash/fingerprint encoding; literal v0.1.1 defaults remain byte/hash identical.
+- Complete `examples/run_temporal_offline.py` and bilingual integration recipes combine default factories, bounded metadata, namespace-routed immutable SQLite references, return-mode hook repairs, dynamic schemas, warmup/queues, prefixed sandbox definitions, tracing and raw/single layouts. It requires a cached local server and disables provider requests; both converters support replay.
+
 - Worker-local `build(instrument=False|True|InstrumentationSettings)` applies to ordinary, feedback and dynamic Agents without changing hashes/fingerprints; explicit default-off remains independent of global Agent defaults. `forkreduce_temporal_names(prefix=...)` / serializable `TemporalNames` provide sandboxed, cached prefixed activity/workflow definitions while preserving original default registrations, child/query IDs, application hooks and custom batch choices. Real in-memory tracing and same-worker official TemporalDurability/PydanticAIPlugin coexistence are covered.
 
 - Public serializable `OutputSpec` / `DynamicOutputs` support per-question JSON schemas and dictionary outputs, with JSON Schema validation, local refs/composition, and native output-feedback retries. Prompted schemas stay in tails; opt-in `dynamic_outputs="generic_tool"` adds one fixed permissive output tool rather than changing tools per query. Dynamic-only auto sessions without that tool use prompted mode. Both Temporal converters handle specs/follow-ups and frozen dynamic settings. Only enabling/changing the frozen tool/mode contract changes hashes; per-question schemas do not.
@@ -62,6 +65,8 @@ Public `QueryFailureKind` is exported from `forkreduce.contrib.temporal` as a `L
 | `unknown` | Ambiguous terminal application/SDK failure or failed child batch. |
 
 ### Upgrade notes
+
+- **Document/message layout:** defaults remain blocks/split and preserve the legacy identity encoding. Raw/single opt-ins change prefix hashes and execution fingerprints; restore both frozen flags in factories and version/drain incompatible in-flight work. Raw metadata rendering and framework block/citation operations are unsupported; applications own deterministic bytes and provider acceptance. The new complete offline example needs the checkout dev/Temporal extras for in-memory OpenTelemetry support and never downloads its test server.
 
 - **Observability and registration:** rebuild models and instrumentation in worker session factories, never serialize providers/exporters/functions. Configure tracing/export explicitly and consider `include_content=False`. Prefixed definitions still use the documented sandbox passthrough runner; register/replay the same definitions. Official plugin clients supply the worker plugin once. forkreduce query activities remain their own Agent path, not a TemporalDurability forwarding shim.
 

@@ -27,7 +27,7 @@ from forkreduce.context import (
     request_context_warning,
     request_text,
 )
-from forkreduce.documents import DocumentIndex, DocumentsInput, MetaRenderer, coerce_documents
+from forkreduce.documents import DocumentFormat, DocumentIndex, DocumentsInput, MetaRenderer, coerce_documents
 from forkreduce.errors import ForkReduceError, OutputModeConflictError, UnregisteredOutputError
 from forkreduce.executor import BudgetLedger, Executor, LocalExecutor, budget_action_failure
 from forkreduce.failures import Failure, classify_exception, wrong_output_failure
@@ -49,6 +49,8 @@ from forkreduce.output_specs import (
 )
 from forkreduce.policy import Policy
 from forkreduce.prefix import (
+    QUERY_SEPARATOR,
+    MessageLayout,
     history_matches_prefix,
     prefix_hash,
     prefix_messages,
@@ -103,6 +105,7 @@ class Session:
         output_validator: OutputValidator | None = None,
         dynamic_outputs: DynamicOutputs | None = None,
         instrument: bool | InstrumentationSettings = False,
+        message_layout: MessageLayout = "split",
     ) -> None:
         self.model = model
         copied = cast(ModelSettings, dict(model_settings)) if model_settings else None
@@ -110,6 +113,8 @@ class Session:
         self.instructions = instructions
         self.documents = documents
         self.rendered_documents = documents.rendered
+        self.document_format: DocumentFormat = documents.document_format
+        self.message_layout: MessageLayout = message_layout
         self.output_types = dict(output_types)
         self.output_mode: OutputMode = output_mode
         self.resolved_output_mode: ResolvedOutputMode = resolved_output_mode
@@ -177,6 +182,7 @@ class Session:
             query.history,
             self.rendered_documents,
             prefix_hash_value=self.prefix_hash,
+            message_layout=self.message_layout,
         )
 
     def _check_output_mode(self, query: Query[Any], *, diagnose: bool = True) -> None:
@@ -196,8 +202,18 @@ class Session:
     def history_for(self, query: Query[Any]) -> list[ModelMessage]:
         """Prefix messages, or a copy of the continuation history."""
         if query.history is None:
-            return prefix_messages(self.rendered_documents)
+            return prefix_messages(
+                self.rendered_documents,
+                message_layout=self.message_layout,
+                tail=self.render_tail(query) if self.message_layout == "single" else None,
+            )
         return copy.deepcopy(query.history)
+
+    def _user_prompt_for(self, query: Query[Any]) -> str | None:
+        """Single initial requests already contain their tail in ``history_for``."""
+        if self.message_layout == "single" and query.history is None:
+            return None
+        return self.render_tail(query)
 
     def render_tail(self, query: Query[Any]) -> str:
         """Query text that follows the frozen prefix. Schema lives here in prompted mode."""
@@ -286,7 +302,7 @@ class Session:
                 with capture_run_messages() as captured:
                     try:
                         result = await self._agent.run(
-                            self.render_tail(query),
+                            self._user_prompt_for(query),
                             message_history=messages,
                             usage_limits=_REQUEST_LIMIT,
                             **kwargs,
@@ -417,7 +433,7 @@ class Session:
         with capture_run_messages() as captured:
             try:
                 async with agent.iter(
-                    self.render_tail(query),
+                    self._user_prompt_for(query),
                     message_history=messages,
                     usage=usage,
                     usage_limits=UsageLimits(request_limit=retries + 1),
@@ -509,12 +525,13 @@ class Session:
                 tool_specs=self.tool_specs,
                 tail=self.render_tail(query),
                 history=query.history,
+                separator=QUERY_SEPARATOR if self.message_layout == "single" and query.history is None else "\n",
             )
         )
 
     def starts_with_prefix(self, messages: Sequence[ModelMessage]) -> bool:
         """Whether a transcript still begins with this session's documents."""
-        return history_matches_prefix(messages, self.rendered_documents)
+        return history_matches_prefix(messages, self.rendered_documents, message_layout=self.message_layout)
 
     async def reduce(
         self,
@@ -603,6 +620,8 @@ def build(
     instrument: bool | InstrumentationSettings = False,
     meta_keys: Sequence[str] | None = None,
     meta_renderer: MetaRenderer | None = None,
+    document_format: DocumentFormat = "blocks",
+    message_layout: MessageLayout = "split",
 ) -> Session:
     """Freeze a shared prefix and the output tool set.
 
@@ -629,6 +648,13 @@ def build(
     the frozen prefix. ``meta_keys`` or ``meta_renderer`` do: rendered block
     meta becomes part of the prefix and its hash. The default renders no meta.
 
+    ``document_format="raw"`` preserves block text exactly, joins it with two
+    newlines, and omits wrappers, titles, metadata and the end marker. Raw text
+    is not block-addressable and cannot use citation checks or repairs.
+    ``message_layout="single"`` puts the documents, :data:`QUERY_SEPARATOR` and
+    the initial query tail into one user part. Continuations append only a tail.
+    The defaults retain the original block rendering and split user parts.
+
     ``activity_options`` sets Temporal-only activity timeouts and retry options.
     Durations are seconds. It does not change local execution or the prefix;
     leaving it unset preserves the five-minute activity timeout and retries
@@ -643,6 +669,8 @@ def build(
     default even when a global agent default is enabled. It applies to ordinary,
     feedback and dynamic agents without changing hashes or execution fingerprints.
     """
+    if message_layout not in ("split", "single"):
+        raise ForkReduceError("message_layout must be 'split' or 'single'")
     if dynamic_outputs not in (None, "generic_tool", "prompted"):
         raise ForkReduceError("dynamic_outputs must be 'generic_tool', 'prompted', or None")
     if output_mode == "tools" and (dynamic_outputs == "prompted" or (not outputs and dynamic_outputs is None)):
@@ -659,7 +687,9 @@ def build(
     )
     if output_mode == "tools" and not forced_tools_available(model, settings):
         diagnose_unforced_tools(on_unforced_tools)
-    index = coerce_documents(documents, meta_keys=meta_keys, meta_renderer=meta_renderer)
+    index = coerce_documents(
+        documents, document_format=document_format, meta_keys=meta_keys, meta_renderer=meta_renderer
+    )
     chosen = policy if policy is not None else Policy()
     output_types: dict[str, type[BaseModel]] = {}
     tool_specs: list[dict[str, Any]] = []
@@ -693,6 +723,8 @@ def build(
         instructions=instructions,
         rendered_documents=index.rendered,
         tools=tool_specs,
+        document_format=document_format,
+        message_layout=message_layout,
     )
     session = Session(
         model=model,
@@ -712,6 +744,7 @@ def build(
         output_validator=output_validator,
         dynamic_outputs=dynamic_outputs,
         instrument=instrument,
+        message_layout=message_layout,
     )
     notice = prefix_context_warning(
         chosen,

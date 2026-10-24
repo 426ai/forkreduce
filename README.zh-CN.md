@@ -303,6 +303,21 @@ session = build(
 )
 ```
 
+### 文档字节与消息布局
+
+`build(document_format="blocks", message_layout="split")` 保持旧默认渲染与请求布局，显式传默认值也相同。`DocumentFormat`、`MessageLayout`、`QUERY_SEPARATOR` 从 `forkreduce` 导出。
+
+| 选项 | 行为 | 前缀身份 |
+| --- | --- | --- |
+| `document_format="blocks"` | 原有清洗、可寻址 document/block 渲染及结束标记。 | 默认编码不变。 |
+| `document_format="raw"` | 原始文本/控制字符，不加包裹或结束标记；多块按两个换行拼接，忽略标题/meta。 | 非默认格式参与 hash。 |
+| `message_layout="split"` | 原有独立 prefix/tail user part。 | 默认编码不变。 |
+| `message_layout="single"` | 首次只有一条 user part：prefix + `QUERY_SEPARATOR` + tail。 | 非默认布局参与 hash。 |
+
+`QUERY_SEPARATOR` 为 `"\n\n===QUERY===\n\n"`。不同题的 prefix/separator 字节完全相同，只变尾巴。续问只追加新尾巴，原生反馈保留最初的组合头部，不重复文档。默认值不写入 hash payload，保持 v0.1.1 的字节/hash fixture；非默认值也进入 execution fingerprint。已有 auto 能力变化的升级注意事项仍适用。
+
+raw 模式有意不清洗控制字符或添加应用分隔符，由应用保证输入字节确定及供应商可接受。raw 下拒绝 metadata 渲染选项，也没有框架 block 地址：`DocumentIndex.block_text`、`CitationCheck` 和使用内置引用检查/修复的 Plan 会明确拒绝。应使用应用自有定位/校验。快照保存两项配置，factory 必须恢复后再做 hash 校验。
+
 ### Query 与 QueryResult
 
 ```python
@@ -761,6 +776,8 @@ import asyncio
 import hashlib
 import sqlite3
 from pathlib import Path
+from pydantic_ai.models.instrumented import InstrumentationSettings
+from forkreduce import Policy
 from forkreduce.contrib.temporal import (
     StoreContext, delete_ref, freeze_prefix, set_default_session_factory,
     set_prefix_store, set_message_store,
@@ -811,6 +828,10 @@ def restore(frozen):
         model, documents=frozen.documents, instructions=frozen.instructions,
         outputs=[Answer], output_mode=frozen.output_mode,
         on_unforced_tools=frozen.on_unforced_tools,
+        dynamic_outputs=frozen.dynamic_outputs,
+        document_format=frozen.document_format, message_layout=frozen.message_layout,
+        policy=Policy(output_feedback_retries=frozen.output_feedback_retries),
+        instrument=InstrumentationSettings(include_content=False),
     )
 
 set_prefix_store(store)
@@ -865,11 +886,58 @@ for result in results:
 factory 默认每个 activity attempt 调用一次，避免无意中跨工作流共享可变 session 预算。需要 worker 内复用时，factory 可返回应用显式管理的缓存 session，或调用 `register_session`；缓存同步、生命周期与预算范围由应用负责。
 
 
+#### 完整离线接入示例
+
+完整可运行程序 [examples/run_temporal_offline.py](examples/run_temporal_offline.py) 同时接入 default factory、`app_meta`、namespace 路由的不可变 SQLite store、return 模式、逐题 `after_query_activity` 修复、两种 `OutputSpec`、first warmup、独立父/模型队列、带前缀的 sandbox 定义、raw/single 布局和真实内存 `instrument` span。程序设置 `ALLOW_MODEL_REQUESTS=False`，要求已有测试 server 二进制，不下载、不导出遥测。运行前安装本 checkout 的 dev/Temporal extras，以获得内存 tracing 依赖。
+
+```bash
+export TEMPORAL_TEST_SERVER="/path/to/cached/temporal-test-server"
+PYTHONPATH=src:. python examples/run_temporal_offline.py
+PYTHONPATH=src:. python examples/run_temporal_offline.py --plugin
+```
+
+程序创建全部 model/store/client 对象，worker factory 与编排采用以下实际配置；完整文件还实现了 review activity、假模型响应、注册及清理：
+
+```python
+def restore(frozen):
+    return build(
+        FunctionModel(reply), documents=frozen.documents, instructions=frozen.instructions, outputs=[],
+        output_mode=frozen.output_mode, dynamic_outputs=frozen.dynamic_outputs,
+        document_format=frozen.document_format, message_layout=frozen.message_layout,
+        on_unforced_tools=frozen.on_unforced_tools,
+        policy=Policy(retries=0, output_feedback_retries=frozen.output_feedback_retries),
+        instrument=instrumentation, warmup=False,
+    )
+
+prefix_ref = await freeze_prefix(
+    session, store, app_meta={"ref_namespace": "offline-demo", "schema_version": 1},
+)
+set_default_session_factory(restore)
+set_prefix_store(store)
+set_message_store(store)
+label = OutputSpec("Label", {
+    "type": "object", "properties": {"value": {"type": "string"}},
+    "required": ["value"], "additionalProperties": False,
+})
+config = MapQueriesInput(
+    queries=[query_activity_input(
+        session, query_id="label", tail="Return the requested value.", output_spec=label,
+        prefix_ref=prefix_ref, ref_namespace="offline-demo",
+    )],
+    batch_size=2, child_concurrency=2, activity_concurrency=2, task_queue=model_queue,
+    warmup="first", on_query_failure="return", after_query_activity="demo.review", max_rounds=1,
+    after_query_options=ActivityOptions(start_to_close=10, maximum_attempts=1),
+    activity_options=ActivityOptions(start_to_close=60, heartbeat_timeout=10, maximum_attempts=2),
+)
+```
+
+合成初答先经过一次原生校验反馈，再由钩子要求一次修复。程序读取最终字典引用，检查首题顺序，使用所选 converter 重放父/子历史，并仅在应用确认保留期结束后演示幂等删除。`result_meta` 记录钩子决定；`feedback_retries_used` 仍是最后一次 query activity 的计数，不猜测跨轮次或跨 Temporal attempt 的总数。实际供应商/模型行为须由应用自行做真实回归。
+
 ## 缓存注意事项
 
 **工具 schema 固定。** 工具定义属于前缀，不能逐题追加。已注册静态输出的 schema/name/description 改动会改变 `prefix_hash`；动态 `OutputSpec` schema 留在题目尾巴，tools 模式只增加一个显式启用的固定通用工具。静态枚举若有开放取值需求，应留 `"other"` 之类的出口。
 
-**控制字符。** 有的供应商会拒绝工具参数 JSON 里的原始控制字符。forkreduce 在渲染和哈希之前去掉除制表符、换行、回车以外的 C0 控制字符，以及 DEL。带空字节的文档和去掉空字节之后的文档，哈希相同。
+**控制字符。** 默认 blocks 模式在渲染/hash 前去掉除 tab/newline/carriage return 外的 C0 控制字符及 DEL，因此空字节不改变默认 hash。raw 模式保留这些字节、改变身份，供应商能否接受由应用负责。
 
 **预热。** 第一次请求才会建立缓存项。`warmup=True` 让第一批的第一个请求先结束，再发其余请求。一整批同时发出去，可能每一次都错过缓存。
 

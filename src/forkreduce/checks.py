@@ -64,12 +64,15 @@ class CitationCheck:
     Matching ignores differences in whitespace. The quote and block field names
     default to ``quote`` and ``block_id``. Every nested model that has both
     fields is checked.
+    Raw documents are not block-addressable and are explicitly rejected.
     """
 
     quote_field: str = "quote"
     block_field: str = "block_id"
 
     def __call__(self, output: Any, *, documents: DocumentIndex) -> list[CheckFailure]:
+        if documents.document_format == "raw":
+            raise ForkReduceError("CitationCheck requires document_format='blocks'; raw documents are not addressable")
         failures: list[CheckFailure] = []
         for path, node in _iter_citations(output, self.quote_field, self.block_field):
             quote = getattr(node, self.quote_field)

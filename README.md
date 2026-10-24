@@ -303,6 +303,21 @@ session = build(
 )
 ```
 
+### Document bytes and message layout
+
+`build(document_format="blocks", message_layout="split")` keeps the old default rendering and request layout, including explicit default arguments. `DocumentFormat`, `MessageLayout`, and `QUERY_SEPARATOR` are exported from `forkreduce`.
+
+| Option | Behavior | Prefix identity |
+| --- | --- | --- |
+| `document_format="blocks"` | Existing cleaned, addressable document/block rendering and end marker. | Default encoding unchanged. |
+| `document_format="raw"` | Exact text/control characters, no wrappers or end marker; multiple block texts joined by two newlines, titles/meta omitted. | Opt-in format is hashed. |
+| `message_layout="split"` | Existing separate prefix/tail user parts. | Default encoding unchanged. |
+| `message_layout="single"` | One initial user part: prefix + `QUERY_SEPARATOR` + tail. | Opt-in layout is hashed. |
+
+`QUERY_SEPARATOR` is `"\n\n===QUERY===\n\n"`. Different questions share the identical prefix/separator bytes; only their tail changes. Continuations append only the new tail to the existing history, and native feedback preserves the original combined head rather than repeating the document. The default flags are omitted from the hash payload, preserving the v0.1.1 bytes/hash fixtures; nondefaults also enter the execution fingerprint. Existing auto-mode capability caveats still apply.
+
+Raw mode deliberately does not sanitize controls or add application delimiters: ensure deterministic input bytes and provider acceptance yourself. Metadata rendering options are rejected in raw mode. There are no framework block addresses: `DocumentIndex.block_text`, `CitationCheck`, and plans using built-in citation checking/repair reject raw mode. Use application-owned addressing/validation instead. Snapshots retain both flags; factories must restore them before hash verification.
+
 ### Query and QueryResult
 
 ```python
@@ -761,6 +776,8 @@ import asyncio
 import hashlib
 import sqlite3
 from pathlib import Path
+from pydantic_ai.models.instrumented import InstrumentationSettings
+from forkreduce import Policy
 from forkreduce.contrib.temporal import (
     StoreContext, delete_ref, freeze_prefix, set_default_session_factory,
     set_prefix_store, set_message_store,
@@ -811,6 +828,10 @@ def restore(frozen):
         model, documents=frozen.documents, instructions=frozen.instructions,
         outputs=[Answer], output_mode=frozen.output_mode,
         on_unforced_tools=frozen.on_unforced_tools,
+        dynamic_outputs=frozen.dynamic_outputs,
+        document_format=frozen.document_format, message_layout=frozen.message_layout,
+        policy=Policy(output_feedback_retries=frozen.output_feedback_retries),
+        instrument=InstrumentationSettings(include_content=False),
     )
 
 set_prefix_store(store)
@@ -865,11 +886,58 @@ Optional `delete(ref, *, context)` is called only by explicit `delete_ref(store,
 Factories run per activity attempt by default; this avoids silently sharing mutable session budgets across workflows. For worker-local reuse, the factory may return an explicitly managed cached session or call `register_session`. Applications own that cache's synchronization, lifetime, and budget scope.
 
 
+#### Complete offline integration
+
+The complete runnable [offline Temporal example](examples/run_temporal_offline.py) combines default-factory reconstruction, `app_meta`, a namespace-routed immutable SQLite store, return-mode failures, immediate `after_query_activity` repairs, two different `OutputSpec` schemas, first-query warmup, separate parent/model queues, prefixed sandboxed definitions, raw/single layout, and real in-memory `instrument` spans. It sets `ALLOW_MODEL_REQUESTS=False`, requires an existing test-server binary, never downloads one, and exports no telemetry. Install this checkout's dev/Temporal extras for its in-memory tracing dependencies.
+
+```bash
+export TEMPORAL_TEST_SERVER="/path/to/cached/temporal-test-server"
+PYTHONPATH=src:. python examples/run_temporal_offline.py
+PYTHONPATH=src:. python examples/run_temporal_offline.py --plugin
+```
+
+The program creates all model/store/client objects. Its worker factory and orchestration use this concrete configuration (the full file also implements the review activity, model responses, registration and cleanup):
+
+```python
+def restore(frozen):
+    return build(
+        FunctionModel(reply), documents=frozen.documents, instructions=frozen.instructions, outputs=[],
+        output_mode=frozen.output_mode, dynamic_outputs=frozen.dynamic_outputs,
+        document_format=frozen.document_format, message_layout=frozen.message_layout,
+        on_unforced_tools=frozen.on_unforced_tools,
+        policy=Policy(retries=0, output_feedback_retries=frozen.output_feedback_retries),
+        instrument=instrumentation, warmup=False,
+    )
+
+prefix_ref = await freeze_prefix(
+    session, store, app_meta={"ref_namespace": "offline-demo", "schema_version": 1},
+)
+set_default_session_factory(restore)
+set_prefix_store(store)
+set_message_store(store)
+label = OutputSpec("Label", {
+    "type": "object", "properties": {"value": {"type": "string"}},
+    "required": ["value"], "additionalProperties": False,
+})
+config = MapQueriesInput(
+    queries=[query_activity_input(
+        session, query_id="label", tail="Return the requested value.", output_spec=label,
+        prefix_ref=prefix_ref, ref_namespace="offline-demo",
+    )],
+    batch_size=2, child_concurrency=2, activity_concurrency=2, task_queue=model_queue,
+    warmup="first", on_query_failure="return", after_query_activity="demo.review", max_rounds=1,
+    after_query_options=ActivityOptions(start_to_close=10, maximum_attempts=1),
+    activity_options=ActivityOptions(start_to_close=60, heartbeat_timeout=10, maximum_attempts=2),
+)
+```
+
+The synthetic first answer needs one native validation-feedback request and one hook-directed repair. The program reads final dictionary references, checks first-query ordering, replays parent and child histories with the selected converter, and explicitly demonstrates idempotent deletion only after its retention boundary. `result_meta` records hook decisions; `feedback_retries_used` remains the final query activity's count, not a guessed cross-round or cross-Temporal-attempt total. Real model/provider behavior must be regression-tested by the adopting application.
+
 ## Caching caveats
 
 **Fixed tool schema.** Tool definitions are part of the prefix and cannot be added per question. Changing a registered static output schema/name/description changes `prefix_hash`; dynamic `OutputSpec` schemas instead stay in question tails, with one explicitly enabled generic tool if tools mode is used. Keep an `"other"` escape in static enums when the application's domain needs one.
 
-**Control characters.** Some providers reject tool-call JSON that contains raw control characters. forkreduce strips C0 controls other than tab, newline, and carriage return, and strips DEL, before rendering and hashing. The hash of a document with a null byte matches the hash of that document without it.
+**Control characters.** Default blocks mode strips C0 controls other than tab/newline/carriage return and strips DEL before rendering/hashing, so a null byte does not change its hash. Raw mode preserves those bytes, changes identity, and leaves provider acceptance to the application.
 
 **Warmup.** The first request creates the cache entry. `warmup=True` finishes that request before the rest of the first batch starts. Firing the whole batch at once can miss the cache on every call.
 

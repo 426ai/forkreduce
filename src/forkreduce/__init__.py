@@ -10,7 +10,7 @@ from __future__ import annotations
 from forkreduce.checks import CheckReport, CitationCheck, CitationRepair
 from forkreduce.context import ContextEstimateWarning, ContextWarning
 from forkreduce.coverage import AcceptUncovered, Provenance, ReduceReport
-from forkreduce.documents import END_MARKER, Block, Document
+from forkreduce.documents import END_MARKER, Block, Document, DocumentFormat
 from forkreduce.errors import (
     ForkReduceError,
     OutputModeConflictError,
@@ -27,6 +27,7 @@ from forkreduce.output_modes import OutputMode, ResolvedOutputMode
 from forkreduce.output_specs import DynamicOutputs, OutputSpec
 from forkreduce.plan import Plan, RoundRecord, RunResult
 from forkreduce.policy import Accept, Budget, BudgetReport, Drop, Fail, Policy, RequireReason, Retry
+from forkreduce.prefix import QUERY_SEPARATOR, MessageLayout
 from forkreduce.query import CheckFailure, Query, QueryResult
 from forkreduce.reduce import ReduceItem, ReduceOutcome
 from forkreduce.schemas import CITATION_INSTRUCTIONS, Citation, DiscardExplanation, DiscardExplanations, Traced
@@ -38,6 +39,7 @@ __version__ = "0.2.0"
 
 __all__ = [
     "END_MARKER",
+    "QUERY_SEPARATOR",
     "CITATION_INSTRUCTIONS",
     "Accept",
     "AcceptLeads",
@@ -56,6 +58,7 @@ __all__ = [
     "DiscardExplanation",
     "DiscardExplanations",
     "Document",
+    "DocumentFormat",
     "Drop",
     "DynamicOutputs",
     "Executor",
@@ -66,6 +69,7 @@ __all__ = [
     "GapFill",
     "LeadReport",
     "LocalExecutor",
+    "MessageLayout",
     "OutputMode",
     "OutputModeConflictError",
     "OutputSpec",

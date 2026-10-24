@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -12,6 +13,7 @@ from forkreduce.errors import ForkReduceError
 from forkreduce.textutil import strip_control_chars
 
 END_MARKER = "===END_FIXED_DOCUMENTS==="
+DocumentFormat = Literal["blocks", "raw"]
 
 
 class Block(BaseModel):
@@ -35,13 +37,16 @@ class Document(BaseModel):
 
 @dataclass
 class DocumentIndex:
-    """Cleaned documents plus the exact text that is frozen into the prefix."""
+    """Copied documents plus their exact frozen text and rendering format."""
 
     documents: list[Document]
     blocks: dict[str, Block] = field(default_factory=dict)
     rendered: str = ""
+    document_format: DocumentFormat = "blocks"
 
     def block_text(self, block_id: str) -> str | None:
+        if self.document_format == "raw":
+            raise ForkReduceError("raw documents are not addressable by block_id")
         block = self.blocks.get(block_id)
         if block is None:
             return None
@@ -56,6 +61,7 @@ def coerce_documents(
     documents: DocumentsInput,
     *,
     meta_keys: Sequence[str] | None = None,
+    document_format: DocumentFormat = "blocks",
     meta_renderer: MetaRenderer | None = None,
 ) -> DocumentIndex:
     """Normalize caller input into cleaned blocks and a stable rendering.
@@ -67,15 +73,22 @@ def coerce_documents(
 
     ``Block.meta`` is stored either way and is omitted from the rendering unless
     ``meta_keys`` or ``meta_renderer`` is set. Pass one of them, not both.
+
+    ``document_format='raw'`` copies the same input shapes without cleaning.
+    Block texts are joined by two newlines with no document/block wrappers,
+    titles, metadata or end marker. At least one text must be nonempty; whitespace
+    and control characters are preserved. Block ids are unused in this format.
     """
-    _check_meta_options(meta_keys, meta_renderer)
-    docs = _coerce_many(documents)
+    _check_render_options(document_format, meta_keys, meta_renderer)
+    docs = _coerce_many(documents, clean=document_format == "blocks")
     if not docs:
         raise ForkReduceError("documents must contain at least one block of text")
     blocks: dict[str, Block] = {}
     for doc in docs:
         if not doc.blocks:
             raise ForkReduceError(f"document {doc.doc_id!r} has no blocks")
+        if document_format == "raw":
+            continue
         for block in doc.blocks:
             if not block.block_id:
                 raise ForkReduceError("block_id must be a non-empty string")
@@ -84,17 +97,20 @@ def coerce_documents(
             if not block.text.strip():
                 raise ForkReduceError(f"block {block.block_id!r} is empty after cleaning")
             blocks[block.block_id] = block
-    rendered = render_documents(docs, meta_keys=meta_keys, meta_renderer=meta_renderer)
-    return DocumentIndex(documents=docs, blocks=blocks, rendered=rendered)
+    rendered = render_documents(docs, document_format=document_format, meta_keys=meta_keys, meta_renderer=meta_renderer)
+    if document_format == "raw" and not any(block.text for doc in docs for block in doc.blocks):
+        raise ForkReduceError("raw documents must contain non-empty text")
+    return DocumentIndex(documents=docs, blocks=blocks, rendered=rendered, document_format=document_format)
 
 
 def render_documents(
     documents: Sequence[Document],
     *,
     meta_keys: Sequence[str] | None = None,
+    document_format: DocumentFormat = "blocks",
     meta_renderer: MetaRenderer | None = None,
 ) -> str:
-    """Render documents into the frozen prefix body, ending with :data:`END_MARKER`.
+    """Render frozen documents, using wrappers and :data:`END_MARKER` by default.
 
     By default each block is ``[block id]``, the text, and a blank line. Meta is
     not included, so a block that only differs by ``meta`` renders the same text
@@ -104,8 +120,12 @@ def render_documents(
     present on the block. ``meta_renderer`` inserts its own line instead. A
     blank renderer result, or a block with none of the requested keys, adds no
     line. Rendered meta is part of the prefix.
+    Raw format joins the unmodified texts with two newlines and rejects meta
+    rendering options.
     """
-    _check_meta_options(meta_keys, meta_renderer)
+    _check_render_options(document_format, meta_keys, meta_renderer)
+    if document_format == "raw":
+        return "\n\n".join(block.text for doc in documents for block in doc.blocks)
     lines: list[str] = []
     for doc in documents:
         title = f" title={doc.title}" if doc.title else ""
@@ -119,6 +139,16 @@ def render_documents(
             lines.append("")
     lines.append(END_MARKER)
     return "\n".join(lines)
+
+
+def _check_render_options(
+    document_format: DocumentFormat, meta_keys: Sequence[str] | None, meta_renderer: MetaRenderer | None
+) -> None:
+    if document_format not in ("blocks", "raw"):
+        raise ForkReduceError("document_format must be 'blocks' or 'raw'")
+    if document_format == "raw" and (meta_keys is not None or meta_renderer is not None):
+        raise ForkReduceError("raw document_format does not support meta_keys or meta_renderer")
+    _check_meta_options(meta_keys, meta_renderer)
 
 
 def _check_meta_options(meta_keys: Sequence[str] | None, meta_renderer: MetaRenderer | None) -> None:
@@ -152,21 +182,21 @@ def _meta_line(
     return f"[meta {payload}]"
 
 
-def _coerce_many(documents: DocumentsInput) -> list[Document]:
+def _coerce_many(documents: DocumentsInput, *, clean: bool) -> list[Document]:
     if isinstance(documents, str):
-        return [_string_document("doc", [documents])]
+        return [_string_document("doc", [documents], clean=clean)]
     if isinstance(documents, Document):
-        return [_clean_document(documents)]
+        return [_clean_document(documents, clean=clean)]
     if isinstance(documents, Block):
-        return [_blocks_document("doc", [documents])]
+        return [_blocks_document("doc", [documents], clean=clean)]
     if isinstance(documents, Sequence):
         # A homogeneous sequence keeps the historical single-document shape.
         # A mixed sequence keeps the caller's order: consecutive loose blocks
         # or strings become one generated document at that position.
         if documents and all(isinstance(item, str) for item in documents):
-            return [_string_document("doc", [item for item in documents if isinstance(item, str)])]
+            return [_string_document("doc", [item for item in documents if isinstance(item, str)], clean=clean)]
         if documents and all(isinstance(item, Block) for item in documents):
-            return [_blocks_document("doc", [item for item in documents if isinstance(item, Block)])]
+            return [_blocks_document("doc", [item for item in documents if isinstance(item, Block)], clean=clean)]
         docs: list[Document] = []
         pending_blocks: list[Block] = []
         pending_strings: list[str] = []
@@ -174,10 +204,10 @@ def _coerce_many(documents: DocumentsInput) -> list[Document]:
         def flush() -> None:
             nonlocal pending_blocks, pending_strings
             if pending_blocks:
-                docs.append(_blocks_document(_generated_doc_id(docs), pending_blocks))
+                docs.append(_blocks_document(_generated_doc_id(docs), pending_blocks, clean=clean))
                 pending_blocks = []
             if pending_strings:
-                docs.append(_string_document(_generated_doc_id(docs), pending_strings))
+                docs.append(_string_document(_generated_doc_id(docs), pending_strings, clean=clean))
                 pending_strings = []
 
         for item in documents:
@@ -191,7 +221,7 @@ def _coerce_many(documents: DocumentsInput) -> list[Document]:
                 pending_blocks.append(item)
             elif isinstance(item, Document):
                 flush()
-                docs.append(_clean_document(item))
+                docs.append(_clean_document(item, clean=clean))
             else:
                 raise ForkReduceError("documents must be a string, Block, Document, or a sequence of those")
         flush()
@@ -209,26 +239,28 @@ def _generated_doc_id(existing: list[Document]) -> str:
     return f"doc-{number}"
 
 
-def _string_document(doc_id: str, parts: list[str]) -> Document:
+def _string_document(doc_id: str, parts: list[str], *, clean: bool) -> Document:
     blocks: list[Block] = []
     for index, part in enumerate(parts, start=1):
-        blocks.append(Block(block_id=f"b{index}", text=strip_control_chars(part)))
+        blocks.append(Block(block_id=f"b{index}", text=strip_control_chars(part) if clean else part))
     return Document(doc_id=doc_id, blocks=blocks)
 
 
-def _blocks_document(doc_id: str, blocks: Sequence[Block]) -> Document:
+def _blocks_document(doc_id: str, blocks: Sequence[Block], *, clean: bool) -> Document:
     cleaned = [
-        Block(block_id=block.block_id, text=strip_control_chars(block.text), meta=dict(block.meta)) for block in blocks
+        Block(
+            block_id=block.block_id,
+            text=strip_control_chars(block.text) if clean else block.text,
+            meta=dict(block.meta),
+        )
+        for block in blocks
     ]
     return Document(doc_id=doc_id, blocks=cleaned)
 
 
-def _clean_document(document: Document) -> Document:
+def _clean_document(document: Document, *, clean: bool) -> Document:
     return Document(
         doc_id=document.doc_id,
-        title=strip_control_chars(document.title),
-        blocks=[
-            Block(block_id=block.block_id, text=strip_control_chars(block.text), meta=dict(block.meta))
-            for block in document.blocks
-        ],
+        title=strip_control_chars(document.title) if clean else document.title,
+        blocks=_blocks_document(document.doc_id, document.blocks, clean=clean).blocks,
     )

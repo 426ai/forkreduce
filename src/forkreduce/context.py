@@ -94,6 +94,7 @@ def request_text(
     tool_specs: Sequence[dict[str, Any]],
     tail: str,
     history: Sequence[ModelMessage] | None,
+    separator: str = "\n",
 ) -> str:
     """Characters for one model call.
 
@@ -103,7 +104,7 @@ def request_text(
     """
     tools = json.dumps(list(tool_specs), sort_keys=True, default=str)
     body = history_text(history) if history else rendered_documents
-    return f"{instructions}\n{tools}\n{body}\n{tail}"
+    return f"{instructions}\n{tools}\n{body}{separator}{tail}"
 
 
 def prefix_context_warning(policy: Policy, estimated_tokens: int) -> ContextWarning | None:

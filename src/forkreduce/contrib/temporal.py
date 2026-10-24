@@ -71,13 +71,14 @@ with workflow.unsafe.imports_passed_through():
     from forkreduce.contrib._temporal_store import (
         delete_ref as delete_ref,
     )
-    from forkreduce.documents import Document
+    from forkreduce.documents import Document, DocumentFormat
     from forkreduce.errors import ForkReduceError
     from forkreduce.failures import Failure
     from forkreduce.models import canonical_value, request_body_settings
     from forkreduce.output_modes import OutputMode, ResolvedOutputMode, UnforcedToolsPolicy
     from forkreduce.output_specs import DynamicOutputs, OutputSpec
     from forkreduce.policy import Policy
+    from forkreduce.prefix import MessageLayout
     from forkreduce.prefix import prefix_hash as compute_prefix_hash
     from forkreduce.query import Query
     from forkreduce.session import Session
@@ -152,6 +153,8 @@ class FrozenPrefix:
     app_meta: dict[str, Any] = field(default_factory=dict)
     output_feedback_retries: int = 0
     dynamic_outputs: DynamicOutputs | None = None
+    document_format: DocumentFormat = "blocks"
+    message_layout: MessageLayout = "split"
 
     @property
     def documents(self) -> list[Document]:
@@ -161,6 +164,8 @@ class FrozenPrefix:
     def validate(self) -> None:
         """Reject corrupt snapshots before invoking a worker factory."""
         _app_meta_json(self.app_meta)
+        if self.document_format not in {"blocks", "raw"} or self.message_layout not in {"split", "single"}:
+            raise ValueError("Invalid document format or message layout in frozen prefix")
         if self.dynamic_outputs not in {None, "generic_tool", "prompted"}:
             raise ValueError("Invalid dynamic_outputs in frozen prefix")
         if (
@@ -183,6 +188,8 @@ class FrozenPrefix:
             instructions=self.instructions,
             rendered_documents=self.rendered_documents,
             tools=json.loads(self.tools_json),
+            document_format=self.document_format,
+            message_layout=self.message_layout,
         )
         if actual != self.prefix_hash:
             raise ValueError("Frozen prefix hash does not match its contents")
@@ -220,6 +227,8 @@ async def freeze_prefix(
         app_meta=cast(dict[str, Any], json.loads(_app_meta_json({} if app_meta is None else app_meta))),
         output_feedback_retries=session.policy.output_feedback_retries,
         dynamic_outputs=session.dynamic_outputs,
+        document_format=session.document_format,
+        message_layout=session.message_layout,
     )
     snapshot.validate()
     encoded = json.dumps(asdict(snapshot), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -316,6 +325,10 @@ def execution_fingerprint(session: Session) -> str:
         payload["output_validator"] = canonical_value(session.output_validator)
     if session.dynamic_outputs is not None:
         payload["dynamic_outputs"] = session.dynamic_outputs
+    if session.document_format != "blocks":
+        payload["document_format"] = session.document_format
+    if session.message_layout != "split":
+        payload["message_layout"] = session.message_layout
     return json.dumps(payload, sort_keys=True, default=str)
 
 
@@ -643,6 +656,8 @@ async def _resolve_session(payload: QueryActivityInput, *, snapshot: FrozenPrefi
             instructions=session.instructions,
             rendered_documents=session.rendered_documents,
             tools=session.tool_specs,
+            document_format=session.document_format,
+            message_layout=session.message_layout,
         )
         if session.prefix_hash != payload.prefix_hash or actual != payload.prefix_hash:
             raise ValueError("Reconstructed session does not match the frozen prefix hash")
