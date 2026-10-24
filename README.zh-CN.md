@@ -639,6 +639,7 @@ class DurableStore:
 
     async def delete(self, ref: str, *, context: StoreContext) -> None:
         await asyncio.to_thread(self.execute, "DELETE FROM blobs WHERE ref = ?", (ref,))
+        # SQL DELETE 对不存在的 ref 不做操作，重复清理也是安全的。
 
 store = DurableStore(str(Path("shared-blobs.sqlite")))
 app_meta = {"ref_namespace": "demo-run", "schema_version": 1}
@@ -647,7 +648,7 @@ prefix_ref = await freeze_prefix(session, store, app_meta=app_meta)
 payloads = [
     query_activity_input(
         session, query_id=f"q{i}", tail=question, output_name="Answer", prefix_ref=prefix_ref,
-        meta={"ref_namespace": "demo-run"},
+        ref_namespace="demo-run",
     )
     for i, question in enumerate(questions)
 ]
@@ -682,15 +683,31 @@ for result in results:
 #                                                namespace="demo-run"))
 ```
 
-`on_query_failure="raise"` 仍是默认，旧 list 调用不变。`"return"` 保持输入顺序，成功/失败都用 `QueryActivityOutput`：失败带 `failure_kind`、有界且不含载荷原文的 `failure_message` 和 `attempts`，不带 transcript/output 正文或引用。可重试错误耗尽映射为 `retryable_exhausted`，不可重试错误为 `permanent` 或 `budget`，Temporal 超时/取消为 `timeout`/`cancelled`；workflow 自身取消始终向上传播。attempts 记录已观察到的 activity 尝试数；`0` 表示 SDK 错误没有提供次数信息（例如执行前超时），不是猜测配置上限。
+`on_query_failure="raise"` 仍是默认，旧 list 调用不变，错误照常向上传播。`"return"` 保持输入顺序，成功/失败都用 `QueryActivityOutput`：失败带 `failure_kind`、`failure_type`、有界且不含载荷原文的 `failure_message` 和 `attempts`，不带 transcript/output 正文或引用。完整的 `failure_kind` 契约如下：
+公开的 `Literal` 类型别名 `QueryFailureKind` 从 `forkreduce.contrib.temporal` 导出，取值为下表六种非 `None` 值；`None` 表示成功。
+
+| `failure_kind` | 含义 |
+| --- | --- |
+| `retryable_exhausted` | Temporal 达到最大尝试次数后的可重试错误。 |
+| `permanent` | 除预算耗尽外的不可重试 application 错误。 |
+| `budget` | 应用预算耗尽。 |
+| `timeout` | Temporal activity 超时。 |
+| `cancelled` | activity 被取消，不是父 workflow 自身取消。 |
+| `unknown` | 无法分类的错误，包括未识别的 application/activity 错误或失败的 child batch。 |
+
+`failure_type` 仅在原始 `ApplicationError.type` 为 `validation`、`transport`、`permanent`、`budget`、`session_factory_missing`、`ref_namespace_mismatch` 之一时保留原值；其他类型均为 `None`，不输出任意异常文本或杜撰代码。例如 validation 重试耗尽是 `retryable_exhausted` / `validation`，缺少 factory 则是 `retryable_exhausted` / `session_factory_missing`。return 模式的 `ChildWorkflowError` 为该 batch 每个 query 生成 `unknown` / `batch_failed`，`attempts=0`；`batch_failed` 是额外允许的合成类型，不是原始 application 错误类型。父 workflow 自身取消始终向上传播，return 模式也不例外。attempts 记录已观察到的 activity 尝试数；`0` 表示没有次数信息（例如执行前超时），不是猜测配置上限。
 
 失败记录的 `attempts` 统计 Temporal activity 尝试次数；成功记录仍保留原有 `Session.run_once` 的单次执行计数，本选项不重新定义成功结果字段。
 
 查找顺序为显式登记的 session、prefix 精确 factory、`set_default_session_factory`；传 `None` 清除默认 factory。都缺失时抛可重试 `session_factory_missing`，仍受已配置重试预算约束，worker 补齐配置后可在后续 attempt 成功。快照损坏、重建/hash 不一致仍不可重试。
+恢复场景建议使用 `ActivityOptions(maximum_attempts=5, retry_backoff=2, max_backoff=30, backoff_coefficient=2.0)`。设置尝试次数和可选 schedule-to-close 时，须给 worker 修复/重启留出足够恢复窗口；窗口关闭后，重试不能再挽救配置。
 
 `freeze_prefix(..., app_meta=...)` 将 JSON 元数据复制进 `FrozenPrefix.app_meta`（旧快照默认 `{}`），限制为 **16 KiB compact UTF-8 JSON**，不参与 prefix hash、identity 或 execution fingerprint。仅放路由/schema 标识，**不要放密钥、正文或文档载荷**；factory 获得完整快照。
 
-`StoreContext` 是 frozen、可序列化 dataclass，字段为 `workflow_id`、`run_id`、`parent_workflow_id`、`activity_id`、`query_id`、`round`、`attempt`、`kind`（`prefix/messages/output/history`）、`prefix_hash`、`namespace`。不可用的执行字段为 `None`。query `meta.ref_namespace` 优先于快照 `app_meta.ref_namespace`；若首次 prefix 读取需要 namespace 路由，须在 query meta 重复携带，因为读取完成前拿不到快照元数据。非空 namespace 经 URL 转义后加到框架 key 前；没有 namespace 时 key 原样保留。context 仅为路由元数据，不是鉴权边界。可选 `delete(ref, *, context)` 仅由应用显式调用 `delete_ref(store, ref, *, context)` 触发，兼容旧 `delete(ref)`；没有 delete 则抛 `NotImplementedError`。框架不会自动删除对象。
+`StoreContext` 是 frozen、可序列化 dataclass，字段为 `workflow_id`、`run_id`、`parent_workflow_id`、`activity_id`、`query_id`、`round`、`attempt`、`kind`（`prefix/messages/output/history`）、`prefix_hash`、`namespace`。不可用的执行字段为 `None`。快照 `app_meta.ref_namespace` 记录 prefix 的存储位置；`query_activity_input` 不读取快照，也不会从不透明引用推断 namespace。首次 prefix 读取需要 namespace 路由时，须在 query 的 `meta.ref_namespace` 携带相同值，因为读取完成前拿不到快照元数据。显式 query namespace 与读出的快照不一致会被不可重试的 `ref_namespace_mismatch` 拒绝，不会静默切换路由。非空 namespace 经 URL 转义后加到框架 key 前；没有 namespace 时 key 原样保留。context 仅为路由元数据，不是鉴权边界。
+可用 `query_activity_input(..., ref_namespace="demo-run")` 自动写入复制后的 query metadata。仅当 query 和快照的 namespace 都非空时要求相同；缺失或空 namespace 不触发 mismatch。
+
+可选 `delete(ref, *, context)` 仅由应用显式调用 `delete_ref(store, ref, *, context)` 触发，兼容旧 `delete(ref)`。实现必须将删除不存在的引用（重复删除或从未创建的引用）作为成功的空操作，保留其他引用。不支持 delete 仍抛 `NotImplementedError`，其他存储错误不会被吞掉。context 应携带原引用的 kind、prefix hash 和 namespace。框架不会自动删除对象；应用负责保留到所有重试/续问结束。
 
 `FrozenPrefix` 存文档、说明、渲染前缀与工具身份，不序列化可执行模型/schema 类。worker 会校验重建后的 prefix hash；须保持 schema/渲染配置一致。worker 启动时登记 factory，引用对象保留到重试/续问生命周期结束。最终结果与引用应持久化，已结束 workflow 的实时流不能当归档重放接口。编排存在不兼容变更时，排空在途执行或使用 worker versioning/新队列，并重放实际迁移所需历史；converter 测试不保证任意旧工作流代码在编排变更后仍能重放。
 `FrozenPrefix.output_mode` 保留请求模式（包括 auto），`resolved_output_mode` 记录实际模式（旧快照可为 `None`），`on_unforced_tools` 保留诊断策略。factory 按上例恢复请求模式和策略，还须恢复相同 thinking 相关模型/session 设置。worker 校验实际模式及 prefix hash；能力或设置改变必须失败，不得悄悄恢复不同输出约定。模型/设置由 factory 管理，不将含传输凭据的设置序列化进快照。

@@ -36,7 +36,7 @@ class StoreContext:
 
 
 class MessageStore(Protocol):
-    """Legacy store contract, still accepted without a context argument."""
+    """Legacy put/get contract; optional delete(ref) must ignore missing references."""
 
     async def put(self, key: str, payload: bytes) -> str: ...
 
@@ -48,7 +48,12 @@ class PrefixStore(MessageStore, Protocol):
 
 
 class ContextMessageStore(Protocol):
-    """Context-aware store; deletion is optional and detected separately."""
+    """Context-aware store; optional delete(ref, *, context) ignores missing refs.
+
+    Deletion is detected separately and is not required by this protocol.
+    Implementations that support it must make repeated or never-created reference
+    deletion a successful no-op, without affecting other stored references.
+    """
 
     async def put(self, key: str, payload: bytes, *, context: StoreContext) -> str: ...
 
@@ -122,6 +127,8 @@ async def delete_ref(store: Store, ref: str, *, context: StoreContext) -> None:
     """Delete only on application request; unsupported stores raise NotImplementedError.
 
     Supply the original reference's kind, prefix hash and namespace in ``context``.
+    Stores implementing deletion must treat missing references as a successful
+    no-op, including repeated deletes. This helper does not suppress store errors.
     No framework path calls this helper automatically.
     """
     method = getattr(store, "delete", None)

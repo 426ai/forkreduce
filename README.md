@@ -639,6 +639,7 @@ class DurableStore:
 
     async def delete(self, ref: str, *, context: StoreContext) -> None:
         await asyncio.to_thread(self.execute, "DELETE FROM blobs WHERE ref = ?", (ref,))
+        # SQL DELETE is a no-op for missing refs, so repeated cleanup is safe.
 
 store = DurableStore(str(Path("shared-blobs.sqlite")))
 app_meta = {"ref_namespace": "demo-run", "schema_version": 1}
@@ -647,7 +648,7 @@ prefix_ref = await freeze_prefix(session, store, app_meta=app_meta)
 payloads = [
     query_activity_input(
         session, query_id=f"q{i}", tail=question, output_name="Answer", prefix_ref=prefix_ref,
-        meta={"ref_namespace": "demo-run"},
+        ref_namespace="demo-run",
     )
     for i, question in enumerate(questions)
 ]
@@ -682,15 +683,31 @@ for result in results:
 #                                                namespace="demo-run"))
 ```
 
-`on_query_failure="raise"` remains the default, including legacy list inputs. `"return"` preserves input order and returns mixed successes/failures in `QueryActivityOutput`; failures have `failure_kind`, a bounded payload-free `failure_message`, and `attempts`, without transcript/output bodies or references. Terminal retryable failures map to `retryable_exhausted`, non-retryable errors to `permanent` or `budget`, and Temporal timeout/cancellation to `timeout`/`cancelled`. Workflow cancellation always propagates. Attempts count observed activity attempts; `0` means the SDK failure supplied no attempt metadata (for example a timeout before execution), not a guessed retry limit.
+`on_query_failure="raise"` remains the default, including legacy list inputs, and propagates failures as before. `"return"` preserves input order and returns mixed successes/failures in `QueryActivityOutput`; failures have `failure_kind`, `failure_type`, a bounded payload-free `failure_message`, and `attempts`, without transcript/output bodies or references. The complete `failure_kind` contract is:
+`QueryFailureKind`, exported from `forkreduce.contrib.temporal`, is the public `Literal` alias for the six non-`None` values below; `None` means success.
+
+| `failure_kind` | Meaning |
+| --- | --- |
+| `retryable_exhausted` | Retryable failure with Temporal maximum attempts reached. |
+| `permanent` | Non-retryable application failure other than budget exhaustion. |
+| `budget` | Application budget exhaustion. |
+| `timeout` | Temporal activity timeout. |
+| `cancelled` | Activity cancellation, not cancellation of the parent workflow. |
+| `unknown` | Unrecognized failure, including unclassified application/activity failures or a failed child batch. |
+
+`failure_type` is the raw `ApplicationError.type` only when it is one of `validation`, `transport`, `permanent`, `budget`, `session_factory_missing`, or `ref_namespace_mismatch`; other raw types become `None`, never arbitrary exception text or an invented code. For example, an exhausted validation failure is `retryable_exhausted` / `validation`, while a missing factory is `retryable_exhausted` / `session_factory_missing`. A `ChildWorkflowError` in return mode produces `unknown` / `batch_failed` for every query in that batch with `attempts=0`; `batch_failed` is an additional synthetic whitelisted type, not a raw application error type. Parent workflow cancellation always propagates, including in return mode. Attempts count observed activity attempts; `0` means no count was available (for example a timeout before execution), not a guessed retry limit.
 
 For failed records, `attempts` counts Temporal activity attempts. Successful records retain the existing `Session.run_once` per-attempt count; this option does not redefine successful result fields.
 
 Factory lookup prefers an explicitly registered session, then the exact prefix factory, then `set_default_session_factory`; pass `None` to clear the default. Missing factories raise retryable `session_factory_missing`, bounded by the configured retry policy, so repaired worker configuration can succeed on a later attempt. Corrupt snapshots and reconstruction/hash mismatches remain non-retryable.
+For recovery, recommend `ActivityOptions(maximum_attempts=5, retry_backoff=2, max_backoff=30, backoff_coefficient=2.0)`. Choose attempts and any schedule-to-close timeout to leave a sufficient worker-repair/restart recovery window; retries cannot recover configuration after that window closes.
 
 `freeze_prefix(..., app_meta=...)` copies JSON metadata into `FrozenPrefix.app_meta` (legacy snapshots default to `{}`). It is limited to **16 KiB of compact UTF-8 JSON** and excluded from prefix hash, identity and execution fingerprint. Put only routing/schema identifiers here, **never secrets or document/body text**. Factories receive the complete snapshot.
 
-`StoreContext` is a frozen, serializable dataclass: `workflow_id`, `run_id`, `parent_workflow_id`, `activity_id`, `query_id`, `round`, `attempt`, `kind` (`prefix/messages/output/history`), `prefix_hash`, and `namespace`. Unavailable execution fields are `None`. Query `meta.ref_namespace` overrides snapshot `app_meta.ref_namespace`; repeat it on queries when initial prefix reads need namespace routing, because snapshot metadata is unavailable until that read finishes. Nonempty namespaces are URL-escaped and prepended to generated keys; without one, keys are unchanged. Context is routing metadata, not an authorization boundary. Optional `delete(ref, *, context)` is called only by explicit `delete_ref(store, ref, *, context)`; legacy `delete(ref)` is supported, missing deletion raises `NotImplementedError`. The framework never deletes blobs automatically.
+`StoreContext` is a frozen, serializable dataclass: `workflow_id`, `run_id`, `parent_workflow_id`, `activity_id`, `query_id`, `round`, `attempt`, `kind` (`prefix/messages/output/history`), `prefix_hash`, and `namespace`. Unavailable execution fields are `None`. Snapshot `app_meta.ref_namespace` records where the prefix was stored; `query_activity_input` does not hydrate the snapshot or infer it from an opaque reference. Supply the same `meta.ref_namespace` on queries when initial prefix reads need namespace routing, because snapshot metadata is unavailable until that read finishes. An explicit query namespace that disagrees with the hydrated snapshot is rejected as non-retryable `ref_namespace_mismatch`, not silently redirected. Nonempty namespaces are URL-escaped and prepended to generated keys; without one, keys are unchanged. Context is routing metadata, not an authorization boundary.
+Use `query_activity_input(..., ref_namespace="demo-run")` to populate copied query metadata. Only when both query and snapshot namespaces are nonempty must they match; an absent or empty namespace does not trigger a mismatch.
+
+Optional `delete(ref, *, context)` is called only by explicit `delete_ref(store, ref, *, context)`; legacy `delete(ref)` is supported. Implementations must make deleting a missing reference (including repeated deletion or a never-created reference) a successful no-op, preserving all other references. Unsupported deletion still raises `NotImplementedError`; other store errors are not suppressed. Supply the original reference's kind, prefix hash and namespace. The framework never deletes blobs automatically; applications own retention through retries and continuations.
 
 `FrozenPrefix` stores documents, instructions, rendered prefix and tool identity, not executable model/schema objects. Reconstruction verifies the prefix hash: use matching schemas/rendering configuration. Configure factories at worker startup and retain blobs through retry/continuation lifetimes. Persist references and final application results; completed workflow streams are not a replayable archive. Drain in-flight workflows or use worker versioning/new task queues for incompatible orchestration changes, and replay representative old histories before migrating. Converter tests are not a guarantee that arbitrary old workflow code replays after orchestration changes.
 `FrozenPrefix.output_mode` retains the requested mode, including `"auto"`; `FrozenPrefix.resolved_output_mode` records the actual mode (`None` for legacy snapshots), and `on_unforced_tools` preserves the diagnostic policy. Restore the requested mode and policy as above, and supply the same thinking-related model/session settings in the factory. Workers verify the reconstructed resolved mode and prefix hash: changed capabilities/settings must fail rather than silently restore a different output contract. The factory still owns model/settings; settings that may contain transport credentials are not serialized into the snapshot.

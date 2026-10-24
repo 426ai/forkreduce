@@ -15,6 +15,7 @@ from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
     CancelledError,
+    ChildWorkflowError,
     RetryState,
     TimeoutError,
     TimeoutType,
@@ -121,6 +122,7 @@ async def test_return_mixed_query_failures_and_replay(plugin: bool, batch_size: 
                 assert [result.attempts for result in results if result.failure_kind is not None] == [1, 4]
                 assert [result.failure_kind for result in results] == [None, "permanent", "retryable_exhausted"]
                 assert seen == {"success": [1, 2], "permanent": [1], "exhausted": [1, 2, 3, 4]}
+                assert [result.failure_type for result in results] == [None, "permanent", "transport"]
                 success, permanent, exhausted = results
                 assert success.failure_message is None
                 if batch_size:
@@ -331,7 +333,8 @@ async def test_return_mode_does_not_swallow_workflow_cancellation(plugin: bool, 
             0,
         ),
         (CancelledError("private"), RetryState.CANCEL_REQUESTED, "cancelled", 0),
-        (RuntimeError("private"), RetryState.INTERNAL_SERVER_ERROR, "activity", 0),
+        (RuntimeError("private"), RetryState.INTERNAL_SERVER_ERROR, "unknown", 0),
+        (ApplicationError("private", type="untrusted"), RetryState.RETRY_POLICY_NOT_SET, "unknown", 0),
     ],
 )
 async def test_terminal_error_mapping_never_exposes_error_text(
@@ -416,3 +419,200 @@ async def test_activity_payload_carries_parent_workflow_identity(monkeypatch) ->
     monkeypatch.setattr(adapter.workflow, "info", lambda: SimpleNamespace(parent=None))
     await adapter._execute_activity(captured[0], adapter.activity_retry_policy(query))
     assert captured[1].parent_workflow_id is None
+
+
+@activity.defn(name="forkreduce.run_query")
+async def inline_batch_result(payload: adapter.QueryActivityInput) -> adapter.QueryActivityOutput:
+    # A misconfigured activity returns inline content: the child must reject it.
+    return adapter.QueryActivityOutput(
+        payload.query_id,
+        payload.prefix_hash,
+        "synthetic-private-body" if payload.query_id == "bad" else None,
+        None,
+        0,
+        1,
+        messages_ref="synthetic-ref",
+    )
+
+
+@pytest.mark.parametrize("plugin", [False, True])
+async def test_return_mode_contains_child_failure_and_replays(plugin: bool) -> None:
+    plugins = [PydanticAIPlugin()] if plugin else []
+    runner = sandbox_runner()
+    async with await WorkflowEnvironment.start_time_skipping(plugins=plugins, **server_options()) as env:
+        queue = f"batch-failure-{uuid4()}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[adapter.MapQueriesWorkflow, adapter.QueryBatchWorkflow],
+            activities=[inline_batch_result],
+            workflow_runner=runner,
+        ):
+            handle = await env.client.start_workflow(
+                adapter.MapQueriesWorkflow.run,
+                adapter.MapQueriesInput(
+                    queries=[
+                        adapter.QueryActivityInput("prefix", name, "question", "FailureAnswer")
+                        for name in ("bad", "same-batch", "good")
+                    ],
+                    batch_size=2,
+                    on_query_failure="return",
+                ),
+                id=f"batch-failure-{uuid4()}",
+                task_queue=queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            results = await asyncio.wait_for(handle.result(), 30)
+            assert [result.query_id for result in results] == ["bad", "same-batch", "good"]
+            for result in results[:2]:
+                assert result.failure_kind == "unknown"
+                assert result.failure_type == "batch_failed"
+                assert result.attempts == 0
+                assert result.output_json is None and result.output_ref is None
+                assert result.messages_json is None and result.messages_ref is None
+                assert "synthetic-private-body" not in json.dumps(asdict(result))
+            assert results[2].failure_kind is None
+            assert results[2].messages_ref == "synthetic-ref"
+            history = await handle.fetch_history()
+            children = [
+                event.start_child_workflow_execution_initiated_event_attributes.workflow_id
+                for event in history.events
+                if event.HasField("start_child_workflow_execution_initiated_event_attributes")
+            ]
+            child_histories = [await env.client.get_workflow_handle(child).fetch_history() for child in children]
+        replayer = Replayer(
+            workflows=[adapter.MapQueriesWorkflow, adapter.QueryBatchWorkflow], plugins=plugins, workflow_runner=runner
+        )
+        await replayer.replay_workflow(history)
+        for child_history in child_histories:
+            await replayer.replay_workflow(child_history)
+
+
+@pytest.mark.parametrize("mode", ["raise", "return"])
+@pytest.mark.parametrize("cancel_parent", [False, True])
+@pytest.mark.parametrize("timed_out", [False, True])
+async def test_child_failure_policy_and_parent_cancellation(
+    monkeypatch, mode: str, cancel_parent: bool, timed_out: bool
+) -> None:  # type: ignore[no-untyped-def]
+    error = ChildWorkflowError(
+        "private wrapper",
+        namespace="default",
+        workflow_id="child",
+        run_id="run",
+        workflow_type="forkreduce.query_batch",
+        initiated_event_id=1,
+        started_event_id=2,
+        retry_state=RetryState.TIMEOUT if timed_out else RetryState.NON_RETRYABLE_FAILURE,
+    )
+    error.__cause__ = (
+        TimeoutError("private timeout", type=TimeoutType.START_TO_CLOSE, last_heartbeat_details=[])
+        if timed_out
+        else CancelledError("private cancellation")
+    )
+
+    async def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise error
+
+    monkeypatch.setattr(adapter.workflow, "execute_child_workflow", execute)
+    monkeypatch.setattr(adapter.workflow, "in_workflow", lambda: True)
+    monkeypatch.setattr(adapter.workflow, "info", lambda: SimpleNamespace(workflow_id="parent"))
+    monkeypatch.setattr(adapter.workflow, "cancellation_reason", lambda: "" if cancel_parent else None)
+    inputs = adapter.MapQueriesInput(
+        queries=[adapter.QueryActivityInput("prefix", "q", "question", "FailureAnswer")],
+        batch_size=1,
+        on_query_failure=mode,
+    )
+    if mode == "raise" or cancel_parent:
+        with pytest.raises(ChildWorkflowError) as caught:
+            await adapter.MapQueriesWorkflow().run(inputs)
+        assert caught.value is error
+    else:
+        result = (await adapter.MapQueriesWorkflow().run(inputs))[0]
+        assert result.failure_kind == "unknown" and result.failure_type == "batch_failed"
+        assert result.attempts == 0
+        assert "private" not in json.dumps(asdict(result))
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        "validation",
+        "transport",
+        "permanent",
+        "budget",
+        "session_factory_missing",
+        "ref_namespace_mismatch",
+        "batch_failed",
+        "private exception text",
+        None,
+    ],
+)
+async def test_failure_type_allowlist(error_type: str | None) -> None:
+    cause = ApplicationError("private payload", type=error_type)
+    result = adapter._failure_output(
+        adapter.QueryActivityInput("prefix", "q", "question", "FailureAnswer"),
+        activity_error(cause, RetryState.MAXIMUM_ATTEMPTS_REACHED),
+    )
+    assert result.failure_type == (None if error_type in {"private exception text", "batch_failed"} else error_type)
+    assert "private" not in json.dumps(asdict(result))
+
+
+@pytest.mark.parametrize("plugin", [False, True])
+async def test_return_failure_type_distinguishes_validation_from_missing_factory(plugin: bool) -> None:
+    def handler(_messages, info, _n):  # type: ignore[no-untyped-def]
+        return tool_result(info, "FailureAnswer", {"wrong-field": "synthetic-invalid-output"})
+
+    session = build(
+        Scripted(handler).model(),
+        documents="Synthetic validation evidence.",
+        instructions="Answer.",
+        outputs=[FailureAnswer],
+        policy=Policy(retries=1, retry_backoff=0.001, max_backoff=0.001),
+    )
+    prefix = adapter.register_session(session)
+    plugins = [PydanticAIPlugin()] if plugin else []
+    runner = sandbox_runner()
+    try:
+        async with await WorkflowEnvironment.start_time_skipping(plugins=plugins, **server_options()) as env:
+            queue = f"failure-type-{uuid4()}"
+            async with Worker(
+                env.client,
+                task_queue=queue,
+                workflows=[adapter.MapQueriesWorkflow],
+                activities=[adapter.run_query_activity],
+                workflow_runner=runner,
+            ):
+                handle = await env.client.start_workflow(
+                    adapter.MapQueriesWorkflow.run,
+                    adapter.MapQueriesInput(
+                        queries=[
+                            adapter.query_activity_input(
+                                session, query_id="validation", tail="Question", output_name="FailureAnswer"
+                            ),
+                            adapter.QueryActivityInput(
+                                "unregistered-prefix",
+                                "missing",
+                                "Question",
+                                "FailureAnswer",
+                                max_attempts=2,
+                                retry_backoff_seconds=0.001,
+                                max_backoff_seconds=0.001,
+                            ),
+                        ],
+                        on_query_failure="return",
+                    ),
+                    id=f"failure-type-{uuid4()}",
+                    task_queue=queue,
+                    execution_timeout=timedelta(seconds=30),
+                )
+                results = await asyncio.wait_for(handle.result(), 30)
+                assert [result.failure_kind for result in results] == ["retryable_exhausted", "retryable_exhausted"]
+                assert [result.failure_type for result in results] == ["validation", "session_factory_missing"]
+                assert [result.attempts for result in results] == [2, 2]
+                assert "synthetic-invalid-output" not in json.dumps([asdict(result) for result in results])
+                history = await handle.fetch_history()
+            await Replayer(
+                workflows=[adapter.MapQueriesWorkflow], plugins=plugins, workflow_runner=runner
+            ).replay_workflow(history)
+    finally:
+        adapter.unregister_session(prefix)

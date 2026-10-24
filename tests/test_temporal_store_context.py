@@ -9,6 +9,7 @@ import pytest
 from pydantic import BaseModel
 from pydantic_ai.models.test import TestModel
 from temporalio.converter import DataConverter
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from forkreduce import build
@@ -74,11 +75,49 @@ async def test_namespaces_separate_identical_prefixes_and_preserve_legacy_keys()
     )
 
 
-@pytest.mark.parametrize("override", [None, "query-space"])
-async def test_context_across_prefix_history_messages_output_and_delete(override: str | None) -> None:
+@pytest.mark.parametrize(
+    ("meta", "namespace", "expected"),
+    [
+        (None, None, {}),
+        ({"ref_namespace": "metadata", "tag": "keep"}, None, {"ref_namespace": "metadata", "tag": "keep"}),
+        ({"ref_namespace": "metadata", "tag": "keep"}, "explicit", {"ref_namespace": "explicit", "tag": "keep"}),
+        ({"ref_namespace": "metadata"}, "", {"ref_namespace": ""}),
+        ({}, "explicit", {"ref_namespace": "explicit"}),
+    ],
+)
+def test_query_activity_input_copies_namespace_metadata(
+    meta: dict[str, str] | None, namespace: str | None, expected: dict[str, str]
+) -> None:
+    original = session()
+    before = dict(meta) if meta is not None else None
+    payload = adapter.query_activity_input(
+        original,
+        query_id="q",
+        tail="Question",
+        output_name="StoredAnswer",
+        meta=meta,
+        ref_namespace=namespace,
+    )
+    assert payload.meta == expected
+    assert payload.prefix_hash == original.prefix_hash
+    assert meta == before
+    assert payload.meta is not meta
+    payload.meta["added"] = "payload-only"
+    assert meta == before
+
+
+@pytest.mark.parametrize(
+    ("snapshot_namespace", "query_namespace"),
+    [(None, None), (None, "query-space"), ("snapshot-space", None), ("shared-space", "shared-space")],
+)
+async def test_context_across_prefix_history_messages_output_and_delete(
+    snapshot_namespace: str | None, query_namespace: str | None
+) -> None:
     original = session()
     store = ContextStore()
-    ref = await adapter.freeze_prefix(original, store, app_meta={"ref_namespace": "snapshot-space"})
+    ref = await adapter.freeze_prefix(
+        original, store, app_meta={} if snapshot_namespace is None else {"ref_namespace": snapshot_namespace}
+    )
     adapter.set_prefix_store(store)
     adapter.set_message_store(store)
     adapter.set_default_session_factory(lambda _snapshot: original)
@@ -88,7 +127,7 @@ async def test_context_across_prefix_history_messages_output_and_delete(override
         tail="First question",
         output_name="StoredAnswer",
         prefix_ref=ref,
-        meta={} if override is None else {"ref_namespace": override},
+        ref_namespace=query_namespace,
     )
     query.require_references = True
     query.parent_workflow_id = "parent"
@@ -96,9 +135,10 @@ async def test_context_across_prefix_history_messages_output_and_delete(override
     env.info = replace(env.info, workflow_id="child", workflow_run_id="run", activity_id="activity", attempt=2)
     first = await env.run(adapter.execute_query_activity, query)
     assert first.messages_ref is not None and first.output_ref is not None
-    namespace = override or "snapshot-space"
-    assert first.messages_ref == f"{namespace}/{original.prefix_hash}:q1"
-    assert first.output_ref == f"{namespace}/output:{original.prefix_hash}:q1"
+    namespace = query_namespace or snapshot_namespace
+    prefix = f"{namespace}/" if namespace else ""
+    assert first.messages_ref == f"{prefix}{original.prefix_hash}:q1"
+    assert first.output_ref == f"{prefix}output:{original.prefix_hash}:q1"
     for operation, _ref, context in store.calls[1:]:
         assert context.workflow_id == "child"
         assert context.run_id == "run"
@@ -107,7 +147,7 @@ async def test_context_across_prefix_history_messages_output_and_delete(override
         assert context.query_id == "q1"
         assert context.round == 0 and context.attempt == 2
         assert context.prefix_hash == original.prefix_hash
-        assert context.namespace == (override if context.kind == "prefix" else namespace)
+        assert context.namespace == (query_namespace if context.kind == "prefix" else namespace)
         assert operation == ("get" if context.kind == "prefix" else "put")
     await env.run(
         adapter.execute_query_activity,
@@ -124,6 +164,62 @@ async def test_context_across_prefix_history_messages_output_and_delete(override
     assert store.calls[-1] == ("delete", first.output_ref, context)
     encoded = await DataConverter.default.encode([context])
     assert await DataConverter.default.decode(encoded, [adapter.StoreContext]) == [context]
+
+
+@pytest.mark.parametrize("cached_session", [False, True])
+async def test_namespace_mismatch_precedes_factory_model_history_and_writes(
+    monkeypatch: pytest.MonkeyPatch, cached_session: bool
+) -> None:
+    original = session()
+    store = ContextStore()
+    snapshot_namespace = "private-snapshot-namespace"
+    query_namespace = "private-query-namespace"
+    ref = await adapter.freeze_prefix(original, store, app_meta={"ref_namespace": snapshot_namespace})
+    adapter.set_prefix_store(store)
+    adapter.set_message_store(store)
+    factory_calls = []
+    model_calls = []
+
+    def factory(_snapshot):  # type: ignore[no-untyped-def]
+        factory_calls.append(_snapshot)
+        return original
+
+    async def run_once(_query):  # type: ignore[no-untyped-def]
+        model_calls.append(_query)
+        raise AssertionError("Model execution must not start for a namespace mismatch")
+
+    adapter.set_default_session_factory(factory)
+    if cached_session:
+        adapter.register_session(original)
+    monkeypatch.setattr(original, "run_once", run_once)
+    payload = adapter.query_activity_input(
+        original,
+        query_id="q",
+        tail="private-query-tail",
+        output_name="StoredAnswer",
+        prefix_ref=ref,
+        history_ref="private-history-reference",
+        ref_namespace=query_namespace,
+    )
+    payload.require_references = True
+    store.calls.clear()
+    env = ActivityEnvironment()
+    env.info = replace(env.info, attempt=3)
+    with pytest.raises(ApplicationError) as caught:
+        await env.run(adapter.execute_query_activity, payload)
+    error = caught.value
+    assert error.type == "ref_namespace_mismatch"
+    assert error.non_retryable is True
+    assert error.message == "Query and frozen prefix reference namespaces do not match"
+    assert list(error.details) == ["ref_namespace_mismatch", {"forkreduce_attempt": 3}]
+    assert factory_calls == []
+    assert model_calls == []
+    assert len(store.calls) == 1
+    operation, read_ref, context = store.calls[0]
+    assert operation == "get" and read_ref == ref
+    assert context.kind == "prefix" and context.namespace == query_namespace
+    assert context.attempt == 3
+    assert set(store.data) == {ref}
 
 
 async def test_legacy_store_supports_namespaced_freeze_activity_and_explicit_delete() -> None:

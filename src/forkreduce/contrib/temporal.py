@@ -29,7 +29,14 @@ from typing import Any, Literal, TypeVar, cast
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError, RetryState, TimeoutError, is_cancelled_exception
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+    ChildWorkflowError,
+    RetryState,
+    TimeoutError,
+    is_cancelled_exception,
+)
 
 with workflow.unsafe.imports_passed_through():
     from collections.abc import Awaitable, Callable, Mapping
@@ -403,14 +410,23 @@ def query_activity_input(
     meta: dict[str, Any] | None = None,
     model_settings: ModelSettings | None = None,
     prefix_ref: str | None = None,
+    ref_namespace: str | None = None,
 ) -> QueryActivityInput:
     """Build an activity payload that carries this session's retry policy.
 
     ``model_settings`` is a per-query override. The worker merges it over the
     registered session's settings. It is not part of the execution fingerprint.
     Values must be JSON-serializable; a client ``timeout`` object is not.
+
+    ``ref_namespace`` routes references without changing the prefix identity.
+    A non-``None`` value overrides the copied ``meta`` namespace; otherwise the
+    metadata value is preserved. Conflicting query and snapshot namespaces fail
+    before session reconstruction or model execution.
     """
     policy = session.policy
+    query_meta = dict(meta or {})
+    if ref_namespace is not None:
+        query_meta["ref_namespace"] = ref_namespace
     return QueryActivityInput(
         prefix_hash=session.prefix_hash,
         query_id=query_id,
@@ -419,7 +435,7 @@ def query_activity_input(
         round=round,
         history_ref=history_ref,
         history_json=history_json,
-        meta=dict(meta or {}),
+        meta=query_meta,
         max_attempts=policy.retries + 1,
         retry_backoff_seconds=policy.retry_backoff,
         max_backoff_seconds=policy.max_backoff,
@@ -455,12 +471,18 @@ def activity_retry_policy(payload: QueryActivityInput) -> RetryPolicy:
     )
 
 
+QueryFailureKind = Literal["retryable_exhausted", "permanent", "budget", "timeout", "cancelled", "unknown"]
+"""Stable terminal query categories; ``None`` on the result denotes success."""
+
+
 @dataclass
 class QueryActivityOutput:
     """Activity result, or a safe terminal failure without bodies or references.
 
-    ``attempts`` counts activity executions, not the configured retry maximum.
-    A terminal SDK failure without attempt metadata reports zero (unknown).
+    For failures, ``attempts`` counts observed activity executions, or zero if
+    unknown (including child failures). Successes retain Session.run_once counts.
+    ``failure_type`` contains only a whitelisted raw application type, or the
+    synthetic ``batch_failed`` for a child failure; arbitrary error text is omitted.
     """
 
     query_id: str
@@ -473,8 +495,9 @@ class QueryActivityOutput:
     messages_json: str | None = None
     output_ref: str | None = None
     resolved_output_mode: ResolvedOutputMode | None = None
-    failure_kind: str | None = None
+    failure_kind: QueryFailureKind | None = None
     failure_message: str | None = None
+    failure_type: str | None = None
 
 
 def _permanent(message: str) -> ApplicationError:
@@ -513,6 +536,16 @@ async def _load_prefix(payload: QueryActivityInput) -> FrozenPrefix | None:
                 raise ValueError("prefix_ref does not match the requested prefix_hash")
         except (KeyError, ValueError, TypeError) as exc:
             raise _permanent(f"Invalid or missing frozen prefix: {exc}") from exc
+        query_namespace = ref_namespace(payload.meta)
+        snapshot_namespace = ref_namespace(snapshot.app_meta)
+        if query_namespace and snapshot_namespace and query_namespace != snapshot_namespace:
+            raise ApplicationError(
+                "Query and frozen prefix reference namespaces do not match",
+                "ref_namespace_mismatch",
+                _attempt_detail(),
+                type="ref_namespace_mismatch",
+                non_retryable=True,
+            )
     return snapshot
 
 
@@ -707,22 +740,33 @@ def child_workflow_id(prefix_hash: str, batch_index: int) -> str:
     return f"forkreduce:{parent_hash}:{prefix_hash}:batch:{batch_index}"
 
 
-_FAILURE_MESSAGES = {
+_FAILURE_MESSAGES: dict[QueryFailureKind, str] = {
     "retryable_exhausted": "Query failed after retry attempts were exhausted.",
     "permanent": "Query failed permanently.",
     "budget": "Query exceeded its execution budget.",
     "timeout": "Query activity timed out.",
     "cancelled": "Query activity was cancelled.",
-    "application": "Query activity failed with an application error.",
-    "activity": "Query activity failed.",
+    "unknown": "Query failed without a query-level failure classification.",
 }
+_FAILURE_TYPES = frozenset(
+    {
+        "validation",
+        "transport",
+        "permanent",
+        "budget",
+        "session_factory_missing",
+        "ref_namespace_mismatch",
+    }
+)
 
 
-def _failure_output(payload: QueryActivityInput, error: ActivityError) -> QueryActivityOutput:
+def _failure_output(payload: QueryActivityInput, error: ActivityError | ChildWorkflowError) -> QueryActivityOutput:
     cause = error.__cause__
     attempts = 0
     details = (
-        cause.details
+        ()
+        if isinstance(error, ChildWorkflowError)
+        else cause.details
         if isinstance(cause, ApplicationError)
         else cause.last_heartbeat_details
         if isinstance(cause, TimeoutError)
@@ -733,7 +777,10 @@ def _failure_output(payload: QueryActivityInput, error: ActivityError) -> QueryA
             attempt = detail.get("forkreduce_attempt")
             if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 0:
                 attempts = attempt
-    if is_cancelled_exception(error):
+    kind: QueryFailureKind
+    if isinstance(error, ChildWorkflowError):
+        kind = "unknown"
+    elif is_cancelled_exception(error):
         kind = "cancelled"
     elif isinstance(cause, TimeoutError) or error.retry_state == RetryState.TIMEOUT:
         kind = "timeout"
@@ -745,11 +792,11 @@ def _failure_output(payload: QueryActivityInput, error: ActivityError) -> QueryA
         elif error.retry_state == RetryState.MAXIMUM_ATTEMPTS_REACHED:
             kind = "retryable_exhausted"
         else:
-            kind = "application"
+            kind = "unknown"
     elif error.retry_state == RetryState.MAXIMUM_ATTEMPTS_REACHED:
         kind = "retryable_exhausted"
     else:
-        kind = "activity"
+        kind = "unknown"
     return QueryActivityOutput(
         query_id=payload.query_id,
         prefix_hash=payload.prefix_hash,
@@ -759,6 +806,13 @@ def _failure_output(payload: QueryActivityInput, error: ActivityError) -> QueryA
         attempts=attempts,
         failure_kind=kind,
         failure_message=_FAILURE_MESSAGES[kind],
+        failure_type=(
+            "batch_failed"
+            if isinstance(error, ChildWorkflowError)
+            else cause.type
+            if isinstance(cause, ApplicationError) and cause.type in _FAILURE_TYPES
+            else None
+        ),
     )
 
 
@@ -855,15 +909,22 @@ class MapQueriesWorkflow:
 
         async def batch(index: int, items: list[QueryActivityInput]) -> list[QueryActivityOutput]:
             async with slots:
-                return await workflow.execute_child_workflow(
-                    QueryBatchWorkflow.run,
-                    MapQueriesInput(
-                        queries=items,
-                        activity_options=config.activity_options,
-                        on_query_failure=config.on_query_failure,
-                    ),
-                    id=child_workflow_id(items[0].prefix_hash, index),
-                )
+                try:
+                    return await workflow.execute_child_workflow(
+                        QueryBatchWorkflow.run,
+                        MapQueriesInput(
+                            queries=items,
+                            activity_options=config.activity_options,
+                            on_query_failure=config.on_query_failure,
+                        ),
+                        id=child_workflow_id(items[0].prefix_hash, index),
+                    )
+                except ChildWorkflowError as exc:
+                    if config.on_query_failure == "raise" or (
+                        workflow.in_workflow() and workflow.cancellation_reason() is not None
+                    ):
+                        raise
+                    return [_failure_output(query, exc) for query in items]
 
         batches = await asyncio.gather(
             *(
