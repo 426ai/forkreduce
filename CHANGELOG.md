@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Add a source-tree-only CUAD benchmark with three method adapters, offline FunctionModel/TestModel coverage, provider-response usage accounting, span/citation metrics, contract-cluster confidence intervals, and real-data cost estimation. Paid execution requires separate estimate approval; benchmark dependencies and downloaded data stay outside the core wheel.
+- Add an explicitly approved minimal multi-model smoke runner with Chat/Responses selection, configurable cache keys/headers and capability profiles, normalized cached/reasoning usage, persistent per-request spend reservations, and attempt-aware reports. Fail closed on unbounded billable output: xAI's visible-only cap cannot enforce a total-token budget; unsafe models remain isolated without discarding their costs or blocking independently bounded providers.
 
 ## 0.1.1
 

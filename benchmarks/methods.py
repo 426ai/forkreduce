@@ -19,6 +19,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart, Tool
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage, UsageLimits
 
+from benchmarks.budget import BudgetExceeded, BudgetHalted
 from benchmarks.providers import RecordingModel
 from benchmarks.schema import INSTRUCTIONS, Answers, Contract, MethodConfig, MethodResult, Question, question_prompt
 from forkreduce import CitationCheck, CitationRepair, Query, build
@@ -41,6 +42,8 @@ def _validate_ids(output: Answers, questions: tuple[Question, ...]) -> None:
 
 
 def _code(exc: BaseException) -> tuple[str, bool, bool]:
+    if isinstance(exc, (BudgetExceeded, BudgetHalted)):
+        return "budget_exceeded", False, False
     if isinstance(exc, UsageLimitExceeded):
         return "question_budget", False, False
     if isinstance(exc, _IdsError):

@@ -210,11 +210,94 @@ exposes the repeated-history cost. Neither establishes an accuracy ranking.
 The generated estimate artifact contains the full per-N and per-contract grid.
 
 
+## Five-model minimal live smoke
+
+This command requires **separate explicit user approval**; it is not part of CI or
+the offline PoC. It schedules availability probes and two short public CUAD
+contracts, N=5, three methods, five configured model IDs. Unsafe models are refused
+before sending; it never runs the full estimate grid.
+
+```sh
+FORKREDUCE_BENCH_ALLOW_PAID=1 python -m benchmarks.live_smoke availability --approve-paid-smoke
+FORKREDUCE_BENCH_ALLOW_PAID=1 python -m benchmarks.live_smoke cuad --approve-paid-smoke
+```
+
+Set `OPENAI_BASE_URL` to the explicitly approved endpoint before running; the
+repository contains no operator-specific relay URL. Runtime credentials come
+from `PROXY_API_KEY`, then `OPENAI_API_KEY`, then `PROXY_API_KEY_FILE` (default
+`~/.config/proxy_key`); neither the key nor SDK exception bodies are logged.
+Results and the shared `budget.json` ledger live in ignored
+`benchmarks/results/models-smoke/`.
+Keep both phases in the **same directory**. Never run simultaneous processes
+against one ledger.
+Restart skips successful availability cases and completed CUAD cases, retaining
+failed probe attempts. It never resets spending.
+`--models` selects a subset without changing the shared $3 ceiling.
+
+`provider_model(..., api="responses", settings={"prompt_cache_key": "...",
+"extra_headers": {...}})` selects `OpenAIResponsesModel`; the default remains
+chat completions. Pydantic AI's existing model settings reach fork/reduce without
+core changes. SDK retries are disabled and requests use a custom User-Agent.
+GPT-6.1-Sol and GPT-6-Luna use Responses and an explicit cache key; unavailable
+`gpt-6.1-luna` is explicitly replaced by `gpt-6-luna`. The recorded Grok probes
+compared no header with stable `x-grok-conv-id`; future Grok calls are now refused
+by the budget guard, for the reason below. DeepSeek and MiMo use chat.
+Both APIs' cached-token counters are normalized before validation and repair.
+DeepSeek thinking rejects forced tool choice. Its benchmark capability profile
+uses automatic tool choice and preserves `reasoning_content` across tool turns;
+the same Answers schema, question-ID and citation validators still apply.
+Setting `tool_choice="auto"` alone is insufficient because Pydantic AI resolves
+tool-only outputs to required unless the profile declares forcing unsupported.
+Its Chat profile sends the documented `max_tokens` field, not the OpenAI-specific
+`max_completion_tokens` alias.
+
+The request wrapper reserves a conservative no-cache input byte/framing bound
+plus a **total billable output bound before every request**, including warmup,
+repair, tools, reduce, and failed structured responses. OpenAI Responses/MiMo
+have reasoning-inclusive caps; DeepSeek Chat conservatively reserves its official
+384K absolute output ceiling while requesting only 2,048 tokens. Concurrent
+reservations share one ledger. Missing input/output usage or transport uncertainty
+retains the full reservation and stops sends. Measured usage and conservative
+charged amounts remain distinct; interrupted reservations also stop sends.
+After correcting a failed request, explicit `--resume-after-correction REASON_CODE`
+can resume only fully charged uncertain reservations with no in-flight calls.
+It keeps every charge and unknown-cost flag, adds an audit event, and cannot
+resume a token-bound violation, underestimated reservation, or exhausted limit.
+
+**Grok is not safe under a token-only hard spending gate.** Its official
+[Chat API](https://docs.x.ai/developers/rest-api-reference/inference/chat-completions)
+and [Responses API](https://docs.x.ai/developers/rest-api-reference/inference/responses)
+explicitly exclude reasoning and function-call tokens from the visible-text cap.
+The recorded smoke caught this mismatch and stopped; lowering reasoning effort
+does not establish a hard bound. New Grok sends are refused even with a fresh
+ledger. A verified provider/proxy monetary cap is a prerequisite for further runs.
+`--quarantine-bound-model MODEL` can permanently isolate an observed output-only
+violator while allowing independently bounded models to continue. It requires
+known costs within the original reservations and no pending calls, preserves all
+charges/audit records, and never relaxes input or monetary-bound violations.
+This is a hard **local estimated-cost admission ceiling**, conditional on provider
+honoring output caps, text tokenization/framing bounds, and the published rates;
+it cannot enforce the proxy's undisclosed invoice or replace an account-side cap.
+GPT unknown cache-population splits are conservatively priced at 1.25x normal
+input, not silently treated as free writes. The pinned prices/sources are in
+`live_smoke.MODEL_SPECS`; no full experiment is authorized by this command.
+
+All methods request temperature 0 (reasoning providers may ignore it; SDK warnings
+are not suppressed), identical schema and retry/repair limits, fork concurrency 1,
+and output cap 2,048 for this smoke. Short-document selection is the two
+shortest contracts with 2,000–7,999 proxy tokens in the prior seeded 20-contract
+sample; it does not inspect gold labels. This is pipeline/cache evidence, not a
+representative accuracy estimate. Per-model reports avoid pooling model scores;
+combined `summary.csv` retains a row per model × method.
+JSONL retains every attempt; summaries select the latest attempt per model,
+contract and method. Non-executed safety-blocked cells have unknown accuracy,
+not fabricated zero-cost model results or ordinary failed model generations.
+
 ## Paid execution: only after separate approval
 
-**No paid run is authorized for this PoC delivery.** Before a future run, show the
-complete estimate and assumptions to the user and obtain explicit approval.
-Provider secrets are accepted only through environment variables:
+**The original offline PoC did not authorize paid calls.** Before a future grid,
+show the complete estimate and assumptions to the user and obtain explicit
+approval. The general grid runner accepts provider secrets through environment variables:
 
 | Provider | Required | Optional |
 | --- | --- | --- |
