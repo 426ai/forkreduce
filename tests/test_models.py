@@ -19,6 +19,7 @@ class Answer(BaseModel):
 
 
 def test_openai_compatible_model_accepts_profile_timeout_and_extra_body() -> None:
+    pytest.importorskip("openai")
     model = openai_compatible_model(
         "demo-model",
         api_key="test-key",

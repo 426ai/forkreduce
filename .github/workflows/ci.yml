@@ -11,7 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
-        extras: ["openai,temporal", "openai,temporal,full"]
+        extras: ["temporal", "openai,temporal,full"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,6 +20,11 @@ jobs:
           cache: pip
       - name: Install
         run: python -m pip install -e ".[dev,${{ matrix.extras }}]" "pydantic-ai-slim[temporal]>=2.57,<3"
+      - name: Verify provider-free slim installation
+        if: matrix.extras == 'temporal'
+        run: |
+          python -c "from importlib.util import find_spec; assert find_spec('openai') is None"
+          python -c "from importlib.metadata import distributions; assert 'pydantic-ai' not in {d.metadata['Name'].lower().replace('_', '-') for d in distributions()}"
       - name: Ruff
         run: |
           ruff check src tests examples
