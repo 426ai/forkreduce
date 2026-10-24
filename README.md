@@ -17,6 +17,8 @@ pip install forkreduce
 
 The Temporal adapter is optional: `pip install "forkreduce[temporal]"`. The core package never imports it.
 
+The source version in this checkout is **0.2.0**. Updating metadata does not publish a package. To install this checkout before publication, use `pip install -e .` or `pip install -e ".[temporal]"`; the commands above install the version currently published on PyPI.
+
 ## Quick start
 
 Ask two questions about the same document (map), then merge the answers into a summary with provenance (reduce). This example calls a real model; first configure an OpenAI-compatible endpoint:
@@ -589,7 +591,7 @@ async with Worker(
 
 Both Temporal's default converter and `PydanticAIPlugin`'s `PydanticAIPayloadConverter` have offline workflow/replay coverage. forkreduce's per-query activities coexist with official `TemporalDurability` agents on the same worker: register those agents/workflows normally, without wrapping these activity calls in another retry loop. Install Pydantic AI's `[temporal]` extra for its official integration. For a default-converter worker, set `workflow_runner=SandboxedWorkflowRunner(restrictions=SandboxRestrictions.default.with_passthrough_modules("forkreduce", "pydantic_ai"))`; both classes come from `temporalio.worker.workflow_sandbox`. This avoids reimporting model dependencies inside the sandbox.
 
-When configured, periodic heartbeats continue while awaiting the model. They signal liveness, not business progress. Blocking the event loop prevents heartbeats: move CPU work to a thread/separate activity and keep a finite start-to-close timeout. Local execution ignores `ActivityOptions`; they never change prefix bytes/hash.
+When configured, one periodic heartbeat task covers the entire asynchronous query activity: prefix and continuation-history reads, async session-factory construction, the model await, and transcript/output uploads. It stops only when the activity finishes, fails, or is cancelled, so a healthy slow store does not lose heartbeat coverage before or after the model call. Heartbeats signal liveness, not business progress. Blocking the event loop still prevents them: move CPU work to a thread/separate activity and keep a finite start-to-close timeout. Local execution ignores `ActivityOptions`; they never change prefix bytes/hash.
 
 Registration is process-local. Payloads carry hashes, tails, output names, options, and optional per-query `model_settings`, never model instances or Python classes. Conflicting model/request-body settings/profile/policy registrations raise `ForkReduceError`; unregister before replacement. `timeout`/`extra_headers` remain outside the fingerprint. Settings must be JSON-serializable. `activity_id(prefix_hash, query_id)` remains `forkreduce:{prefix_hash}:{query_id}`. Inline single-workflow continuations still accept the previous `messages_json` as `history_json`.
 
@@ -700,6 +702,12 @@ OPENAI_API_KEY=... OPENAI_MODEL=... OPENAI_BASE_URL=... python examples/run_live
 
 `FORKREDUCE_MODEL` is accepted as another name for the model.
 
+## Upgrading to 0.2.0
+
+- Default `output_mode="auto"` preserves the old tools hash when the effective profile supports forced output. Unsupported forcing (including thinking restrictions) now resolves to prompted, so users previously relying on the tools default get a new hash and cold cache. Explicit tools/prompted remain stable for unchanged schemas/instructions; adopting the new citation schema/instructions also changes the hash. See [Upgrade notes](CHANGELOG.md#upgrade-notes) for the full compatibility details.
+- Before changing Temporal workers/converters, stop sending work to the old task queue and let the old workers finish all in-flight workflows, children, and activities; then switch clients and workers together. Retain referenced blobs through retries/continuations. If draining is impossible, keep old executions isolated on their compatible queue/worker version, use a separate queue or worker version for 0.2.0, and replay representative histories before migrating existing work.
+- Default-converter workers and Replayers need the sandbox `workflow_runner` passthrough configuration in the [Temporal recipe](#temporal-optional). Register both map and batch workflows when batching. Heartbeats now span slow async storage/factory operations as well as model calls; they do not make event-loop-blocking CPU work safe.
+
 ## Releasing
 
 PyPI publishes from a git tag. `.github/workflows/release.yml` builds the sdist and wheel, checks them, and uploads with [Trusted Publishing](https://docs.pypi.org/trusted-publishers/). The repository has no PyPI token. The publisher is the `pypi` environment on `426ai/forkreduce`, workflow `release.yml`.
@@ -713,7 +721,7 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-The tag is `v` plus the version string: `0.1.0` is `v0.1.0`. The workflow fails when they differ. You can also run the Release workflow by hand from the Actions tab, but only on an existing `v*` tag.
+The tag is `v` plus the version string: `0.2.0` corresponds to `v0.2.0`. The workflow fails when they differ. You can also run the Release workflow by hand from the Actions tab, but only on an existing `v*` tag. Release preparation alone must not create a tag or run that workflow.
 
 ## Roadmap
 

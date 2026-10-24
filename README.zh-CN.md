@@ -17,6 +17,8 @@ pip install forkreduce
 
 Temporal 适配器是可选依赖：`pip install "forkreduce[temporal]"`。核心包不会导入它。
 
+本 checkout 的源码版本是 **0.2.0**，修改版本元数据不等于发布。发布前安装本 checkout 请使用 `pip install -e .` 或 `pip install -e ".[temporal]"`；上面的命令安装 PyPI 当前已发布版本。
+
 ## 快速开始
 
 对同一份文档提两个问题（map），再把回答合并为保留来源的摘要（reduce）。这个示例会调用真实模型；请先配置 OpenAI 兼容接口的环境变量：
@@ -589,7 +591,7 @@ async with Worker(
 
 Temporal 默认 converter 和 `PydanticAIPlugin` 安装的 `PydanticAIPayloadConverter` 均有离线 workflow/replay 覆盖。forkreduce 的逐查询 activity 可以与官方 `TemporalDurability` agent 在同一 worker 共存；照常登记其 agent/workflow，不要再给这些 activity 外包一层模型重试循环。使用官方集成时安装 Pydantic AI 的 `[temporal]` extra。默认 converter 的 worker 请设置 `workflow_runner=SandboxedWorkflowRunner(restrictions=SandboxRestrictions.default.with_passthrough_modules("forkreduce", "pydantic_ai"))`；两个类都来自 `temporalio.worker.workflow_sandbox`，避免在沙箱重新导入模型依赖。
 
-设置 heartbeat timeout 后，等待模型期间定期发送心跳；这是存活信号，不代表业务进度。阻塞事件循环也会阻塞心跳：CPU 工作放线程或独立 activity，并保留有限 start-to-close。LocalExecutor 不使用这些选项；它们不改变前缀字节/哈希。
+设置 heartbeat timeout 后，单个定期心跳协程覆盖整个异步 query activity：前缀及续问历史读取、异步 session factory 构建、模型 await、transcript/output 写入。仅在 activity 完成、失败或取消时结束，慢存储不会在模型调用前后失去心跳保护。这是存活信号，不代表业务进度。阻塞事件循环仍会阻塞心跳：CPU 工作放线程或独立 activity，并保留有限 start-to-close。LocalExecutor 不使用这些选项；它们不改变前缀字节/哈希。
 
 登记仅对本进程有效。payload 只带哈希、问题尾巴、输出类型名、选项和可选单题 `model_settings`，不带模型实例或 Python 类。相同前缀登记不同模型/请求体设置/profile/policy 会抛出 `ForkReduceError`，替换前先 unregister。`timeout`/`extra_headers` 仍不计入指纹；设置必须能 JSON 序列化。`activity_id(prefix_hash, query_id)` 仍是 `forkreduce:{prefix_hash}:{query_id}`。单工作流内联续问仍可把前次 `messages_json` 传入 `history_json`。
 
@@ -700,6 +702,12 @@ OPENAI_API_KEY=... OPENAI_MODEL=... OPENAI_BASE_URL=... python examples/run_live
 
 模型名也可以用环境变量 `FORKREDUCE_MODEL`。
 
+## 升级到 0.2.0
+
+- 新默认 `output_mode="auto"` 在有效 profile 支持强制输出时保留旧 tools hash。强制调用不可用（包括 thinking 限制）时现在解析为 prompted，原先依赖 tools 默认值的用户会得到新 hash、旧缓存失效。schema/instructions 不变时显式 tools/prompted 的 hash 稳定；采用新引用 schema/instructions 也会改变 hash。完整兼容说明见 [Upgrade notes](CHANGELOG.md#upgrade-notes)。
+- 切换 Temporal worker/converter 前，停止向旧队列提交新任务，让旧 worker 完成全部在途 workflow、child 和 activity，再一起切换 client/worker。引用对象保留到重试/续问生命周期结束。无法排空时，旧执行继续隔离在兼容队列/worker version，0.2.0 使用新队列或 worker version；迁移既有执行前重放代表性历史。
+- 默认 converter 的 worker 和 Replayer 需使用 [Temporal 配方](#temporal可选) 中的 sandbox `workflow_runner` passthrough 配置；分批时同时登记 map/batch workflow。心跳现在也覆盖慢异步 store/factory，不代表可以阻塞事件循环执行 CPU 工作。
+
 ## 发布
 
 PyPI 由 git tag 触发。`.github/workflows/release.yml` 构建 sdist 和 wheel，检查后通过 [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) 上传。仓库里没有 PyPI token。发布者是 `426ai/forkreduce` 上名为 `pypi` 的环境，工作流文件是 `release.yml`。
@@ -713,7 +721,7 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-tag 是 `v` 加上版本号：`0.1.0` 对应 `v0.1.0`。两者不一致时工作流失败。也可以在 Actions 里手动运行 Release，但只能选一个已经存在的 `v*` tag。
+tag 是 `v` 加上版本号：`0.2.0` 对应 `v0.2.0`。两者不一致时工作流失败。也可以在 Actions 里手动运行 Release，但只能选一个已经存在的 `v*` tag。仅做发版准备时，不得创建 tag 或运行该发布工作流。
 
 ## 路线图
 

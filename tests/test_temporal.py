@@ -44,7 +44,6 @@ def test_core_import_does_not_load_temporalio() -> None:
         "import sys\n"
         "import forkreduce\n"
         "assert not any(name == 'temporalio' or name.startswith('temporalio.') for name in sys.modules)\n"
-        "assert forkreduce.__version__ == '0.1.1'\n"
     )
     env = os.environ.copy()
     env["PYDANTIC_AI_NO_BANNER"] = "1"
