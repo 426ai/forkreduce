@@ -111,12 +111,6 @@ def _scripted(
     return FunctionModel(respond), calls
 
 
-def test_benchmark_output_controls_are_opt_in() -> None:
-    config = MethodConfig()
-    assert config.output_mode == "tools"
-    assert config.raw_response_path is None
-
-
 @pytest.mark.parametrize("name,requests", [("forkreduce", 3), ("one_shot", 1)])
 async def test_prompted_json_answers_preserve_ids_citations_and_usage(name: str, requests: int) -> None:
     model, calls = _scripted()

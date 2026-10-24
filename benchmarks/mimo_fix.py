@@ -10,20 +10,19 @@ import asyncio
 import hashlib
 import json
 import os
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from pydantic_ai import models
-from pydantic_ai.profiles.openai import OpenAIModelProfile
 
-from benchmarks.budget import BudgetHalted, BudgetLedger, BudgetModel
+from benchmarks.budget import BudgetHalted, BudgetLedger
 from benchmarks.data import select_questions
 from benchmarks.estimate import price_usage
-from benchmarks.live_smoke import MODEL_SPECS, _model, rates_for, selected_contracts
+from benchmarks.live_smoke import _model, method_config, output_mode_metadata, rates_for, selected_contracts
 from benchmarks.methods import METHODS
 from benchmarks.metrics import score, summarize_usage
-from benchmarks.providers import provider_model
+from benchmarks.profiles import model_profile, output_mode_decision
 from benchmarks.schema import MethodConfig
 
 
@@ -46,27 +45,9 @@ async def run(args: argparse.Namespace) -> None:
         raw_response_path=str(args.output_dir / f"{args.label}-failures.jsonl") if args.capture_failures else None,
     )
     configs = {
-        method: replace(
-            config,
-            **(MODEL_SPECS[args.model].get("method_configs", {}).get(method, {}) if args.recommended else {}),
-        )
-        for method in args.methods
+        method: method_config(args.model, method, config) if args.recommended else config for method in args.methods
     }
-    if args.model == "deepseek-flash":
-        if args.tool_choice_auto:
-            raise ValueError("deepseek_comparison_uses_its_required_capability_profile")
-        model = _model(
-            args.model, ledger, max_output_tokens=max(current.max_output_tokens for current in configs.values())
-        )
-    else:
-        profile = OpenAIModelProfile(supports_forced_tool_choice=False) if args.tool_choice_auto else None
-        model = BudgetModel(
-            provider_model("openai", args.model, settings={"timeout": 120}, profile=profile),
-            ledger,
-            rates=rates_for(args.model),
-            max_output_tokens=max(current.max_output_tokens for current in configs.values()),
-            label=args.model,
-        )
+    model = _model(args.model, ledger, max_output_tokens=max(current.max_output_tokens for current in configs.values()))
     path = args.output_dir / "runs.jsonl"
     contracts = selected_contracts(args.cache_dir)
     if len(contracts) != 2:
@@ -92,7 +73,16 @@ async def run(args: argparse.Namespace) -> None:
                     "method": method,
                     "n": 5,
                     "config": asdict(config),
-                    "provider_settings": {"timeout": 120, "tool_choice_auto": args.tool_choice_auto},
+                    "output_mode_resolution": (
+                        output_mode_metadata(args.model, method, config)
+                        if args.recommended
+                        else {
+                            **output_mode_decision(model_profile(args.model)),
+                            "output_mode": config.output_mode,
+                            "source": "cli",
+                        }
+                    ),
+                    "provider_settings": {"timeout": 120},
                     "recommended_preset": args.recommended,
                     "answers": result.answers.model_dump(),
                     "failures": result.failures,
@@ -143,7 +133,6 @@ def main() -> None:
     parser.add_argument("--max-output-tokens", type=int, default=2048)
     parser.add_argument("--output-mode", choices=("tools", "prompted"), default="tools")
     parser.add_argument("--retries", type=int, default=1)
-    parser.add_argument("--tool-choice-auto", action="store_true")
     parser.add_argument("--capture-failures", action="store_true")
     parser.add_argument("--resume-after-correction", metavar="REASON_CODE")
     parser.add_argument("--output-dir", type=Path, default=Path("benchmarks/results/mimo-fix"))

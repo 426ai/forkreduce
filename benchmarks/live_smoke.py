@@ -24,6 +24,7 @@ from benchmarks.data import DEFAULT_SEED, load_contracts, sample_contracts, sele
 from benchmarks.estimate import count_tokens, price_usage
 from benchmarks.methods import METHODS, _code
 from benchmarks.metrics import score, summarize_usage
+from benchmarks.profiles import model_profile, output_mode_decision, profile_output_mode
 from benchmarks.providers import RecordingModel, provider_model
 from benchmarks.reporting import summarize_rows, write_reports
 from benchmarks.schema import Answers, MethodConfig, MethodResult
@@ -34,7 +35,11 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "api": "chat",
         "rates": (0.30, 0.006, 1.20),
         "source": "https://api-docs.deepseek.com/quick_start/pricing",
-        "method_configs": {"forkreduce": {"max_output_tokens": 8192}},
+        # Preserve measured tools runs; profile-derived prompted is a future paid-run decision.
+        "method_configs": {
+            "forkreduce": {"output_mode": "tools", "max_output_tokens": 8192},
+            "one_shot": {"output_mode": "tools"},
+        },
     },
     "gpt-6.1-sol": {
         "api": "responses",
@@ -53,12 +58,33 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "rates": (0.435, 0.0036, 0.87),
         "source": "https://mimo.mi.com/docs/en-US/pricing",
         "method_configs": {
-            "forkreduce": {"output_mode": "prompted", "max_output_tokens": 8192},
-            "one_shot": {"max_output_tokens": 8192},
+            "forkreduce": {"max_output_tokens": 8192},
+            # Do not silently change the previously measured one-shot method.
+            "one_shot": {"output_mode": "tools", "max_output_tokens": 8192},
         },
     },
 }
 CONFIG = MethodConfig(concurrency=1, max_output_tokens=2048)
+
+
+def method_config(name: str, method: str, base: MethodConfig = CONFIG) -> MethodConfig:
+    """Use profile capabilities unless the measured method has an explicit override."""
+    mode = "tools" if method == "tool_agent" else profile_output_mode(model_profile(name))
+    return replace(
+        base,
+        **{"output_mode": mode, **MODEL_SPECS[name].get("method_configs", {}).get(method, {})},
+    )
+
+
+def output_mode_metadata(name: str, method: str, config: MethodConfig) -> dict[str, Any]:
+    overrides = MODEL_SPECS[name].get("method_configs", {}).get(method, {})
+    return {
+        **output_mode_decision(model_profile(name)),
+        "output_mode": config.output_mode,
+        "source": "method_configs"
+        if "output_mode" in overrides
+        else ("tool_agent" if method == "tool_agent" else "profile"),
+    }
 
 
 def rates_for(name: str) -> dict[str, Any]:
@@ -100,21 +126,7 @@ def _model(name: str, ledger: Any, *, sticky: bool = True, max_output_tokens: in
     from benchmarks.budget import BudgetModel
 
     settings: dict[str, Any] = {"timeout": 120}
-    profile = None
-    if name == "deepseek-flash":
-        # A setting of auto alone still becomes required for ToolOutput in the
-        # SDK. Advertise the actual capability; keep reasoning and validation.
-        from pydantic_ai.profiles.openai import OpenAIModelProfile
-
-        profile = OpenAIModelProfile(
-            supports_thinking=True,
-            thinking_enabled_by_default=True,
-            supports_forced_tool_choice=False,
-            openai_chat_thinking_field="reasoning_content",
-            openai_chat_send_back_thinking_parts="field",
-            openai_chat_thinking_requires_field_on_tool_calls=True,
-            openai_chat_supports_max_completion_tokens=False,
-        )
+    profile = model_profile(name)
     if MODEL_SPECS[name]["api"] == "responses":
         settings.update(openai_prompt_cache_key=f"cuad-smoke-{name}", openai_store=False)
     if name == "grok-4.7" and sticky:
@@ -186,6 +198,11 @@ async def availability(directory: Path, ledger: Any, names: list[str]) -> None:
                 "requested_model": MODEL_SPECS[name].get("requested_model", name),
                 "attempt": 1 + sum(r["model"] == name and r["case"] == case for r in previous),
                 "api": MODEL_SPECS[name]["api"],
+                "output_mode_resolution": {
+                    **output_mode_decision(model_profile(name)),
+                    "output_mode": "tools",
+                    "source": "availability_probe",
+                },
                 "case": case,
                 "sticky_header": name == "grok-4.7" and sticky,
                 "prefix_proxy_tokens": prefix_tokens if text else 0,
@@ -223,6 +240,16 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
         "n": 5,
         "config": asdict(CONFIG),
         "models": MODEL_SPECS,
+        "resolved_methods": {
+            name: {
+                method: {
+                    "config": asdict(method_config(name, method)),
+                    "output_mode_resolution": output_mode_metadata(name, method, method_config(name, method)),
+                }
+                for method in METHODS
+            }
+            for name in MODEL_SPECS
+        },
         "contracts": [
             {
                 "id": c.id,
@@ -239,9 +266,7 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
         raise ValueError("smoke_workload_changed")
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
     for name in names:
-        configs = {
-            method: replace(CONFIG, **MODEL_SPECS[name].get("method_configs", {}).get(method, {})) for method in METHODS
-        }
+        configs = {method: method_config(name, method) for method in METHODS}
         model = _model(name, ledger, max_output_tokens=max(config.max_output_tokens for config in configs.values()))
         jobs = [(contract, method) for contract in contracts for method in METHODS]
         random.Random(DEFAULT_SEED).shuffle(jobs)
@@ -270,6 +295,7 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
                 "sent_requests": sent,
                 "execution_status": "executed" if sent else "not_executed",
                 "config": asdict(config),
+                "output_mode_resolution": output_mode_metadata(name, method, config),
                 "metrics": score(contract, questions, result.answers),
                 "usage": usage,
                 "provider_usage": result.usage,
@@ -313,10 +339,9 @@ async def run(args: argparse.Namespace) -> None:
     # Secrets are read only at runtime and never persisted in any manifest.
     if not os.environ.get("OPENAI_BASE_URL"):
         raise ValueError("smoke_base_url_missing")
-    key = os.environ.get("PROXY_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    key = os.environ.get("PROXY_API_KEY")
     if not key:
-        key_file = Path(os.environ.get("PROXY_API_KEY_FILE", "~/.config/proxy_key")).expanduser()
-        key = key_file.read_text().strip()
+        key = Path("/home/box/.config/proxy_key").read_text().strip()
     os.environ["OPENAI_API_KEY"] = key
     from benchmarks.budget import BudgetLedger
 

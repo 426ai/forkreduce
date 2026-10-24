@@ -224,8 +224,8 @@ FORKREDUCE_BENCH_ALLOW_PAID=1 python -m benchmarks.live_smoke cuad --approve-pai
 
 Set `OPENAI_BASE_URL` to the explicitly approved endpoint before running; the
 repository contains no operator-specific relay URL. Runtime credentials come
-from `PROXY_API_KEY`, then `OPENAI_API_KEY`, then `PROXY_API_KEY_FILE` (default
-`~/.config/proxy_key`); neither the key nor SDK exception bodies are logged.
+only from `PROXY_API_KEY` or `/home/box/.config/proxy_key`; neither the key nor
+SDK exception bodies are logged.
 Results and the shared `budget.json` ledger live in ignored
 `benchmarks/results/models-smoke/`.
 Keep both phases in the **same directory**. Never run simultaneous processes
@@ -243,13 +243,30 @@ GPT-6.1-Sol and GPT-6-Luna use Responses and an explicit cache key; unavailable
 compared no header with stable `x-grok-conv-id`; future Grok calls are now refused
 by the budget guard, for the reason below. DeepSeek and MiMo use chat.
 Both APIs' cached-token counters are normalized before validation and repair.
-DeepSeek thinking rejects forced tool choice. Its benchmark capability profile
-uses automatic tool choice and preserves `reasoning_content` across tool turns;
-the same Answers schema, question-ID and citation validators still apply.
-Setting `tool_choice="auto"` alone is insufficient because Pydantic AI resolves
-tool-only outputs to required unless the profile declares forcing unsupported.
-Its Chat profile sends the documented `max_tokens` field, not the OpenAI-specific
-`max_completion_tokens` alias.
+Benchmark-only profiles in `profiles.py` describe provider capabilities without
+changing `src/forkreduce` or its public defaults. `model_profile` uses the upstream
+DeepSeek provider profile (`deepseek-v4-flash` for the proxy alias) with only the
+Chat `max_tokens` compatibility override; reasoning-content handling stays upstream.
+`profile_output_mode` derives structured-output defaults from those capabilities
+and thinking state; `output_mode_decision` records the decision. DeepSeek's
+thinking restriction means forced tool choice is unavailable for these requests,
+so its profile-derived mode is prompted. Explicit forkreduce/one-shot overrides
+and the retrieval adapter's tools-only rule preserve tools for all three DeepSeek
+methods. Setting `tool_choice="auto"` alone is not enough: the profile must tell
+Pydantic AI when forced tool choice is unsupported.
+
+MiMo's profile likewise disables forced tool choice. Its official
+[Chat](https://mimo.mi.com/docs/api/chat/openai-api) and
+[Responses](https://mimo.mi.com/docs/en-US/api/chat/responses) APIs remove non-auto
+`tool_choice` values and treat them as auto; this is an API design constraint,
+not evidence of a proxy fault. MiMo tools requests now send `auto` instead of
+`required`, so request bytes are **not identical**. Thinking forces temperature /
+top_p to 1.0 / 0.95: the requested temperature 0 is ineffective. Its
+[FAQ](https://mimo.mi.com/docs/en-US/quick-start/faq/api-integration) also warns of
+thinking/tool instability. Analogous constraints in
+[DeepSeek #1376](https://github.com/deepseek-ai/DeepSeek-V3/issues/1376) and
+[Pydantic AI #7450](https://github.com/pydantic/pydantic-ai/pull/7450) are
+model/mode/API-specific, not a universal reasoning-model rule.
 
 The request wrapper reserves a conservative no-cache input byte/framing bound
 plus a **total billable output bound before every request**, including warmup,
@@ -284,14 +301,20 @@ input, not silently treated as free writes. The pinned prices/sources are in
 
 Methods request temperature 0 (reasoning providers may ignore it; SDK warnings
 are not suppressed), identical schema and retry/repair limits, and fork concurrency 1.
-The original smoke used a 2,048 output cap everywhere. The MiMo fix adds explicit
-`MODEL_SPECS["mimo-v2.6-pro"]["method_configs"]` overrides: prompted forkreduce
-with 8,192 output tokens and tools one-shot with 8,192. DeepSeek forkreduce also
-uses 8,192 after the compatibility run exposed reasoning-only truncation at 2,048;
-its tools mode and absolute billable-output reservation are unchanged. Other
-model/method settings remain original. The manifest records these differences; use a new
-output directory rather than rewriting an old workload manifest. Do not treat
-different output budgets as a controlled quality comparison. Short-document
+The original smoke used a 2,048 output cap everywhere. Profile-derived defaults
+are resolved before explicit `MODEL_SPECS[*]["method_configs"]` overrides.
+MiMo forkreduce remains prompted with 8,192 output tokens; one-shot remains an
+**explicit tools override** with 8,192, pending validation of the new profile in
+the next separately approved paid run. DeepSeek forkreduce retains 8,192 after
+reasoning-only truncation at 2,048; its forkreduce/one-shot overrides retain tools
+despite the profile-derived prompted mode, and tool_agent remains tools-only.
+Its absolute billable-output reservation is unchanged. Other modes and caps remain unchanged.
+`workload.json` records `resolved_methods`; run rows record `output_mode_resolution`,
+including profile fields, thinking state, forced-choice availability, profile-derived
+mode, effective mode and decision source. These are configuration decisions, not
+new provider measurements. Use a new output directory rather than rewriting an
+old workload manifest. Do not treat different output budgets as a controlled
+quality comparison. Short-document
 selection remains the two shortest contracts with 2,000–7,999 proxy tokens in
 the prior seeded 20-contract sample; it does not inspect gold labels. This is pipeline/cache evidence, not a
 representative accuracy estimate. Per-model reports avoid pooling model scores;
@@ -302,10 +325,13 @@ not fabricated zero-cost model results or ordinary failed model generations.
 
 ## MiMo failure diagnosis
 
-`MethodConfig.output_mode` selects `"tools"` (default) or `"prompted"` for
-forkreduce and one-shot. Prompted mode uses the same `Answers` schema, question-ID,
-provenance, and citation validation; it is not a permissive JSON fallback.
-The retrieval `tool_agent` requires tools and rejects prompted mode before sending.
+`MethodConfig.output_mode` selects `"tools"` (default) or `"prompted"`. The live
+smoke's `method_config` resolver derives the mode from the profile before applying
+explicit method overrides; the diagnostic CLI uses that resolver with `--recommended`,
+otherwise retaining its explicit `--output-mode` selection. Forkreduce and one-shot
+prompted mode use the same `Answers` schema, question-ID, provenance, and citation
+validation; it is not a permissive JSON fallback. The retrieval `tool_agent`
+requires tools and rejects explicit prompted mode before sending.
 
 Set `MethodConfig.raw_response_path` to opt into **failure-only** JSONL capture,
 including failures recovered by retries or citation repair. Each complete record
@@ -346,7 +372,15 @@ question-ID to `fork:N` provenance mapping; it must replace inherited document o
 block IDs, not append them. Citation field descriptions and shared instructions
 explicitly require the entire verbatim quote to occur in the cited block, not just
 elsewhere in the contract; split quotes at block boundaries. Validation itself is
-unchanged. To repeat the chosen configuration through the diagnostic task ledger:
+unchanged.
+
+The obsolete `--tool-choice-auto` diagnostic flag is removed: tool-choice
+capabilities now come from the shared profile, including for non-recommended runs.
+Offline MockTransport coverage compares previous/current request bytes and checks
+reasoning-content replay. MiMo also adds empty `reasoning_content` when replaying
+a tool-call turn without thinking; this is an additional history-dependent wire change.
+
+To repeat the chosen configuration through the diagnostic task ledger:
 
 ```sh
 python -m benchmarks.mimo_fix --approve-paid-smoke --label confirm \
