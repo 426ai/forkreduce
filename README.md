@@ -684,6 +684,8 @@ for result in results:
 
 `on_query_failure="raise"` remains the default, including legacy list inputs. `"return"` preserves input order and returns mixed successes/failures in `QueryActivityOutput`; failures have `failure_kind`, a bounded payload-free `failure_message`, and `attempts`, without transcript/output bodies or references. Terminal retryable failures map to `retryable_exhausted`, non-retryable errors to `permanent` or `budget`, and Temporal timeout/cancellation to `timeout`/`cancelled`. Workflow cancellation always propagates. Attempts count observed activity attempts; `0` means the SDK failure supplied no attempt metadata (for example a timeout before execution), not a guessed retry limit.
 
+For failed records, `attempts` counts Temporal activity attempts. Successful records retain the existing `Session.run_once` per-attempt count; this option does not redefine successful result fields.
+
 Factory lookup prefers an explicitly registered session, then the exact prefix factory, then `set_default_session_factory`; pass `None` to clear the default. Missing factories raise retryable `session_factory_missing`, bounded by the configured retry policy, so repaired worker configuration can succeed on a later attempt. Corrupt snapshots and reconstruction/hash mismatches remain non-retryable.
 
 `freeze_prefix(..., app_meta=...)` copies JSON metadata into `FrozenPrefix.app_meta` (legacy snapshots default to `{}`). It is limited to **16 KiB of compact UTF-8 JSON** and excluded from prefix hash, identity and execution fingerprint. Put only routing/schema identifiers here, **never secrets or document/body text**. Factories receive the complete snapshot.

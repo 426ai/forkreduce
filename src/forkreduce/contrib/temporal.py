@@ -665,7 +665,7 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
         output_json=output_json,
         output_type=output_name,
         cache_hit_tokens=result.cache_hit_tokens,
-        attempts=activity.info().attempt if activity.in_activity() else result.attempts,
+        attempts=result.attempts,
         messages_ref=messages_ref,
         messages_json=messages_json,
         output_ref=output_ref,

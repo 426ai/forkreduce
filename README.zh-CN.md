@@ -684,6 +684,8 @@ for result in results:
 
 `on_query_failure="raise"` 仍是默认，旧 list 调用不变。`"return"` 保持输入顺序，成功/失败都用 `QueryActivityOutput`：失败带 `failure_kind`、有界且不含载荷原文的 `failure_message` 和 `attempts`，不带 transcript/output 正文或引用。可重试错误耗尽映射为 `retryable_exhausted`，不可重试错误为 `permanent` 或 `budget`，Temporal 超时/取消为 `timeout`/`cancelled`；workflow 自身取消始终向上传播。attempts 记录已观察到的 activity 尝试数；`0` 表示 SDK 错误没有提供次数信息（例如执行前超时），不是猜测配置上限。
 
+失败记录的 `attempts` 统计 Temporal activity 尝试次数；成功记录仍保留原有 `Session.run_once` 的单次执行计数，本选项不重新定义成功结果字段。
+
 查找顺序为显式登记的 session、prefix 精确 factory、`set_default_session_factory`；传 `None` 清除默认 factory。都缺失时抛可重试 `session_factory_missing`，仍受已配置重试预算约束，worker 补齐配置后可在后续 attempt 成功。快照损坏、重建/hash 不一致仍不可重试。
 
 `freeze_prefix(..., app_meta=...)` 将 JSON 元数据复制进 `FrozenPrefix.app_meta`（旧快照默认 `{}`），限制为 **16 KiB compact UTF-8 JSON**，不参与 prefix hash、identity 或 execution fingerprint。仅放路由/schema 标识，**不要放密钥、正文或文档载荷**；factory 获得完整快照。

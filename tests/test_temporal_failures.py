@@ -118,7 +118,7 @@ async def test_return_mixed_query_failures_and_replay(plugin: bool, batch_size: 
                 )
                 results = await asyncio.wait_for(handle.result(), 30)
                 assert [result.query_id for result in results] == list(seen)
-                assert [result.attempts for result in results] == [2, 1, 4]
+                assert [result.attempts for result in results if result.failure_kind is not None] == [1, 4]
                 assert [result.failure_kind for result in results] == [None, "permanent", "retryable_exhausted"]
                 assert seen == {"success": [1, 2], "permanent": [1], "exhausted": [1, 2, 3, 4]}
                 success, permanent, exhausted = results
