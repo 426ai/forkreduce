@@ -277,18 +277,12 @@ def output_for(query):  # type: ignore[no-untyped-def]
     )
 
 
-def test_child_ids_are_stable_and_scoped_to_parent_execution(monkeypatch):  # type: ignore[no-untyped-def]
-    info = SimpleNamespace(workflow_id="parent-a", run_id="run-a")
-    monkeypatch.setattr(adapter.workflow, "info", lambda: info)
-    first = adapter.child_workflow_id("prefix", 0)
-    assert adapter.child_workflow_id("prefix", 0) == first
-    assert adapter.child_workflow_id("prefix", 1) != first
-    assert adapter.child_workflow_id("other-prefix", 0) != first
-    info.run_id = "run-b"
-    assert adapter.child_workflow_id("prefix", 0) == first
-    info.run_id = "run-a"
-    info.workflow_id = "parent-b"
-    assert adapter.child_workflow_id("prefix", 0) != first
+def test_child_ids_are_stable_and_scoped_to_parent_execution() -> None:
+    first = adapter.batch_child_id("parent-a", "prefix", 0)
+    assert adapter.batch_child_id("parent-a", "prefix", 0) == first
+    assert adapter.batch_child_id("parent-a", "prefix", 1) != first
+    assert adapter.batch_child_id("parent-a", "other-prefix", 0) != first
+    assert adapter.batch_child_id("parent-b", "prefix", 0) != first
 
 
 @pytest.mark.asyncio

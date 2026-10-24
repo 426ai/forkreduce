@@ -621,12 +621,59 @@ Batch mode requires a `MessageStore` and returns `messages_ref` plus `output_ref
 
 `warmup="first"` completes the first query before releasing any others. In batched mode, the parent awaits a singleton child at batch index zero, then schedules remaining batches from index one. `warmup="per_batch"` completes each batch's first query before releasing its remaining queries; a direct map is one batch. A returned query/child failure also opens the gate; raise mode still propagates failure and workflow cancellation always propagates. Warmup preserves result order and deterministic IDs but cannot guarantee provider cache hits. These orchestration settings do not change prefix hashes or session execution fingerprints.
 
+#### Composable workflows and per-query hooks
+
+Public helpers in `forkreduce.contrib.temporal` are usable from application workflows:
+
+| API | Contract |
+| --- | --- |
+| `plan_batches(queries, batch_size)` | Ordered copied batch lists; does not mutate input. |
+| `batch_child_id(parent_id, prefix_hash, index)` | Pure deterministic child ID; same algorithm as the built-in map. |
+| `require_query_references(query)` | Copies a query into reference-only mode and rejects inline history. |
+| `validate_query_references(output)` | Checks a successful result has transcript/output references; safe failure records are exempt. |
+| `query_failure(query, error)` | Safe `ActivityError` / `ChildWorkflowError` mapping, without exception text. |
+| `await execute_query(query, options=None, *, on_query_failure="raise", task_queue=None, require_references=False, activity_name="forkreduce.run_query")` | Schedules the query activity, derives retries, and applies the requested failure policy. |
+
+For example, an application can choose a serial batch policy while reusing the same reference/failure contract:
+
+```python
+from temporalio import workflow
+from forkreduce.contrib.temporal import (
+    MapQueriesInput, QueryActivityOutput, execute_query, validate_query_references,
+)
+
+@workflow.defn(name="app.batch")
+class AppBatch:
+    @workflow.run
+    async def run(self, config: MapQueriesInput) -> list[QueryActivityOutput]:
+        results = []
+        for query in config.queries:
+            result = await execute_query(
+                query, config.activity_options, on_query_failure=config.on_query_failure,
+                task_queue=config.task_queue, require_references=True,
+            )
+            validate_query_references(result)
+            results.append(result)
+        return results
+```
+
+Register this class and select `MapQueriesInput(batch_workflow="app.batch", ...)`. Custom batches accept `MapQueriesInput` and return an ordered `list[QueryActivityOutput]` with successful reference-only outputs. They own their scheduling, hook handling, and cancellation semantics; the built-in options are input data, not automatic behavior inside arbitrary application workflows.
+
+For the built-in per-question pipeline, set `after_query_activity="app.review"`, `after_query_options=ActivityOptions(...)`, and `max_rounds=1`. The named activity receives `AfterQueryInput(query, output, round, batch_index, parent_workflow_id, meta)` immediately after that question's activity, including returned failures, without waiting for other questions. Hooked queries require shared reference storage even in direct mode. A concurrency slot spans the entire initial-answer → hook → repair → hook pipeline.
+
+Return `AfterQueryDecision(action="done"|"failed"|"follow_up", follow_up_tail=None, follow_up_query=None, result_meta=None)`. A follow-up tail continues from the previous `messages_ref`; a replacement query must keep the prefix hash. IDs become `original_id#r{round}` and round increments automatically. `max_rounds` is the maximum **inclusive round index**: initial round zero, default one permits one repair. A failed decision or another follow-up at the cap becomes `permanent` / `after_query_failed`, not an unapproved success. The last non-None `result_meta` is JSON-copied unchanged into the final result, replaces rather than merges previous metadata, and must fit 16 KiB compact UTF-8 JSON.
+
+Hook activity errors propagate in raise mode; return mode produces `unknown` / synthetic `after_query_failed`. The complete synthetic failure-type additions are `batch_failed` and `after_query_failed`; neither is an arbitrary raw application-type passthrough. Hook retry/timeouts use their own options (default one attempt, five minutes) on the configured queue. Parent cancellation always propagates. These hooks/round limits do not change prefix hashes or default execution behavior.
+
+Stores must return immutable references: writing new bytes under a reused logical key must not change earlier results or continuation history. The SQLite recipe below uses a content digest in the reference and insert-only writes; identical bytes may reuse a reference. Keep content-addressed references private if equality disclosure is sensitive; a production store may instead allocate opaque unique references.
+
 #### Worker-restart-safe integration
 
 This runnable storage implementation persists across local worker restarts. Use a shared object store/database for distributed workers; every worker must resolve the same references. Application credentials and output classes remain local. `model`, `session`, `Answer`, `questions`, and `client` below are the application objects from the recipe above.
 
 ```python
 import asyncio
+import hashlib
 import sqlite3
 from pathlib import Path
 from forkreduce.contrib.temporal import (
@@ -645,9 +692,10 @@ class DurableStore:
             return db.execute(sql, args).fetchone()
 
     async def put(self, key: str, payload: bytes, *, context: StoreContext) -> str:
-        # Framework-generated keys already include the escaped namespace prefix.
-        await asyncio.to_thread(self.execute, "INSERT OR REPLACE INTO blobs VALUES (?, ?)", (key, payload))
-        return key
+        # Logical keys already include namespace; refs also identify immutable bytes.
+        ref = f"{key}:{hashlib.sha256(payload).hexdigest()}"
+        await asyncio.to_thread(self.execute, "INSERT OR IGNORE INTO blobs VALUES (?, ?)", (ref, payload))
+        return ref
 
     async def get(self, ref: str, *, context: StoreContext) -> bytes:
         row = await asyncio.to_thread(self.execute, "SELECT body FROM blobs WHERE ref = ?", (ref,))

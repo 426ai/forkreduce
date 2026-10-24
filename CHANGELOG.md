@@ -4,6 +4,8 @@
 
 ### Added
 
+- Public workflow primitives `plan_batches`, `batch_child_id`, `require_query_references`, `validate_query_references`, `query_failure`, and `execute_query` support application-owned orchestration. Built-in pipelines add `AfterQueryInput` / `AfterQueryDecision`, per-query `after_query_activity` with independent options, bounded repair rounds, safe `after_query_failed` records, and small copied `result_meta`. `batch_workflow` selects an application batch with the same input/output contract. Defaults and hashes are unchanged; repair IDs append `#r{round}`.
+
 - `MapQueriesInput.activity_concurrency`, `task_queue`, and `warmup="none"|"first"|"per_batch"` control direct/per-child query concurrency, child/activity queue routing, and deterministic warmup gates. A first returned failure releases warmup; raise/cancellation propagation remains unchanged. Default settings preserve fan-out/queue behavior and do not change prefix hashes or session execution fingerprints.
 
 - Bounded same-branch output feedback via `Policy(output_feedback_retries=0)` and worker-local `build(output_validator=...)` sync/async callbacks raising `ModelRetry`. Schema/cross-field errors share native Pydantic AI retry semantics; every actual request is budgeted. Results expose `feedback_retries_used` and matching metadata; frozen snapshots preserve the numeric setting, not callbacks. Default zero retains old request behavior and hashes; opt-in feedback/validators change execution fingerprints, not prefix hashes.
@@ -23,6 +25,8 @@
 - Frozen `StoreContext`, context-aware store signatures alongside legacy put/get, namespace-prefixed generated keys, and explicit application-owned `delete_ref`. English/Chinese recipes combine durable storage, default factories, metadata and partial-failure returns.
 
 ### Changed
+
+- Store contracts require immutable returned references. Both SQLite README stores now use content-addressed, insert-only references rather than overwriting a reused logical key; tests retain earlier transcript bytes across rewrites and independent deletion. This fixes the outstanding immutable-reference review finding without changing framework key/hash identity.
 
 - Base dependency is now `pydantic-ai-slim>=2.57,<3`; `[openai]` installs its OpenAI support and `[full]` restores the complete `pydantic-ai` provider bundle. HTTPX is an explicit dependency for the existing transport API. CI covers slim/OpenAI/Temporal and full installations. Core imports do not require a provider SDK; calling the OpenAI helper without its extra raises an actionable `ImportError`. No hash or default execution change.
 
@@ -54,6 +58,8 @@ Public `QueryFailureKind` is exported from `forkreduce.contrib.temporal` as a `L
 | `unknown` | Ambiguous terminal application/SDK failure or failed child batch. |
 
 ### Upgrade notes
+
+- **Per-query hooks:** register the named hook on the selected queue and retain referenced histories through all repairs. `max_rounds` is an inclusive round index (initial zero); reaching the cap while still requesting repair yields a failed record. Hooked direct queries also require reference storage. Hook retries are independent of model retries; custom batches own their implementation of hook/concurrency/cancellation semantics. The additional synthetic failure type is `after_query_failed`; raw application types remain whitelisted separately.
 
 - **Scheduling:** workers on an explicit `task_queue` must register child workflows and activities there. `activity_concurrency` is per batch, not a global distributed semaphore. First warmup uses a singleton first child when batching; changing orchestration for existing executions requires draining/versioning and replay as described below.
 

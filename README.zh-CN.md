@@ -621,12 +621,59 @@ Temporal 默认 converter 和 `PydanticAIPlugin` 安装的 `PydanticAIPayloadCon
 
 `warmup="first"` 先完整完成第一题再放开其余题；分批时父 workflow 先等待 batch index zero 的单题 child，后续批从 index one 调度。`warmup="per_batch"` 各批先完成本批第一题，直接 map 视作一批。return 模式的失败结果也会打开预热门，raise 模式仍向上抛错，workflow 取消始终传播。结果顺序及 ID 确定性不变；预热不保证供应商缓存命中。这些编排选项不改变 prefix hash 或 session execution fingerprint。
 
+#### 可组合 workflow 与每题钩子
+
+`forkreduce.contrib.temporal` 导出可供应用 workflow 直接组合的函数：
+
+| API | 契约 |
+| --- | --- |
+| `plan_batches(queries, batch_size)` | 按原顺序返回独立批列表，不修改输入。 |
+| `batch_child_id(parent_id, prefix_hash, index)` | 纯函数，使用内置 map 相同的确定性 child ID 算法。 |
+| `require_query_references(query)` | 复制 query 并强制引用模式，拒绝 inline history。 |
+| `validate_query_references(output)` | 检查成功结果的 transcript/output 引用；安全失败结果豁免。 |
+| `query_failure(query, error)` | 安全映射 ActivityError/ChildWorkflowError，不带异常原文。 |
+| `await execute_query(query, options=None, *, on_query_failure="raise", task_queue=None, require_references=False, activity_name="forkreduce.run_query")` | 调度 query activity，推导重试并应用失败策略。 |
+
+例如应用可自选串行批策略，同时复用引用与失败契约：
+
+```python
+from temporalio import workflow
+from forkreduce.contrib.temporal import (
+    MapQueriesInput, QueryActivityOutput, execute_query, validate_query_references,
+)
+
+@workflow.defn(name="app.batch")
+class AppBatch:
+    @workflow.run
+    async def run(self, config: MapQueriesInput) -> list[QueryActivityOutput]:
+        results = []
+        for query in config.queries:
+            result = await execute_query(
+                query, config.activity_options, on_query_failure=config.on_query_failure,
+                task_queue=config.task_queue, require_references=True,
+            )
+            validate_query_references(result)
+            results.append(result)
+        return results
+```
+
+注册该类后设 `MapQueriesInput(batch_workflow="app.batch", ...)`。自定义批接收 `MapQueriesInput`，返回与输入顺序一致的 `list[QueryActivityOutput]`，成功结果只带引用。任意应用 workflow 须自行实现调度、钩子与取消语义；内置选项只是输入数据，不会自动控制自定义代码。
+
+内置每题管线使用 `after_query_activity="app.review"`、`after_query_options=ActivityOptions(...)`、`max_rounds=1`。命名 activity 收到 `AfterQueryInput(query, output, round, batch_index, parent_workflow_id, meta)`，每题活动结束（包括 return 模式失败）后立即调用，不等整批。即使直接模式，启用钩子也要求共享引用存储。一个并发槽覆盖整条 初答→钩子→修复→钩子 管线。
+
+钩子返回 `AfterQueryDecision(action="done"|"failed"|"follow_up", follow_up_tail=None, follow_up_query=None, result_meta=None)`。follow-up 尾巴沿用上轮 `messages_ref`；替换 query 必须保持 prefix hash。ID 自动变为 `original_id#r{round}`，round 自增。`max_rounds` 是**包含上界的 round 序号**：初答为零，默认一允许一次修复。failed 决定或达到上限后仍要求 follow-up，会生成 `permanent` / `after_query_failed`，不会静默返回未经批准的成功。最后一个非 None 的 `result_meta` 经 JSON 复制后原样放入最终结果，替换而不合并历史 metadata，限制为 16 KiB compact UTF-8 JSON。
+
+钩子 activity 异常在 raise 模式传播，return 模式为 `unknown` / 合成 `after_query_failed`。完整合成 failure_type 为 `batch_failed`、`after_query_failed`，均不作为任意原始 application type 透传。钩子在配置队列上使用独立 ActivityOptions，默认一次尝试、五分钟。父取消始终传播。这些钩子/轮次配置不改变 prefix hash 或默认执行行为。
+
+store 返回的引用必须不可变：相同逻辑 key 写入新内容不能改变之前返回的结果或续问历史。下面 SQLite 示例把内容摘要放入 ref，使用只插入写入；同内容可复用引用。若内容相等性本身敏感，须保护内容寻址 ref，生产 store 也可改为不透明的唯一引用。
+
 #### Worker 重启安全的接入示例
 
 下面的 SQLite store 可跨本地 worker 重启保留引用；分布式 worker 应改用共享对象存储或数据库，确保每个 worker 都能读取同一引用。凭证和输出类始终留在应用进程内。`model`、`session`、`Answer`、`questions`、`client` 沿用上面的应用配置。
 
 ```python
 import asyncio
+import hashlib
 import sqlite3
 from pathlib import Path
 from forkreduce.contrib.temporal import (
@@ -645,9 +692,10 @@ class DurableStore:
             return db.execute(sql, args).fetchone()
 
     async def put(self, key: str, payload: bytes, *, context: StoreContext) -> str:
-        # 框架生成的 key 已包含转义后的 namespace 前缀。
-        await asyncio.to_thread(self.execute, "INSERT OR REPLACE INTO blobs VALUES (?, ?)", (key, payload))
-        return key
+        # 逻辑 key 已包含 namespace；ref 还标识不可变的正文内容。
+        ref = f"{key}:{hashlib.sha256(payload).hexdigest()}"
+        await asyncio.to_thread(self.execute, "INSERT OR IGNORE INTO blobs VALUES (?, ?)", (ref, payload))
+        return ref
 
     async def get(self, ref: str, *, context: StoreContext) -> bytes:
         row = await asyncio.to_thread(self.execute, "SELECT body FROM blobs WHERE ref = ?", (ref,))

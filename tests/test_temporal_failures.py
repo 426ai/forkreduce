@@ -414,10 +414,10 @@ async def test_activity_payload_carries_parent_workflow_identity(monkeypatch) ->
     monkeypatch.setattr(adapter.workflow, "execute_activity", execute)
     monkeypatch.setattr(adapter.workflow, "in_workflow", lambda: True)
     monkeypatch.setattr(adapter.workflow, "info", lambda: SimpleNamespace(parent=SimpleNamespace(workflow_id="parent")))
-    await adapter._execute_activity(query, adapter.activity_retry_policy(query))
+    await adapter.execute_query(query)
     assert captured[0].parent_workflow_id == "parent"
     monkeypatch.setattr(adapter.workflow, "info", lambda: SimpleNamespace(parent=None))
-    await adapter._execute_activity(captured[0], adapter.activity_retry_policy(query))
+    await adapter.execute_query(captured[0])
     assert captured[1].parent_workflow_id is None
 
 
@@ -543,17 +543,20 @@ async def test_child_failure_policy_and_parent_cancellation(
         "session_factory_missing",
         "ref_namespace_mismatch",
         "batch_failed",
+        "after_query_failed",
         "private exception text",
         None,
     ],
 )
 async def test_failure_type_allowlist(error_type: str | None) -> None:
     cause = ApplicationError("private payload", type=error_type)
-    result = adapter._failure_output(
+    result = adapter.query_failure(
         adapter.QueryActivityInput("prefix", "q", "question", "FailureAnswer"),
         activity_error(cause, RetryState.MAXIMUM_ATTEMPTS_REACHED),
     )
-    assert result.failure_type == (None if error_type in {"private exception text", "batch_failed"} else error_type)
+    assert result.failure_type == (
+        None if error_type in {"private exception text", "batch_failed", "after_query_failed"} else error_type
+    )
     assert "private" not in json.dumps(asdict(result))
 
 

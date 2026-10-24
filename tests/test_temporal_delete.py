@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -27,7 +28,7 @@ def store(request: pytest.FixtureRequest, tmp_path: Path):  # type: ignore[no-un
     tree = ast.parse(source)
     definition = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DurableStore")
     module = ast.Module(body=[definition], type_ignores=[])
-    namespace = {"asyncio": asyncio, "sqlite3": sqlite3, "StoreContext": StoreContext}
+    namespace = {"asyncio": asyncio, "hashlib": hashlib, "sqlite3": sqlite3, "StoreContext": StoreContext}
     exec(compile(module, str(readme), "exec"), namespace)
     return namespace["DurableStore"](str(tmp_path / "blobs.sqlite"))
 
@@ -61,3 +62,14 @@ async def test_delete_unsupported_store_still_raises() -> None:
 
     with pytest.raises(NotImplementedError, match="does not implement delete"):
         await delete_ref(ReadWriteOnlyStore(), "missing", context=StoreContext(kind="prefix", prefix_hash="prefix"))
+
+
+async def test_put_preserves_prior_reference_when_logical_key_is_reused(store) -> None:  # type: ignore[no-untyped-def]
+    context = StoreContext(kind="messages", prefix_hash="prefix", namespace="tenant")
+    first = await store_put(store, "same-query", b"first transcript", context=context)
+    second = await store_put(store, "same-query", b"later transcript", context=context)
+    assert first != second
+    assert await store_get(store, first, context=context) == b"first transcript"
+    assert await store_get(store, second, context=context) == b"later transcript"
+    await delete_ref(store, second, context=context)
+    assert await store_get(store, first, context=context) == b"first transcript"

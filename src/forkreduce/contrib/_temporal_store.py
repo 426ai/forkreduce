@@ -36,7 +36,11 @@ class StoreContext:
 
 
 class MessageStore(Protocol):
-    """Legacy put/get contract; optional delete(ref) must ignore missing references."""
+    """Legacy put/get; returned refs stay immutable until explicitly deleted.
+
+    Reusing a logical key with different bytes must not overwrite an earlier ref.
+    Optional delete(ref) must ignore missing references.
+    """
 
     async def put(self, key: str, payload: bytes) -> str: ...
 
@@ -53,6 +57,8 @@ class ContextMessageStore(Protocol):
     Deletion is detected separately and is not required by this protocol.
     Implementations that support it must make repeated or never-created reference
     deletion a successful no-op, without affecting other stored references.
+    Returned refs must remain immutable: a later put of different bytes under the
+    same logical key must not change the earlier reference's payload.
     """
 
     async def put(self, key: str, payload: bytes, *, context: StoreContext) -> str: ...

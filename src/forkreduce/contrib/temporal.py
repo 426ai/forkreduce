@@ -497,7 +497,9 @@ class QueryActivityOutput:
     For failures, ``attempts`` counts observed activity executions, or zero if
     unknown (including child failures). Successes retain Session.run_once counts.
     ``failure_type`` contains only a whitelisted raw application type, or the
-    synthetic ``batch_failed`` for a child failure; arbitrary error text is omitted.
+    synthetic ``batch_failed`` / ``after_query_failed``; arbitrary error text is
+    omitted. ``result_meta`` is a JSON copy of the last non-None hook metadata,
+    bounded to 16 KiB, replacing rather than merging earlier round metadata.
     """
 
     query_id: str
@@ -515,6 +517,35 @@ class QueryActivityOutput:
     failure_type: str | None = None
     feedback_retries_used: int = 0
     meta: dict[str, Any] = field(default_factory=dict)
+    result_meta: dict[str, Any] | None = None
+
+
+@dataclass
+class AfterQueryInput:
+    """Reference-only query result delivered immediately to an application hook."""
+
+    query: QueryActivityInput
+    output: QueryActivityOutput
+    round: int
+    batch_index: int
+    parent_workflow_id: str
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AfterQueryDecision:
+    """Finish, reject, or repair a query.
+
+    A repair supplies exactly one tail or complete query, retains the prefix,
+    and receives ``root_id#r{round}`` automatically. Missing history references
+    inherit the preceding result's messages reference. ``result_meta`` must be a
+    JSON object fitting in 16 KiB of compact UTF-8 JSON.
+    """
+
+    action: Literal["done", "failed", "follow_up"]
+    follow_up_tail: str | None = None
+    follow_up_query: QueryActivityInput | None = None
+    result_meta: dict[str, Any] | None = None
 
 
 def _permanent(message: str) -> ApplicationError:
@@ -733,7 +764,16 @@ async def run_query_activity(payload: QueryActivityInput) -> QueryActivityOutput
 
 @dataclass
 class MapQueriesInput:
-    """Map configuration; failures raise unless explicitly returned as safe records."""
+    """Map configuration; failures raise unless explicitly returned as safe records.
+
+    Hooks force reference-only results, including direct maps, and occupy the
+    same concurrency slot as every model/repair round. ``max_rounds`` is a
+    positive inclusive round index: initial round 0, default permits repair 1.
+    Hook options default independently to one attempt and five minutes.
+    ``batch_workflow`` names an application workflow accepting MapQueriesInput
+    and returning list[QueryActivityOutput]; children retain all hook/scheduling
+    settings and receive their zero-based ``batch_index``.
+    """
 
     queries: list[QueryActivityInput]
     batch_size: int | None = None
@@ -743,6 +783,11 @@ class MapQueriesInput:
     activity_concurrency: int | None = None
     task_queue: str | None = None
     warmup: Literal["none", "first", "per_batch"] = "none"
+    after_query_activity: str | None = None
+    after_query_options: ActivityOptions | None = None
+    max_rounds: int = 1
+    batch_workflow: str | None = None
+    batch_index: int = 0
 
 
 def activity_timeout_options(options: ActivityOptions | None) -> dict[str, Any]:
@@ -756,10 +801,35 @@ def activity_timeout_options(options: ActivityOptions | None) -> dict[str, Any]:
     return result
 
 
-def child_workflow_id(prefix_hash: str, batch_index: int) -> str:
-    """Stable per-parent workflow id, including when a workflow retry changes run id."""
-    parent_hash = hashlib.sha256(workflow.info().workflow_id.encode()).hexdigest()
-    return f"forkreduce:{parent_hash}:{prefix_hash}:batch:{batch_index}"
+def plan_batches(queries: list[_T], batch_size: int) -> list[list[_T]]:
+    """Split into ordered batches without mutating the input; safe in workflows."""
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise _permanent("batch_size must be a positive integer")
+    return [queries[start : start + batch_size] for start in range(0, len(queries), batch_size)]
+
+
+def batch_child_id(parent_id: str, prefix_hash: str, index: int) -> str:
+    """Stable child id scoped to the parent workflow id, never its run id."""
+    parent_hash = hashlib.sha256(parent_id.encode()).hexdigest()
+    return f"forkreduce:{parent_hash}:{prefix_hash}:batch:{index}"
+
+
+def require_query_references(payload: QueryActivityInput) -> QueryActivityInput:
+    """Copy a query into reference-only mode, rejecting inline continuation history."""
+    if payload.history_json is not None:
+        raise _permanent("Batch continuations require history_ref, not history_json")
+    return replace(payload, require_references=True)
+
+
+def validate_query_references(output: QueryActivityOutput) -> None:
+    """Reject inline or missing success references; safe failure records are exempt."""
+    if output.failure_kind is None and (
+        output.messages_json is not None
+        or output.messages_ref is None
+        or output.output_json is not None
+        or (output.output_type is not None and output.output_ref is None)
+    ):
+        raise _permanent("Batch activities must return transcript and output references")
 
 
 _FAILURE_MESSAGES: dict[QueryFailureKind, str] = {
@@ -782,7 +852,13 @@ _FAILURE_TYPES = frozenset(
 )
 
 
-def _failure_output(payload: QueryActivityInput, error: ActivityError | ChildWorkflowError) -> QueryActivityOutput:
+def query_failure(payload: QueryActivityInput, error: ActivityError | ChildWorkflowError) -> QueryActivityOutput:
+    """Map an activity or child error to a safe record without exposing its text.
+
+    Synthetic hook/batch failure types are never trusted from application error
+    types; orchestration generates them itself. Parent workflow cancellation
+    propagates; isolated activity cancellation can be returned safely.
+    """
     cause = error.__cause__
     attempts = 0
     feedback_retries_used = 0
@@ -844,29 +920,43 @@ def _failure_output(payload: QueryActivityInput, error: ActivityError | ChildWor
     )
 
 
-async def _execute_activity(
+async def execute_query(
     payload: QueryActivityInput,
-    retry_policy: RetryPolicy,
-    on_query_failure: Literal["raise", "return"] = "raise",
+    options: ActivityOptions | None = None,
     *,
+    on_query_failure: Literal["raise", "return"] = "raise",
     task_queue: str | None = None,
+    require_references: bool = False,
+    activity_name: str = "forkreduce.run_query",
 ) -> QueryActivityOutput:
+    """Schedule a query in a workflow, optionally mapping terminal errors safely.
+
+    Explicit options override the payload options. Reference mode rejects inline
+    history and validates successful results. Parent cancellation always propagates.
+    """
+    payload = replace(payload, activity_options=options or payload.activity_options)
+    if require_references or payload.require_references:
+        payload = require_query_references(payload)
     if workflow.in_workflow():
         parent = workflow.info().parent
         payload = replace(payload, parent_workflow_id=parent.workflow_id if parent is not None else None)
     try:
-        return await workflow.execute_activity(
-            run_query_activity,
+        output: QueryActivityOutput = await workflow.execute_activity(
+            activity_name,
             payload,
+            result_type=QueryActivityOutput,
             activity_id=activity_id(payload.prefix_hash, payload.query_id),
-            retry_policy=retry_policy,
+            retry_policy=activity_retry_policy(payload),
             task_queue=task_queue,
             **activity_timeout_options(payload.activity_options),
         )
     except ActivityError as exc:
         if on_query_failure == "raise" or (workflow.in_workflow() and workflow.cancellation_reason() is not None):
             raise
-        return _failure_output(payload, exc)
+        return query_failure(payload, exc)
+    if payload.require_references:
+        validate_query_references(output)
+    return output
 
 
 def _validate_scheduling(config: MapQueriesInput) -> None:
@@ -875,6 +965,107 @@ def _validate_scheduling(config: MapQueriesInput) -> None:
         raise _permanent("activity_concurrency must be a positive integer or None")
     if config.warmup not in {"none", "first", "per_batch"}:
         raise _permanent("warmup must be 'none', 'first', or 'per_batch'")
+    if isinstance(config.max_rounds, bool) or not isinstance(config.max_rounds, int) or config.max_rounds < 1:
+        raise _permanent("max_rounds must be a positive integer")
+
+
+def _after_query_failure(
+    query: QueryActivityInput,
+    kind: Literal["permanent", "unknown"],
+    result_meta: dict[str, Any] | None,
+    *,
+    feedback_retries_used: int = 0,
+) -> QueryActivityOutput:
+    return QueryActivityOutput(
+        query.query_id,
+        query.prefix_hash,
+        None,
+        None,
+        0,
+        0,
+        failure_kind=kind,
+        failure_message=_FAILURE_MESSAGES[kind],
+        failure_type="after_query_failed",
+        result_meta=result_meta,
+        feedback_retries_used=feedback_retries_used,
+        meta={"feedback_retries_used": feedback_retries_used},
+    )
+
+
+def _copy_result_meta(value: dict[str, Any]) -> dict[str, Any]:
+    validated = _APP_META_ADAPTER.validate_python(value, strict=True)
+    encoded = json.dumps(validated, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    if len(encoded.encode("utf-8")) > 16 * 1024:
+        raise ValueError("result_meta must not exceed 16 KiB of compact UTF-8 JSON")
+    return cast(dict[str, Any], json.loads(encoded))
+
+
+async def _query_pipeline(query: QueryActivityInput, config: MapQueriesInput) -> QueryActivityOutput:
+    if config.after_query_activity is None:
+        return await execute_query(query, on_query_failure=config.on_query_failure, task_queue=config.task_queue)
+    current = require_query_references(replace(query, round=0))
+    root_id = query.query_id
+    result_meta: dict[str, Any] | None = None
+    hook_options = config.after_query_options or ActivityOptions()
+    # Hook retries are independent of the model/session policy, including when
+    # a caller configures only a hook timeout and leaves retry fields unset.
+    hook_policy = activity_retry_policy(QueryActivityInput("", "", "", "", activity_options=hook_options))
+    info = workflow.info()
+    parent_id = info.parent.workflow_id if info.parent is not None else info.workflow_id
+    while True:
+        output = await execute_query(
+            current,
+            config.activity_options,
+            on_query_failure=config.on_query_failure,
+            task_queue=config.task_queue,
+            require_references=True,
+        )
+        output = replace(output, result_meta=result_meta)
+        try:
+            decision: AfterQueryDecision = await workflow.execute_activity(
+                config.after_query_activity,
+                AfterQueryInput(current, output, current.round, config.batch_index, parent_id, dict(current.meta)),
+                result_type=AfterQueryDecision,
+                activity_id=f"{activity_id(current.prefix_hash, current.query_id)}:after_query:r{current.round}",
+                task_queue=config.task_queue,
+                retry_policy=hook_policy,
+                **activity_timeout_options(hook_options),
+            )
+        except ActivityError:
+            if config.on_query_failure == "raise" or (
+                workflow.in_workflow() and workflow.cancellation_reason() is not None
+            ):
+                raise
+            return _after_query_failure(
+                current, "unknown", result_meta, feedback_retries_used=output.feedback_retries_used
+            )
+        try:
+            if decision.result_meta is not None:
+                result_meta = _copy_result_meta(decision.result_meta)
+            if decision.action == "done":
+                return replace(output, result_meta=result_meta)
+            if decision.action == "failed" or current.round >= config.max_rounds:
+                return _after_query_failure(
+                    current, "permanent", result_meta, feedback_retries_used=output.feedback_retries_used
+                )
+            if decision.action != "follow_up" or (
+                (decision.follow_up_tail is None) == (decision.follow_up_query is None)
+            ):
+                raise ValueError("follow_up requires exactly one tail or query")
+            next_query = decision.follow_up_query
+            if next_query is None:
+                next_query = replace(current, tail=cast(str, decision.follow_up_tail), history_ref=output.messages_ref)
+            elif next_query.prefix_hash != current.prefix_hash:
+                raise ValueError("follow_up must retain the same prefix_hash")
+            elif next_query.history_ref is None:
+                next_query = replace(next_query, history_ref=output.messages_ref)
+            current = require_query_references(
+                replace(next_query, query_id=f"{root_id}#r{current.round + 1}", round=current.round + 1)
+            )
+        except (ValueError, TypeError, ApplicationError):
+            return _after_query_failure(
+                current, "permanent", result_meta, feedback_retries_used=output.feedback_retries_used
+            )
 
 
 async def _run_queries(queries: list[QueryActivityInput], config: MapQueriesInput) -> list[QueryActivityOutput]:
@@ -883,9 +1074,7 @@ async def _run_queries(queries: list[QueryActivityInput], config: MapQueriesInpu
     slots = asyncio.Semaphore(config.activity_concurrency) if config.activity_concurrency is not None else None
 
     async def execute(query: QueryActivityInput) -> QueryActivityOutput:
-        return await _execute_activity(
-            query, activity_retry_policy(query), config.on_query_failure, task_queue=config.task_queue
-        )
+        return await _query_pipeline(query, config)
 
     async def bounded(query: QueryActivityInput) -> QueryActivityOutput:
         if slots is None:
@@ -906,27 +1095,11 @@ class QueryBatchWorkflow:
 
     @workflow.run
     async def run(self, inputs: MapQueriesInput) -> list[QueryActivityOutput]:
-        if any(query.history_json is not None for query in inputs.queries):
-            raise _permanent("Batch continuations require history_ref, not history_json")
         queries = [
-            replace(
-                query,
-                require_references=True,
-                activity_options=inputs.activity_options or query.activity_options,
-            )
+            require_query_references(replace(query, activity_options=inputs.activity_options or query.activity_options))
             for query in inputs.queries
         ]
-        outputs = await _run_queries(queries, inputs)
-        if any(
-            output.messages_json is not None
-            or output.messages_ref is None
-            or output.output_json is not None
-            or (output.output_type is not None and output.output_ref is None)
-            for output in outputs
-            if output.failure_kind is None
-        ):
-            raise _permanent("Batch activities must return transcript and output references")
-        return outputs
+        return await _run_queries(queries, inputs)
 
 
 @workflow.defn(name="forkreduce.map_queries")
@@ -955,30 +1128,32 @@ class MapQueriesWorkflow:
             or config.child_concurrency < 1
         ):
             raise _permanent("child_concurrency must be a positive integer")
-        if any(query.history_json is not None for query in queries):
-            raise _permanent("Batch continuations require history_ref, not history_json")
+        queries = [require_query_references(query) for query in queries]
         slots = asyncio.Semaphore(config.child_concurrency)
 
         async def batch(index: int, items: list[QueryActivityInput]) -> list[QueryActivityOutput]:
             async with slots:
                 try:
-                    return await workflow.execute_child_workflow(
-                        QueryBatchWorkflow.run,
+                    outputs: list[QueryActivityOutput] = await workflow.execute_child_workflow(
+                        config.batch_workflow or "forkreduce.query_batch",
                         replace(
                             config,
                             queries=items,
                             batch_size=None,
+                            batch_index=index,
                             warmup="per_batch" if config.warmup == "per_batch" else "none",
                         ),
-                        id=child_workflow_id(items[0].prefix_hash, index),
+                        id=batch_child_id(workflow.info().workflow_id, items[0].prefix_hash, index),
+                        result_type=list[QueryActivityOutput],
                         task_queue=config.task_queue,
                     )
+                    return outputs
                 except ChildWorkflowError as exc:
                     if config.on_query_failure == "raise" or (
                         workflow.in_workflow() and workflow.cancellation_reason() is not None
                     ):
                         raise
-                    return [_failure_output(query, exc) for query in items]
+                    return [query_failure(query, exc) for query in items]
 
         first: list[QueryActivityOutput] = []
         batch_offset = 0
@@ -989,8 +1164,8 @@ class MapQueriesWorkflow:
 
         batches = await asyncio.gather(
             *(
-                batch(index + batch_offset, queries[start : start + config.batch_size])
-                for index, start in enumerate(range(0, len(queries), config.batch_size))
+                batch(index + batch_offset, items)
+                for index, items in enumerate(plan_batches(queries, config.batch_size))
             )
         )
         return [*first, *(output for outputs in batches for output in outputs)]
