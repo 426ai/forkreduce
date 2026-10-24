@@ -32,6 +32,7 @@ def isolated_registrations(monkeypatch):  # type: ignore[no-untyped-def]
     monkeypatch.setattr(adapter, "_SESSIONS", {})
     monkeypatch.setattr(adapter, "_FINGERPRINTS", {})
     monkeypatch.setattr(adapter, "_FACTORIES", {})
+    monkeypatch.setattr(adapter, "_DEFAULT_FACTORY", None)
     monkeypatch.setattr(adapter, "_STORE", None)
     monkeypatch.setattr(adapter, "_PREFIX_STORE", None)
 
@@ -154,7 +155,7 @@ async def test_prefix_factory_reconstruction_and_reference_continuation() -> Non
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("problem", ["store", "missing-ref", "factory", "hash", "corrupt", "rebuild"])
-async def test_prefix_configuration_and_integrity_errors_are_permanent(problem: str) -> None:
+async def test_prefix_configuration_and_integrity_error_classification(problem: str) -> None:
     session = make_session()
     store = adapter.InMemoryMessageStore()
     ref = await adapter.freeze_prefix(session, store)
@@ -177,8 +178,8 @@ async def test_prefix_configuration_and_integrity_errors_are_permanent(problem: 
         adapter.register_session_factory(session.prefix_hash, lambda _frozen: make_session(documents="different"))
     with pytest.raises(ApplicationError) as caught:
         await adapter.execute_query_activity(query)
-    assert caught.value.non_retryable
-    assert caught.value.type == "permanent"
+    assert caught.value.non_retryable is (problem != "factory")
+    assert caught.value.type == ("session_factory_missing" if problem == "factory" else "permanent")
 
 
 @pytest.mark.asyncio

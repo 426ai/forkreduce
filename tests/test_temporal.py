@@ -111,7 +111,8 @@ async def test_activity_stores_messages_and_rejects_unknown_sessions() -> None:
                 output_name="Answer",
             )
         )
-    assert caught.value.non_retryable is True
+    assert caught.value.non_retryable is False
+    assert caught.value.type == "session_factory_missing"
 
     # The activity itself is one attempt: a permanent HTTP failure is non-retryable.
     def denied(_messages, _info, _n):  # type: ignore[no-untyped-def]

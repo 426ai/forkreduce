@@ -6,8 +6,9 @@ raises :class:`temporalio.exceptions.ApplicationError` with ``non_retryable``
 set from the failure class, so Temporal's retry policy is the bound.
 
 Register a worker-owned session with :func:`register_session`, or persist its
-prefix using :func:`freeze_prefix` and register a :func:`register_session_factory`.
-Factories reconstruct the model and output classes locally; neither is serialized.
+prefix using :func:`freeze_prefix` and configure :func:`register_session_factory`
+or :func:`set_default_session_factory`. Factories reconstruct the model and output
+classes locally; neither is serialized.
 
 Transcripts use :class:`MessageStore` references when configured. Direct maps
 retain inline results for compatibility; child batches require references for
@@ -140,6 +141,7 @@ class FrozenPrefix:
 
 SessionFactory = Callable[[FrozenPrefix], Session | Awaitable[Session]]
 _FACTORIES: dict[str, SessionFactory] = {}
+_DEFAULT_FACTORY: SessionFactory | None = None
 _PREFIX_STORE: PrefixStore | None = None
 
 
@@ -166,7 +168,7 @@ def set_prefix_store(store: PrefixStore | None) -> None:
 
 
 def register_session_factory(prefix_hash: str, factory: SessionFactory) -> None:
-    """Register a sync or async factory; missing configuration fails permanently.
+    """Register a sync or async factory for one exact prefix hash.
 
     Unless a session is explicitly registered, the factory runs on every activity
     attempt. The adapter does not implicitly share session budgets across those
@@ -174,6 +176,19 @@ def register_session_factory(prefix_hash: str, factory: SessionFactory) -> None:
     :func:`register_session` when worker-wide reuse and budget sharing are wanted.
     """
     _FACTORIES[prefix_hash] = factory
+
+
+def set_default_session_factory(factory: SessionFactory | None) -> None:
+    """Set the fallback factory for prefixes without an exact registration.
+
+    Registered sessions take precedence over all factories. An exact factory
+    takes precedence over this default; passing ``None`` removes the default.
+    Factories run on every activity attempt unless a session is registered.
+    Missing factories raise retryable ``session_factory_missing`` errors so
+    workers can acquire configuration before a later attempt.
+    """
+    global _DEFAULT_FACTORY
+    _DEFAULT_FACTORY = factory
 
 
 def execution_fingerprint(session: Session) -> str:
@@ -405,6 +420,9 @@ def _permanent(message: str) -> ApplicationError:
 
 
 async def _resolve_session(payload: QueryActivityInput) -> Session:
+    session = _SESSIONS.get(payload.prefix_hash)
+    if session is not None:
+        return session
     snapshot: FrozenPrefix | None = None
     if payload.prefix_ref is not None:
         if _PREFIX_STORE is None:
@@ -416,12 +434,14 @@ async def _resolve_session(payload: QueryActivityInput) -> Session:
                 raise ValueError("prefix_ref does not match the requested prefix_hash")
         except (KeyError, ValueError, TypeError) as exc:
             raise _permanent(f"Invalid or missing frozen prefix: {exc}") from exc
-    session = _SESSIONS.get(payload.prefix_hash)
-    if session is not None:
-        return session
     factory = _FACTORIES.get(payload.prefix_hash)
     if factory is None:
-        raise _permanent(f"No session or factory registered for prefix {payload.prefix_hash}")
+        factory = _DEFAULT_FACTORY
+    if factory is None:
+        raise ApplicationError(
+            f"No session or factory registered for prefix {payload.prefix_hash}",
+            type="session_factory_missing",
+        )
     if snapshot is None:
         raise _permanent("A registered session factory requires prefix_ref")
     try:
