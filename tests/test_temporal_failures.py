@@ -190,7 +190,9 @@ async def test_raise_mode_keeps_terminal_failure_behavior(plugin: bool, input_mo
                 workflow_runner=sandbox_runner(),
             ):
                 queries = [
-                    adapter.query_activity_input(session, query_id="permanent", tail="Question", output_name="FailureAnswer")
+                    adapter.query_activity_input(
+                        session, query_id="permanent", tail="Question", output_name="FailureAnswer"
+                    )
                 ]
                 payload = (
                     queries
@@ -311,11 +313,13 @@ async def test_return_mode_does_not_swallow_workflow_cancellation(plugin: bool, 
         (
             ApplicationError("private", type="unexpected", non_retryable=True),
             RetryState.NON_RETRYABLE_FAILURE,
-            "application",
+            "permanent",
             0,
         ),
         (
-            TimeoutError("private", type=TimeoutType.START_TO_CLOSE, last_heartbeat_details=[{"forkreduce_attempt": 2}]),
+            TimeoutError(
+                "private", type=TimeoutType.START_TO_CLOSE, last_heartbeat_details=[{"forkreduce_attempt": 2}]
+            ),
             RetryState.MAXIMUM_ATTEMPTS_REACHED,
             "timeout",
             2,
@@ -355,9 +359,7 @@ async def test_terminal_error_mapping_never_exposes_error_text(
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
-async def test_requested_cancellation_propagates_even_when_wrapped(
-    monkeypatch, wrapped: bool
-) -> None:  # type: ignore[no-untyped-def]
+async def test_requested_cancellation_propagates_even_when_wrapped(monkeypatch, wrapped: bool) -> None:  # type: ignore[no-untyped-def]
     cause = CancelledError("cancelled") if wrapped else asyncio.CancelledError()
     error = activity_error(cause, RetryState.CANCEL_REQUESTED) if wrapped else cause
     query = adapter.QueryActivityInput("prefix", "q", "question", "FailureAnswer")

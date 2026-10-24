@@ -8,7 +8,7 @@ from dataclasses import asdict
 from types import MappingProxyType
 
 import pytest
-from pydantic import BaseModel, JsonValue
+from pydantic import BaseModel
 from pydantic_ai.models.test import TestModel
 from temporalio.exceptions import ApplicationError
 
@@ -151,7 +151,6 @@ async def test_default_factory_requires_snapshot_reference() -> None:
 
 @pytest.mark.parametrize("exact", [False, True])
 async def test_factory_receives_independent_application_metadata(exact: bool) -> None:
-    assert adapter.JSONValue is JsonValue
     session = make_session()
     prefix_hash = session.prefix_hash
     fingerprint = adapter.execution_fingerprint(session)

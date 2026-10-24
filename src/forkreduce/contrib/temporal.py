@@ -25,7 +25,7 @@ import json
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
-from typing import Any, Literal, Protocol, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
@@ -39,6 +39,31 @@ with workflow.unsafe.imports_passed_through():
     from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
     from pydantic_ai.settings import ModelSettings, merge_model_settings
 
+    from forkreduce.contrib._temporal_store import (
+        ContextMessageStore as ContextMessageStore,
+    )
+    from forkreduce.contrib._temporal_store import (
+        MessageStore as MessageStore,
+    )
+    from forkreduce.contrib._temporal_store import (
+        PrefixStore as PrefixStore,
+    )
+    from forkreduce.contrib._temporal_store import (
+        Store as Store,
+    )
+    from forkreduce.contrib._temporal_store import (
+        StoreContext as StoreContext,
+    )
+    from forkreduce.contrib._temporal_store import (
+        StoreKind,
+        ref_namespace,
+        store_context,
+        store_get,
+        store_put,
+    )
+    from forkreduce.contrib._temporal_store import (
+        delete_ref as delete_ref,
+    )
     from forkreduce.documents import Document
     from forkreduce.errors import ForkReduceError
     from forkreduce.failures import Failure
@@ -51,22 +76,6 @@ with workflow.unsafe.imports_passed_through():
     from forkreduce.temporal_options import ActivityOptions
 
 _T = TypeVar("_T")
-
-
-class MessageStore(Protocol):
-    """Store branch transcripts outside the activity result."""
-
-    async def put(self, key: str, payload: bytes) -> str:
-        """Store ``payload`` and return a reference the worker can resolve."""
-        ...
-
-    async def get(self, ref: str) -> bytes:
-        """Load the payload stored under ``ref``."""
-        ...
-
-
-class PrefixStore(MessageStore, Protocol):
-    """Persist frozen prefixes for reconstruction on any activity worker."""
 
 
 class InMemoryMessageStore:
@@ -88,10 +97,14 @@ class InMemoryMessageStore:
         except KeyError as exc:
             raise KeyError(f"unknown message ref {ref!r}") from exc
 
+    async def delete(self, ref: str, *, context: StoreContext | None = None) -> None:
+        """Explicit application-owned cleanup; unknown references are ignored."""
+        self._data.pop(ref, None)
+
 
 _SESSIONS: dict[str, Session] = {}
 _FINGERPRINTS: dict[str, str] = {}
-_STORE: MessageStore | None = None
+_STORE: Store | None = None
 _APP_META_ADAPTER = TypeAdapter(dict[str, JSONValue])
 _APP_META_MAX_BYTES = 16 * 1024
 
@@ -162,12 +175,12 @@ class FrozenPrefix:
 SessionFactory = Callable[[FrozenPrefix], Session | Awaitable[Session]]
 _FACTORIES: dict[str, SessionFactory] = {}
 _DEFAULT_FACTORY: SessionFactory | None = None
-_PREFIX_STORE: PrefixStore | None = None
+_PREFIX_STORE: Store | None = None
 
 
 async def freeze_prefix(
     session: Session,
-    store: PrefixStore,
+    store: Store,
     *,
     app_meta: Mapping[str, JSONValue] | None = None,
 ) -> str:
@@ -190,10 +203,15 @@ async def freeze_prefix(
     )
     snapshot.validate()
     encoded = json.dumps(asdict(snapshot), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return await store.put(f"prefix:{session.prefix_hash}", encoded)
+    return await store_put(
+        store,
+        f"prefix:{session.prefix_hash}",
+        encoded,
+        context=store_context("prefix", session.prefix_hash, namespace=ref_namespace(snapshot.app_meta)),
+    )
 
 
-def set_prefix_store(store: PrefixStore | None) -> None:
+def set_prefix_store(store: Store | None) -> None:
     """Install the worker store used to resolve ``QueryActivityInput.prefix_ref``."""
     global _PREFIX_STORE
     _PREFIX_STORE = store
@@ -303,7 +321,7 @@ def unregister_session(prefix_hash: str) -> None:
     _FACTORIES.pop(prefix_hash, None)
 
 
-def set_message_store(store: MessageStore | None) -> None:
+def set_message_store(store: Store | None) -> None:
     """Install the transcript/output store. ``None`` inlines direct-map results."""
     global _STORE
     _STORE = store
@@ -463,27 +481,55 @@ def _permanent(message: str) -> ApplicationError:
     return ApplicationError(message, "permanent", _attempt_detail(), type="permanent", non_retryable=True)
 
 
-async def _resolve_session(payload: QueryActivityInput) -> Session:
-    session = _SESSIONS.get(payload.prefix_hash)
-    if session is not None:
-        return session
+def _query_store_context(kind: StoreKind, payload: QueryActivityInput, namespace: str | None) -> StoreContext:
+    return store_context(
+        kind,
+        payload.prefix_hash,
+        namespace=namespace,
+        query_id=payload.query_id,
+        round=payload.round,
+        parent_workflow_id=payload.parent_workflow_id,
+    )
+
+
+async def _load_prefix(payload: QueryActivityInput) -> FrozenPrefix | None:
+    """Read with query metadata before snapshot routing metadata is available."""
     snapshot: FrozenPrefix | None = None
     if payload.prefix_ref is not None:
         if _PREFIX_STORE is None:
             raise _permanent("prefix_ref was set but this worker has no prefix store")
         try:
-            snapshot = FrozenPrefix(**json.loads(await _PREFIX_STORE.get(payload.prefix_ref)))
+            snapshot = FrozenPrefix(
+                **json.loads(
+                    await store_get(
+                        _PREFIX_STORE,
+                        payload.prefix_ref,
+                        context=_query_store_context("prefix", payload, ref_namespace(payload.meta)),
+                    )
+                )
+            )
             snapshot.validate()
             if snapshot.prefix_hash != payload.prefix_hash:
                 raise ValueError("prefix_ref does not match the requested prefix_hash")
         except (KeyError, ValueError, TypeError) as exc:
             raise _permanent(f"Invalid or missing frozen prefix: {exc}") from exc
+    return snapshot
+
+
+async def _resolve_session(payload: QueryActivityInput, *, snapshot: FrozenPrefix | None = None) -> Session:
+    if snapshot is None:
+        snapshot = await _load_prefix(payload)
+    session = _SESSIONS.get(payload.prefix_hash)
+    if session is not None:
+        return session
     factory = _FACTORIES.get(payload.prefix_hash)
     if factory is None:
         factory = _DEFAULT_FACTORY
     if factory is None:
         raise ApplicationError(
             f"No session or factory registered for prefix {payload.prefix_hash}",
+            "session_factory_missing",
+            _attempt_detail(),
             type="session_factory_missing",
         )
     if snapshot is None:
@@ -543,7 +589,15 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
         raise _permanent("Batch activities require a message store for transcript and output references")
     if payload.require_references and payload.history_json is not None:
         raise _permanent("Batch continuations require history_ref, not history_json")
-    session = await _resolve_session(payload)
+    snapshot = await _load_prefix(payload)
+    namespace = (
+        ref_namespace(payload.meta)
+        if "ref_namespace" in payload.meta
+        else ref_namespace(snapshot.app_meta)
+        if snapshot is not None
+        else None
+    )
+    session = await _resolve_session(payload, snapshot=snapshot)
     output_type = session.output_types.get(payload.output_name)
     if output_type is None:
         raise _permanent(f"Output {payload.output_name!r} is not registered on this session")
@@ -555,7 +609,13 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
     elif payload.history_ref is not None:
         if _STORE is None:
             raise _permanent("history_ref was set but this worker has no message store")
-        history = list(ModelMessagesTypeAdapter.validate_json(await _STORE.get(payload.history_ref)))
+        history = list(
+            ModelMessagesTypeAdapter.validate_json(
+                await store_get(
+                    _STORE, payload.history_ref, context=_query_store_context("history", payload, namespace)
+                )
+            )
+        )
     query_settings = cast(ModelSettings, dict(payload.model_settings)) if payload.model_settings else None
     query: Query[Any] = Query(
         tail=payload.tail,
@@ -577,7 +637,12 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
     messages_ref: str | None = None
     messages_json: str | None = None
     if _STORE is not None:
-        messages_ref = await _STORE.put(f"{payload.prefix_hash}:{payload.query_id}", dumped)
+        messages_ref = await store_put(
+            _STORE,
+            f"{payload.prefix_hash}:{payload.query_id}",
+            dumped,
+            context=_query_store_context("messages", payload, namespace),
+        )
     else:
         messages_json = dumped.decode()
     output_json: str | None = None
@@ -587,7 +652,12 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
         output_json = result.output.model_dump_json()
         output_name = type(result.output).__name__
         if _STORE is not None and payload.require_references:
-            output_ref = await _STORE.put(f"output:{payload.prefix_hash}:{payload.query_id}", output_json.encode())
+            output_ref = await store_put(
+                _STORE,
+                f"output:{payload.prefix_hash}:{payload.query_id}",
+                output_json.encode(),
+                context=_query_store_context("output", payload, namespace),
+            )
             output_json = None
     return QueryActivityOutput(
         query_id=result.query_id,
@@ -654,7 +724,9 @@ def _failure_output(payload: QueryActivityInput, error: ActivityError) -> QueryA
     details = (
         cause.details
         if isinstance(cause, ApplicationError)
-        else cause.last_heartbeat_details if isinstance(cause, TimeoutError) else ()
+        else cause.last_heartbeat_details
+        if isinstance(cause, TimeoutError)
+        else ()
     )
     for detail in details:
         if isinstance(detail, dict):
@@ -666,12 +738,16 @@ def _failure_output(payload: QueryActivityInput, error: ActivityError) -> QueryA
     elif isinstance(cause, TimeoutError) or error.retry_state == RetryState.TIMEOUT:
         kind = "timeout"
     elif isinstance(cause, ApplicationError):
-        if cause.type in ("permanent", "budget", "cancelled"):
-            kind = cause.type or "application"
+        if cause.type == "budget":
+            kind = "budget"
+        elif cause.non_retryable:
+            kind = "permanent"
         elif error.retry_state == RetryState.MAXIMUM_ATTEMPTS_REACHED:
             kind = "retryable_exhausted"
         else:
             kind = "application"
+    elif error.retry_state == RetryState.MAXIMUM_ATTEMPTS_REACHED:
+        kind = "retryable_exhausted"
     else:
         kind = "activity"
     return QueryActivityOutput(
@@ -703,9 +779,7 @@ async def _execute_activity(
             **activity_timeout_options(payload.activity_options),
         )
     except ActivityError as exc:
-        if on_query_failure == "raise" or (
-            workflow.in_workflow() and workflow.cancellation_reason() is not None
-        ):
+        if on_query_failure == "raise" or (workflow.in_workflow() and workflow.cancellation_reason() is not None):
             raise
         return _failure_output(payload, exc)
 
@@ -761,7 +835,10 @@ class MapQueriesWorkflow:
         if config.batch_size is None:
             return list(
                 await asyncio.gather(
-                    *(_execute_activity(query, activity_retry_policy(query), config.on_query_failure) for query in queries)
+                    *(
+                        _execute_activity(query, activity_retry_policy(query), config.on_query_failure)
+                        for query in queries
+                    )
                 )
             )
         if isinstance(config.batch_size, bool) or not isinstance(config.batch_size, int) or config.batch_size < 1:
