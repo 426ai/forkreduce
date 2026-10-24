@@ -370,7 +370,7 @@ def execution_fingerprint(session: Session) -> str:
         payload["document_format"] = session.document_format
     if session.message_layout != "split":
         payload["message_layout"] = session.message_layout
-    if session.query_separator != QUERY_SEPARATOR:
+    if session.message_layout == "single" and session.query_separator != QUERY_SEPARATOR:
         payload["query_separator"] = session.query_separator
     if not session.dynamic_output_instructions:
         payload["dynamic_output_instructions"] = False
@@ -380,9 +380,12 @@ def execution_fingerprint(session: Session) -> str:
 def register_session(session: Session) -> str:
     """Make ``session`` available to activities in this process. Returns its prefix hash.
 
-    A second registration with the same prefix and the same execution fingerprint
-    replaces the session. A different model or policy for that prefix raises
+    A second registration with the same prefix and execution fingerprint replaces
+    the session only when it uses the same worker-local output validator object.
+    A different execution configuration or validator raises
     :class:`forkreduce.errors.ForkReduceError` instead of silently taking over.
+    Call :func:`unregister_session` before replacing a validator; callable names
+    in serialized fingerprints cannot distinguish closures or callable instances.
     """
     key = session.prefix_hash
     fingerprint = execution_fingerprint(session)
@@ -392,6 +395,12 @@ def register_session(session: Session) -> str:
             "A session with this prefix_hash is already registered with a different model, "
             "model settings, profile, or policy. "
             "Call unregister_session before registering a different execution config."
+        )
+    registered = _SESSIONS.get(key)
+    if registered is not None and registered.output_validator is not session.output_validator:
+        raise ForkReduceError(
+            "A session with this prefix_hash is already registered with a different output validator. "
+            "Call unregister_session before registering a different validator."
         )
     _SESSIONS[key] = session
     _FINGERPRINTS[key] = fingerprint
@@ -695,8 +704,10 @@ async def _load_prefix(payload: QueryActivityInput) -> FrozenPrefix | None:
 
 
 def _validate_session_layout(session: Session, snapshot: FrozenPrefix | None) -> None:
-    if isinstance(snapshot, ConfiguredFrozenPrefix) and (
-        session.query_separator != snapshot.query_separator
+    if snapshot is not None and (
+        session.document_format != snapshot.document_format
+        or session.message_layout != snapshot.message_layout
+        or (session.message_layout == "single" and session.query_separator != snapshot.query_separator)
         or session.dynamic_output_instructions != snapshot.dynamic_output_instructions
     ):
         raise _permanent("Worker session query layout does not match the frozen configuration")

@@ -318,9 +318,9 @@ session = build(
 
 Raw mode deliberately does not sanitize controls or add application delimiters: ensure deterministic input bytes and provider acceptance yourself. Metadata rendering options are rejected in raw mode. There are no framework block addresses: `DocumentIndex.block_text`, `CitationCheck`, and plans using built-in citation checking/repair reject raw mode. Use application-owned addressing/validation instead. Snapshots retain both flags; factories must restore them before hash verification.
 
-For exact caller-owned dynamic tails, set `query_separator="<custom boundary>"` and `dynamic_output_instructions=False` on `build` with raw/single layout. The initial user part is exactly `raw_prefix + query_separator + query.tail`, preserving whitespace/control characters. No output instruction sentence, description, schema or trimming is added; callers supply their own instructions. Schema validation still runs. Only nondefault separators enter prefix hashes; suppressing dynamic guidance is tail-only (fingerprint changes, prefix hash does not). Static tails are unaffected.
+For exact caller-owned dynamic tails, set `query_separator="<custom boundary>"` and `dynamic_output_instructions=False` on `build` with raw/single layout. The initial user part is exactly `raw_prefix + query_separator + query.tail`, preserving whitespace/control characters. Guidance suppression applies **only to OutputSpec tails**: no instruction sentence, description, schema or trimming is added; callers supply their own instructions and schema validation still runs. Static output tails are unchanged. A nondefault separator affects prefix hashes/fingerprints only in `message_layout="single"`; split ignores it. Suppressing dynamic guidance is tail-only (fingerprint changes, prefix hash does not).
 
-Default snapshot fields/bytes remain unchanged. Nondefault layouts use `ConfiguredFrozenPrefix` with `QueryLayout`. On either snapshot type, factories read `frozen.query_separator` and `frozen.dynamic_output_instructions` and pass them to `build`; forgotten opt-in reconstruction is rejected, including cached sessions.
+Default snapshot fields/bytes remain unchanged. Nondefault layouts use `ConfiguredFrozenPrefix` with `QueryLayout`. On either snapshot type, factories read `frozen.query_separator` and `frozen.dynamic_output_instructions` and pass them to `build`. Both default and configured snapshots are checked against factory-created or cached sessions; mismatched document/message layouts or instruction settings fail non-retryably. Unused split separators are ignored.
 
 ### Query and QueryResult
 
@@ -414,11 +414,11 @@ Keys are content-addressed and namespace-scoped. One retained writer deduplicate
 The official large-list pattern is **activity-generated bounded batches**, not an unbounded `MapQueriesInput` or a resolver returning one giant list. The complete [offline generation example](examples/run_spec_refs_offline.py) sends a small job/range, prepares batches/spec refs in an activity, then composes public `plan_batches` / `execute_query` in a workflow. Both preparation results and model-activity inputs stay bounded. It exercises 300 different synthetic schemas, each over 11 KB, with every workflow/activity input and generation result below 512 KiB, both converters and replay. No workflow storage I/O, `queries_ref` field or new default activity registration is introduced. Applications replace the generation activity's data source while retaining its bounded input/output contract.
 
 ```bash
-PYTHONPATH=src:. python examples/run_spec_refs_offline.py
-PYTHONPATH=src:. python examples/run_spec_refs_offline.py --plugin
+python examples/run_spec_refs_offline.py
+python examples/run_spec_refs_offline.py --plugin
 ```
 
-These require an existing `TEMPORAL_TEST_SERVER` binary and checkout dev/Temporal extras; no download, real provider request or telemetry export occurs.
+These require checkout dev/Temporal extras. An unset `TEMPORAL_TEST_SERVER` uses the SDK's normal test-server cache/download behavior, like the integration tests; set it to an existing binary for network-isolated execution. The script bootstraps checkout imports for direct execution. No real provider request or telemetry export occurs.
 
 ### Check and repair
 
@@ -544,11 +544,13 @@ It asks once per scope, on the same prefix. Leads whose position (`block_id` by 
 
 `Policy(output_feedback_retries=0)` preserves the single-request attempt. Opt into a bounded same-branch correction with `Policy(output_feedback_retries=1)` and `build(..., output_validator=validate_output)`. The validator accepts the parsed output, may be synchronous or asynchronous, returns the accepted/replaced value, and raises Pydantic AI `ModelRetry` to send an error back to the model. Schema and cross-field validation errors use the same feedback mechanism. Feedback is not a fresh query: the frozen instructions, document bytes and tool set stay unchanged, while retry messages extend this question's history.
 
-`QueryResult.feedback_retries_used` and `meta["feedback_retries_used"]` record actual feedback requests; local outer attempts aggregate this count. Request/token budgets are enforced before every request, including feedback. `Policy.retries` remains the separate outer retry budget. Feedback and validators do not change `prefix_hash`; non-default feedback/validator configuration changes the Temporal execution fingerprint.
+`QueryResult.feedback_retries_used` and `meta["feedback_retries_used"]` record actual feedback requests. Local outer attempts, check/repair results and combined reduce results sum counts across their actual calls without recounting prior transcript history. Request/token budgets are enforced before every request, including feedback. `Policy.retries` remains the separate outer retry budget. Feedback and validators do not change `prefix_hash`; non-default feedback/validator configuration changes the Temporal execution fingerprint.
 
 Temporal activities use the worker's registered or factory-created session, never a serialized callback. `FrozenPrefix.output_feedback_retries` records the numeric policy; factories should restore it with `Policy(output_feedback_retries=frozen.output_feedback_retries)` and install their worker-local validator. Activity results and safe failure metadata expose `feedback_retries_used` for the final activity attempt, not an inferred total across Temporal attempts. Keep sensitive data out of validation messages: feedback deliberately sends these messages to the model.
 
 A validator can instead accept `(output, context: OutputValidationContext)`, imported from `forkreduce`. An explicit second positional parameter opts in; context contains `query_id`, `round`, and deep-copied `meta`. Sync/async/native `ModelRetry` work identically. Binding is per query, not on a shared Agent, so concurrent queries cannot overwrite identities. Callbacks remain worker-local and have no prefix-hash impact; one-argument callbacks retain their behavior.
+
+When registering the same prefix again, reuse the same validator callable object. Different closures or callable instances are rejected even if their canonical names/fingerprints collide; explicitly `unregister_session` before intentional replacement. This check is worker-local: no object addresses enter serialized fingerprints or workflow data.
 
 With `output_feedback_retries > 0`, **one activity may make multiple model calls**. Set `start_to_close >= single_call_time * (output_feedback_retries + 1)`, plus factory/store I/O and validation headroom. Two feedback retries with a 60-second single-call bound require at least 180 seconds before overhead. `maximum_attempts` is the independent Temporal outer retry budget; heartbeat timeout does not replace a sufficiently long start-to-close window.
 

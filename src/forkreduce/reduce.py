@@ -636,17 +636,20 @@ def _combine(calls: list[QueryResult[Any]]) -> QueryResult[Any] | None:
     cache = 0
     elapsed = 0.0
     attempts = 0
+    feedback_retries = 0
     for call in calls:
         usage = add_usage(usage, call.usage)
         cache += call.cache_hit_tokens
         elapsed += call.elapsed_ms
         attempts += call.attempts
+        feedback_retries += call.feedback_retries_used
     return replace(
         calls[-1],
         usage=usage,
         cache_hit_tokens=cache,
         elapsed_ms=elapsed,
         attempts=attempts,
+        feedback_retries_used=feedback_retries,
     )
 
 

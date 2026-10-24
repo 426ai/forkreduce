@@ -62,7 +62,7 @@ def prefix_hash(
         payload["document_format"] = document_format
     if message_layout != "split":
         payload["message_layout"] = message_layout
-    if query_separator != QUERY_SEPARATOR:
+    if message_layout == "single" and query_separator != QUERY_SEPARATOR:
         payload["query_separator"] = query_separator
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()

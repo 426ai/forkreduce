@@ -309,6 +309,7 @@ class Plan:
                 cache_hit_tokens=cache,
                 attempts=attempts,
                 elapsed_ms=elapsed,
+                feedback_retries_used=sum(part.feedback_retries_used for part in parts),
                 failure=None,
                 check_failures=list(problems),
                 context_warning=notice,

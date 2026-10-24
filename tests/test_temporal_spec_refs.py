@@ -273,7 +273,8 @@ async def test_generated_300_large_specs_never_enter_workflow_inputs(plugin):
 
 
 @pytest.mark.parametrize("cached", [False, True])
-async def test_worker_cannot_silently_ignore_frozen_literal_tail(cached):
+@pytest.mark.parametrize("original_instructions", [False, True])
+async def test_worker_cannot_silently_change_frozen_tail_instructions(cached, original_instructions):
     store = RecordingStore()
 
     def make(instructions):
@@ -286,7 +287,7 @@ async def test_worker_cannot_silently_ignore_frozen_literal_tail(cached):
             dynamic_output_instructions=instructions,
         )
 
-    original, wrong = make(False), make(True)
+    original, wrong = make(original_instructions), make(not original_instructions)
     assert original.prefix_hash == wrong.prefix_hash
     ref = await adapter.freeze_prefix(original, store)
     adapter.set_prefix_store(store)

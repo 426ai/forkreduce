@@ -160,7 +160,13 @@ def test_dynamic_instruction_switch_requires_bool(value: Any) -> None:
 
 
 def test_custom_separator_hashes_and_prefix_warning_use_literal_contract() -> None:
-    kwargs: dict[str, Any] = {"output_mode": "tools", "instructions": "", "rendered_documents": "raw", "tools": []}
+    kwargs: dict[str, Any] = {
+        "output_mode": "tools",
+        "instructions": "",
+        "rendered_documents": "raw",
+        "tools": [],
+        "message_layout": "single",
+    }
     historical = prefix_hash(**kwargs)
     assert prefix_hash(query_separator=QUERY_SEPARATOR, **kwargs) == historical
     assert prefix_hash(query_separator="", **kwargs) != historical
@@ -405,3 +411,21 @@ async def test_optional_explicit_context_and_variadic_output_only_callbacks() ->
         assert result.failure is None and result.output == Answer(value=7)
     assert contexts == [OutputValidationContext(query_id="arity", round=0, meta={})]
     assert argument_counts == [1]
+
+
+@pytest.mark.parametrize("mode", ["tools", "prompted"])
+async def test_unused_split_separator_preserves_request_hash_and_execution_identity(mode: str) -> None:
+    from forkreduce.contrib.temporal import execution_fingerprint
+
+    recorded = RecordingModel(lambda _n: {"value": 7})
+    kwargs = dict(documents="Evidence.", instructions="Answer.", outputs=[Answer], output_mode=mode)
+    default = build(recorded.model, **kwargs)
+    custom = build(recorded.model, **kwargs, query_separator="unused\x00separator")
+    left = await default.ask(Query(tail="Question.", output=Answer))
+    right = await custom.ask(Query(tail="Question.", output=Answer))
+    assert left.output == right.output == Answer(value=7)
+    assert left.prefix_hash == right.prefix_hash
+    assert execution_fingerprint(default) == execution_fingerprint(custom)
+    assert [part.content for part in user_parts(recorded.calls[0][0])] == [
+        part.content for part in user_parts(recorded.calls[1][0])
+    ]

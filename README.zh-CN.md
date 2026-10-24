@@ -318,9 +318,9 @@ session = build(
 
 raw 模式有意不清洗控制字符或添加应用分隔符，由应用保证输入字节确定及供应商可接受。raw 下拒绝 metadata 渲染选项，也没有框架 block 地址：`DocumentIndex.block_text`、`CitationCheck` 和使用内置引用检查/修复的 Plan 会明确拒绝。应使用应用自有定位/校验。快照保存两项配置，factory 必须恢复后再做 hash 校验。
 
-需要调用者完全控制动态尾巴时，在 raw/single 的 `build` 上设置 `query_separator="<custom boundary>"`、`dynamic_output_instructions=False`。首次 user part 精确等于 `raw_prefix + query_separator + query.tail`，保留所有空白/控制字符；不添加输出指令句、description、schema，也不裁剪，由应用提供指令。schema 校验仍执行。仅非默认 separator 参与 prefix hash；关闭动态指引只改尾巴/fingerprint，不改 prefix hash。静态输出尾巴不受影响。
+需要调用者完全控制动态尾巴时，在 raw/single 的 `build` 上设置 `query_separator="<custom boundary>"`、`dynamic_output_instructions=False`。首次 user part 精确等于 `raw_prefix + query_separator + query.tail`，保留所有空白/控制字符。关闭指引**只影响 OutputSpec 尾巴**：不添加指令句、description、schema，不裁剪；由应用提供指令，schema 校验仍执行。静态输出尾巴不变。非默认 separator 仅在 `message_layout="single"` 时影响 prefix hash/fingerprint，split 忽略它；关闭动态指引只改尾巴/fingerprint，不改 prefix hash。
 
-默认快照字段/字节不变。非默认布局使用带 `QueryLayout` 的 `ConfiguredFrozenPrefix`。factory 对两类快照均可读取 `frozen.query_separator`、`frozen.dynamic_output_instructions` 并传回 `build`；遗漏非默认恢复会被拒绝，已缓存 session 也不能绕过。
+默认快照字段/字节不变。非默认布局使用带 `QueryLayout` 的 `ConfiguredFrozenPrefix`。factory 对两类快照均可读取 `frozen.query_separator`、`frozen.dynamic_output_instructions` 并传回 `build`。默认和 configured 快照都会检查 factory/缓存 session；文档/消息布局或指令配置不一致时不可重试失败。split 中未使用的 separator 不参与比较。
 
 ### Query 与 QueryResult
 
@@ -414,11 +414,11 @@ key 内容寻址且按 namespace 隔离。同一 writer 对相同/并发 spec �
 大列表的正式模式是 **activity 按批生成**，不向 `MapQueriesInput` 塞无界列表，也不让 resolver 一次返回巨型列表。完整 [离线生成示例](examples/run_spec_refs_offline.py) 只传小型 job/范围，由 activity 准备每批 query/spec ref，workflow 用公开 `plan_batches` / `execute_query` 组合。准备结果和模型 activity 输入均须有界。示例覆盖 300 个不同合成 schema、每个超过 11 KB，所有 workflow/activity 输入及生成结果低于 512 KiB，含双 converter 和 replay。workflow 不做存储 I/O，不新增 `queries_ref` 字段或改变默认 activity 注册。应用替换生成 activity 数据源时保留有界输入/输出合同。
 
 ```bash
-PYTHONPATH=src:. python examples/run_spec_refs_offline.py
-PYTHONPATH=src:. python examples/run_spec_refs_offline.py --plugin
+python examples/run_spec_refs_offline.py
+python examples/run_spec_refs_offline.py --plugin
 ```
 
-运行需已有 `TEMPORAL_TEST_SERVER` 二进制和 checkout 的 dev/Temporal extras，不下载、不调用真实 provider、不导出遥测。
+运行需 checkout 的 dev/Temporal extras。未设置 `TEMPORAL_TEST_SERVER` 时，与集成测试一样使用 SDK 默认 server 缓存/下载行为；网络隔离运行时将它设为已有二进制。脚本直接运行会配置 checkout 导入路径，无需手动 PYTHONPATH；不调用真实 provider、不导出遥测。
 
 ### 检查与修复
 
@@ -544,11 +544,13 @@ gap = GapFill(
 
 `Policy(output_feedback_retries=0)` 保持单次请求行为。启用 `Policy(output_feedback_retries=1)` 并在 `build(..., output_validator=validate_output)` 传入校验器，可在同一题历史上有界续写。校验器接收解析后的输出，支持同步或异步，返回接受/替换后的值，通过 Pydantic AI `ModelRetry` 将错误回喂模型。schema 与跨字段校验失败也走同一机制。回喂不会重建共享前缀：instructions、文档字节、工具集合不变，仅给本题历史追加 retry 消息。
 
-`QueryResult.feedback_retries_used` 和 `meta["feedback_retries_used"]` 记录实际回喂次数；本地外层重试会累加该数。每次实际请求（含回喂）之前都检查请求数/token 预算。`Policy.retries` 仍是独立的外层重试上限。回喂和校验器不改变 `prefix_hash`，非默认配置会改变 Temporal execution fingerprint。
+`QueryResult.feedback_retries_used` 和 `meta["feedback_retries_used"]` 记录实际回喂次数。本地外层尝试、check/repair 合并、reduce 合并都按实际调用累加，不重复计算已有历史。每次请求（含回喂）之前检查请求数/token 预算。`Policy.retries` 仍是独立外层重试上限。回喂和校验器不改变 prefix hash，非默认配置会改变 Temporal execution fingerprint。
 
 Temporal activity 使用 worker 登记或 factory 构建的 session，不序列化函数。`FrozenPrefix.output_feedback_retries` 保存数值策略；factory 应以 `Policy(output_feedback_retries=frozen.output_feedback_retries)` 恢复，并安装 worker 本地校验器。activity 成功/安全失败结果记录最后一次 activity attempt 的 `feedback_retries_used`，不猜测跨 Temporal attempt 的总数。校验错误会发送给模型，勿将敏感内容放入错误信息。
 
 校验器也可接受 `(output, context: OutputValidationContext)`，类型从 `forkreduce` 导出。显式第二个位置参数表示启用，context 包含 `query_id`、`round` 和深拷贝的 `meta`；同步/异步、原生 `ModelRetry` 行为相同。按 query 绑定，不修改共享 Agent，并发题目不会串身份。回调仍由 worker 持有，不改变 prefix hash；原有单参数行为不变。
+
+再次注册同一 prefix 时须复用同一个 validator callable 对象。即使 canonical name/fingerprint 相同，不同闭包或 callable 实例也会被拒绝；有意替换时先 `unregister_session`。该检查仅存在 worker 本地，不把对象地址放进 fingerprint 或 workflow 数据。
 
 `output_feedback_retries > 0` 时，**一个 activity 可能调用模型多次**。须设置 `start_to_close >= single_call_time * (output_feedback_retries + 1)`，另加 factory/store I/O、校验余量。例如单次上界 60 秒、最多两次反馈，至少需 180 秒再加额外开销。`maximum_attempts` 为独立 Temporal 外层尝试次数；heartbeat timeout 不能代替足够长的 start-to-close。
 

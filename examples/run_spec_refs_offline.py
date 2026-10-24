@@ -1,8 +1,8 @@
 """Generate bounded batches in an activity; never send a large query/spec list.
 
-Requires checkout dev/Temporal extras and an existing TEMPORAL_TEST_SERVER binary.
-Run with PYTHONPATH=src:. python examples/run_spec_refs_offline.py [--plugin].
-Only synthetic models/data; no downloads, provider requests or telemetry exports.
+Requires checkout dev/Temporal extras. Run python examples/run_spec_refs_offline.py [--plugin].
+Set TEMPORAL_TEST_SERVER to a cached binary for network-isolated runs; otherwise
+use the SDK's default test-server cache/download behavior. No real model calls or telemetry exports.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
@@ -18,10 +19,15 @@ from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from temporalio import activity, workflow
-from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Replayer, Worker
-from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
+if __name__ == "__main__" and not __package__:
+    root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root))
+    sys.path.insert(0, str(root / "src"))
+
+from temporalio import activity, workflow  # noqa: E402
+from temporalio.testing import WorkflowEnvironment  # noqa: E402
+from temporalio.worker import Replayer, Worker  # noqa: E402
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions  # noqa: E402
 
 with workflow.unsafe.imports_passed_through():
     from pydantic_ai import models
@@ -90,8 +96,6 @@ class GeneratedQueriesWorkflow:
 
 async def run(*, plugin: bool = False) -> dict[str, int | bool]:
     binary = os.environ.get("TEMPORAL_TEST_SERVER")
-    if not binary or not Path(binary).is_file():
-        raise RuntimeError("Set TEMPORAL_TEST_SERVER to an existing cached binary; downloads are disabled")
     old_allow = models.ALLOW_MODEL_REQUESTS
     models.ALLOW_MODEL_REQUESTS = False
     requests: Counter[str] = Counter()
