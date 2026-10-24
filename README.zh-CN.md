@@ -601,24 +601,60 @@ Temporal 默认 converter 和 `PydanticAIPlugin` 安装的 `PydanticAIPayloadCon
 
 分批模式要求 `MessageStore`，返回 `messages_ref` 和 `output_ref`，不把 transcript 或结构化结果正文带回父历史。父历史与 transcript 大小无关，但问题尾巴、meta 和结果引用列表仍占用空间，须保持精简。分批续问必须用 `history_ref`，不能用内联 `history_json`。默认列表输入/单工作流模式仍支持小载荷内联。
 
-`MessageStore` 与 `PrefixStore` 使用异步 `put(key, bytes) -> ref` / `get(ref) -> bytes` 接口。生产实现应为所有 worker 可访问的对象存储/数据库；`InMemoryMessageStore` 只适合单进程示例/测试。大前缀在 workflow 之外冻结，例如应用的 `prepare` activity，只返回引用和小问题载荷：
+`MessageStore` / `PrefixStore` 保留旧异步 `put(key, bytes)` / `get(ref)` 协议；新 `ContextMessageStore` 在两者上接受 keyword-only `context: StoreContext`。适配器先检测签名，绝不捕获 `TypeError` 后重复写入。生产应接所有 worker 共享的持久存储；`InMemoryMessageStore` 只适合单进程测试。
+
+#### Worker 重启安全的接入示例
+
+下面的 SQLite store 可跨本地 worker 重启保留引用；分布式 worker 应改用共享对象存储或数据库，确保每个 worker 都能读取同一引用。凭证和输出类始终留在应用进程内。`model`、`session`、`Answer`、`questions`、`client` 沿用上面的应用配置。
 
 ```python
+import asyncio
+import sqlite3
+from pathlib import Path
 from forkreduce.contrib.temporal import (
-    freeze_prefix, register_session_factory, set_prefix_store, set_message_store,
+    StoreContext, delete_ref, freeze_prefix, set_default_session_factory,
+    set_prefix_store, set_message_store,
 )
 
-# client 或 prepare activity；store 为应用提供的持久存储。
-prefix_ref = await freeze_prefix(session, store)
+class DurableStore:
+    def __init__(self, path: str):
+        self.path = path
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS blobs (ref TEXT PRIMARY KEY, body BLOB)")
+
+    def execute(self, sql, args):
+        with sqlite3.connect(self.path) as db:
+            return db.execute(sql, args).fetchone()
+
+    async def put(self, key: str, payload: bytes, *, context: StoreContext) -> str:
+        # 框架生成的 key 已包含转义后的 namespace 前缀。
+        await asyncio.to_thread(self.execute, "INSERT OR REPLACE INTO blobs VALUES (?, ?)", (key, payload))
+        return key
+
+    async def get(self, ref: str, *, context: StoreContext) -> bytes:
+        row = await asyncio.to_thread(self.execute, "SELECT body FROM blobs WHERE ref = ?", (ref,))
+        if row is None:
+            raise KeyError(ref)
+        return row[0]
+
+    async def delete(self, ref: str, *, context: StoreContext) -> None:
+        await asyncio.to_thread(self.execute, "DELETE FROM blobs WHERE ref = ?", (ref,))
+
+store = DurableStore(str(Path("shared-blobs.sqlite")))
+app_meta = {"ref_namespace": "demo-run", "schema_version": 1}
+# client 或 prepare activity 内执行，不在 workflow 内冻结：
+prefix_ref = await freeze_prefix(session, store, app_meta=app_meta)
 payloads = [
     query_activity_input(
         session, query_id=f"q{i}", tail=question, output_name="Answer", prefix_ref=prefix_ref,
+        meta={"ref_namespace": "demo-run"},
     )
     for i, question in enumerate(questions)
 ]
 
-# 每个 worker 启动时配置，凭证与 Python 输出类留在进程内。
+# 每个 worker 启动时配置，不需要恢复逐 prefix 的登记列表。
 def restore(frozen):
+    assert frozen.app_meta["schema_version"] == 1
     return build(
         model, documents=frozen.documents, instructions=frozen.instructions,
         outputs=[Answer], output_mode=frozen.output_mode,
@@ -627,16 +663,32 @@ def restore(frozen):
 
 set_prefix_store(store)
 set_message_store(store)
-register_session_factory(session.prefix_hash, restore)
-# 在上方 worker 运行期间执行：
+set_default_session_factory(restore)
+# worker 同时登记两个 workflow 和 run_query_activity，并在运行期间提交：
 results = await client.execute_workflow(
     MapQueriesWorkflow.run,
-    MapQueriesInput(queries=payloads, batch_size=15, child_concurrency=4),
+    MapQueriesInput(queries=payloads, batch_size=15, child_concurrency=4, on_query_failure="return"),
     id="extraction-run-2", task_queue="extraction",
 )
-answer = Answer.model_validate_json(await store.get(results[0].output_ref))
-# 续问使用 history_ref=results[0].messages_ref。
+for result in results:
+    if result.failure_kind is not None:
+        print(result.query_id, result.failure_kind, result.failure_message, result.attempts)
+    else:
+        context = StoreContext(kind="output", prefix_hash=result.prefix_hash, namespace="demo-run")
+        answer = Answer.model_validate_json(await store.get(result.output_ref, context=context))
+# 成功结果用 history_ref=result.messages_ref 续问。
+# 仅在应用确认引用保留期结束后，显式清理：
+# await delete_ref(store, ref, context=StoreContext(kind="prefix", prefix_hash=session.prefix_hash,
+#                                                namespace="demo-run"))
 ```
+
+`on_query_failure="raise"` 仍是默认，旧 list 调用不变。`"return"` 保持输入顺序，成功/失败都用 `QueryActivityOutput`：失败带 `failure_kind`、有界且不含载荷原文的 `failure_message` 和 `attempts`，不带 transcript/output 正文或引用。可重试错误耗尽映射为 `retryable_exhausted`，不可重试错误为 `permanent` 或 `budget`，Temporal 超时/取消为 `timeout`/`cancelled`；workflow 自身取消始终向上传播。attempts 记录已观察到的 activity 尝试数；`0` 表示 SDK 错误没有提供次数信息（例如执行前超时），不是猜测配置上限。
+
+查找顺序为显式登记的 session、prefix 精确 factory、`set_default_session_factory`；传 `None` 清除默认 factory。都缺失时抛可重试 `session_factory_missing`，仍受已配置重试预算约束，worker 补齐配置后可在后续 attempt 成功。快照损坏、重建/hash 不一致仍不可重试。
+
+`freeze_prefix(..., app_meta=...)` 将 JSON 元数据复制进 `FrozenPrefix.app_meta`（旧快照默认 `{}`），限制为 **16 KiB compact UTF-8 JSON**，不参与 prefix hash、identity 或 execution fingerprint。仅放路由/schema 标识，**不要放密钥、正文或文档载荷**；factory 获得完整快照。
+
+`StoreContext` 是 frozen、可序列化 dataclass，字段为 `workflow_id`、`run_id`、`parent_workflow_id`、`activity_id`、`query_id`、`round`、`attempt`、`kind`（`prefix/messages/output/history`）、`prefix_hash`、`namespace`。不可用的执行字段为 `None`。query `meta.ref_namespace` 优先于快照 `app_meta.ref_namespace`；若首次 prefix 读取需要 namespace 路由，须在 query meta 重复携带，因为读取完成前拿不到快照元数据。非空 namespace 经 URL 转义后加到框架 key 前；没有 namespace 时 key 原样保留。context 仅为路由元数据，不是鉴权边界。可选 `delete(ref, *, context)` 仅由应用显式调用 `delete_ref(store, ref, *, context)` 触发，兼容旧 `delete(ref)`；没有 delete 则抛 `NotImplementedError`。框架不会自动删除对象。
 
 `FrozenPrefix` 存文档、说明、渲染前缀与工具身份，不序列化可执行模型/schema 类。worker 会校验重建后的 prefix hash；须保持 schema/渲染配置一致。worker 启动时登记 factory，引用对象保留到重试/续问生命周期结束。最终结果与引用应持久化，已结束 workflow 的实时流不能当归档重放接口。编排存在不兼容变更时，排空在途执行或使用 worker versioning/新队列，并重放实际迁移所需历史；converter 测试不保证任意旧工作流代码在编排变更后仍能重放。
 `FrozenPrefix.output_mode` 保留请求模式（包括 auto），`resolved_output_mode` 记录实际模式（旧快照可为 `None`），`on_unforced_tools` 保留诊断策略。factory 按上例恢复请求模式和策略，还须恢复相同 thinking 相关模型/session 设置。worker 校验实际模式及 prefix hash；能力或设置改变必须失败，不得悄悄恢复不同输出约定。模型/设置由 factory 管理，不将含传输凭据的设置序列化进快照。

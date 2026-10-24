@@ -601,24 +601,60 @@ Registration is process-local. Payloads carry hashes, tails, output names, optio
 
 Batch mode requires a `MessageStore` and returns `messages_ref` plus `output_ref`, not transcript/structured-output bodies. Parent history is independent of transcript size, but query tails, metadata, and reference lists still occupy history. Keep them small. Batch continuations require `history_ref`, not inline `history_json`. Single-workflow/list-input mode keeps inline behavior for small cases.
 
-`MessageStore` and `PrefixStore` use async `put(key, bytes) -> ref` / `get(ref) -> bytes`. Implement durable object storage/database access shared by every worker; `InMemoryMessageStore` is process-local, for examples/tests only. Freeze large prefixes outside workflow code, e.g. in an application's `prepare` activity, returning only references and small query payloads:
+`MessageStore` / `PrefixStore` retain the legacy async `put(key, bytes)` / `get(ref)` protocol. A `ContextMessageStore` instead accepts keyword-only `context: StoreContext` on both methods. The adapter inspects signatures before calling; it never retries a write after `TypeError`. Implement shared durable storage for production; `InMemoryMessageStore` is process-local and test-only.
+
+#### Worker-restart-safe integration
+
+This runnable storage implementation persists across local worker restarts. Use a shared object store/database for distributed workers; every worker must resolve the same references. Application credentials and output classes remain local. `model`, `session`, `Answer`, `questions`, and `client` below are the application objects from the recipe above.
 
 ```python
+import asyncio
+import sqlite3
+from pathlib import Path
 from forkreduce.contrib.temporal import (
-    freeze_prefix, register_session_factory, set_prefix_store, set_message_store,
+    StoreContext, delete_ref, freeze_prefix, set_default_session_factory,
+    set_prefix_store, set_message_store,
 )
 
-# Client or prepare activity; store is your durable implementation.
-prefix_ref = await freeze_prefix(session, store)
+class DurableStore:
+    def __init__(self, path: str):
+        self.path = path
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS blobs (ref TEXT PRIMARY KEY, body BLOB)")
+
+    def execute(self, sql, args):
+        with sqlite3.connect(self.path) as db:
+            return db.execute(sql, args).fetchone()
+
+    async def put(self, key: str, payload: bytes, *, context: StoreContext) -> str:
+        # Framework-generated keys already include the escaped namespace prefix.
+        await asyncio.to_thread(self.execute, "INSERT OR REPLACE INTO blobs VALUES (?, ?)", (key, payload))
+        return key
+
+    async def get(self, ref: str, *, context: StoreContext) -> bytes:
+        row = await asyncio.to_thread(self.execute, "SELECT body FROM blobs WHERE ref = ?", (ref,))
+        if row is None:
+            raise KeyError(ref)
+        return row[0]
+
+    async def delete(self, ref: str, *, context: StoreContext) -> None:
+        await asyncio.to_thread(self.execute, "DELETE FROM blobs WHERE ref = ?", (ref,))
+
+store = DurableStore(str(Path("shared-blobs.sqlite")))
+app_meta = {"ref_namespace": "demo-run", "schema_version": 1}
+# Client or prepare activity, not workflow code:
+prefix_ref = await freeze_prefix(session, store, app_meta=app_meta)
 payloads = [
     query_activity_input(
         session, query_id=f"q{i}", tail=question, output_name="Answer", prefix_ref=prefix_ref,
+        meta={"ref_namespace": "demo-run"},
     )
     for i, question in enumerate(questions)
 ]
 
-# Every worker: model credentials and output classes stay local.
+# Every worker startup: no per-prefix registration list to recover.
 def restore(frozen):
+    assert frozen.app_meta["schema_version"] == 1
     return build(
         model, documents=frozen.documents, instructions=frozen.instructions,
         outputs=[Answer], output_mode=frozen.output_mode,
@@ -627,16 +663,32 @@ def restore(frozen):
 
 set_prefix_store(store)
 set_message_store(store)
-register_session_factory(session.prefix_hash, restore)
-# Execute while the worker above is running:
+set_default_session_factory(restore)
+# Execute while a worker registering both workflows and run_query_activity is running:
 results = await client.execute_workflow(
     MapQueriesWorkflow.run,
-    MapQueriesInput(queries=payloads, batch_size=15, child_concurrency=4),
+    MapQueriesInput(queries=payloads, batch_size=15, child_concurrency=4, on_query_failure="return"),
     id="extraction-run-2", task_queue="extraction",
 )
-answer = Answer.model_validate_json(await store.get(results[0].output_ref))
-# Continue with history_ref=results[0].messages_ref.
+for result in results:
+    if result.failure_kind is not None:
+        print(result.query_id, result.failure_kind, result.failure_message, result.attempts)
+    else:
+        context = StoreContext(kind="output", prefix_hash=result.prefix_hash, namespace="demo-run")
+        answer = Answer.model_validate_json(await store.get(result.output_ref, context=context))
+# Continue successful queries with history_ref=result.messages_ref.
+# Only after the application ends the reference retention lifetime:
+# await delete_ref(store, ref, context=StoreContext(kind="prefix", prefix_hash=session.prefix_hash,
+#                                                namespace="demo-run"))
 ```
+
+`on_query_failure="raise"` remains the default, including legacy list inputs. `"return"` preserves input order and returns mixed successes/failures in `QueryActivityOutput`; failures have `failure_kind`, a bounded payload-free `failure_message`, and `attempts`, without transcript/output bodies or references. Terminal retryable failures map to `retryable_exhausted`, non-retryable errors to `permanent` or `budget`, and Temporal timeout/cancellation to `timeout`/`cancelled`. Workflow cancellation always propagates. Attempts count observed activity attempts; `0` means the SDK failure supplied no attempt metadata (for example a timeout before execution), not a guessed retry limit.
+
+Factory lookup prefers an explicitly registered session, then the exact prefix factory, then `set_default_session_factory`; pass `None` to clear the default. Missing factories raise retryable `session_factory_missing`, bounded by the configured retry policy, so repaired worker configuration can succeed on a later attempt. Corrupt snapshots and reconstruction/hash mismatches remain non-retryable.
+
+`freeze_prefix(..., app_meta=...)` copies JSON metadata into `FrozenPrefix.app_meta` (legacy snapshots default to `{}`). It is limited to **16 KiB of compact UTF-8 JSON** and excluded from prefix hash, identity and execution fingerprint. Put only routing/schema identifiers here, **never secrets or document/body text**. Factories receive the complete snapshot.
+
+`StoreContext` is a frozen, serializable dataclass: `workflow_id`, `run_id`, `parent_workflow_id`, `activity_id`, `query_id`, `round`, `attempt`, `kind` (`prefix/messages/output/history`), `prefix_hash`, and `namespace`. Unavailable execution fields are `None`. Query `meta.ref_namespace` overrides snapshot `app_meta.ref_namespace`; repeat it on queries when initial prefix reads need namespace routing, because snapshot metadata is unavailable until that read finishes. Nonempty namespaces are URL-escaped and prepended to generated keys; without one, keys are unchanged. Context is routing metadata, not an authorization boundary. Optional `delete(ref, *, context)` is called only by explicit `delete_ref(store, ref, *, context)`; legacy `delete(ref)` is supported, missing deletion raises `NotImplementedError`. The framework never deletes blobs automatically.
 
 `FrozenPrefix` stores documents, instructions, rendered prefix and tool identity, not executable model/schema objects. Reconstruction verifies the prefix hash: use matching schemas/rendering configuration. Configure factories at worker startup and retain blobs through retry/continuation lifetimes. Persist references and final application results; completed workflow streams are not a replayable archive. Drain in-flight workflows or use worker versioning/new task queues for incompatible orchestration changes, and replay representative old histories before migrating. Converter tests are not a guarantee that arbitrary old workflow code replays after orchestration changes.
 `FrozenPrefix.output_mode` retains the requested mode, including `"auto"`; `FrozenPrefix.resolved_output_mode` records the actual mode (`None` for legacy snapshots), and `on_unforced_tools` preserves the diagnostic policy. Restore the requested mode and policy as above, and supply the same thinking-related model/session settings in the factory. Workers verify the reconstructed resolved mode and prefix hash: changed capabilities/settings must fail rather than silently restore a different output contract. The factory still owns model/settings; settings that may contain transport credentials are not serialized into the snapshot.
