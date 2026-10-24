@@ -232,7 +232,8 @@ async def test_heartbeat_helper_is_safe_outside_activity(monkeypatch):  # type: 
 async def test_periodic_heartbeat_task_always_stops(monkeypatch, outcome: str):  # type: ignore[no-untyped-def]
     beats = []
     monkeypatch.setattr(adapter.activity, "in_activity", lambda: True)
-    monkeypatch.setattr(adapter.activity, "heartbeat", lambda: beats.append(True))
+    monkeypatch.setattr(adapter.activity, "info", lambda: SimpleNamespace(attempt=2))
+    monkeypatch.setattr(adapter.activity, "heartbeat", lambda detail: beats.append(detail))
     started = asyncio.Event()
 
     async def work():  # type: ignore[no-untyped-def]
@@ -256,6 +257,7 @@ async def test_periodic_heartbeat_task_always_stops(monkeypatch, outcome: str): 
     else:
         assert await running == "done"
     assert len(beats) >= 2
+    assert all(detail == {"forkreduce_attempt": 2} for detail in beats)
     count = len(beats)
     await asyncio.sleep(0.02)
     assert len(beats) == count

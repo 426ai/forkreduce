@@ -12,8 +12,9 @@ classes locally; neither is serialized.
 
 Transcripts use :class:`MessageStore` references when configured. Direct maps
 retain inline results for compatibility; child batches require references for
-both transcripts and structured outputs. Direct callers can request the same
-reference-only behavior with ``QueryActivityInput.require_references``.
+successful transcripts and structured outputs. ``MapQueriesInput.on_query_failure``
+can return safe failure records instead of failing the map; cancellation of the
+workflow always propagates. Direct callers can also request reference-only results.
 """
 
 from __future__ import annotations
@@ -24,11 +25,11 @@ import json
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Literal, Protocol, TypeVar, cast
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, RetryState, TimeoutError, is_cancelled_exception
 
 with workflow.unsafe.imports_passed_through():
     from collections.abc import Awaitable, Callable, Mapping
@@ -313,6 +314,10 @@ def activity_id(prefix_hash: str, query_id: str) -> str:
     return f"forkreduce:{prefix_hash}:{query_id}"
 
 
+def _attempt_detail() -> dict[str, int]:
+    return {"forkreduce_attempt": activity.info().attempt if activity.in_activity() else 1}
+
+
 def to_application_error(failure: Failure) -> ApplicationError:
     """Map a classified failure onto a Temporal application error.
 
@@ -322,6 +327,7 @@ def to_application_error(failure: Failure) -> ApplicationError:
     return ApplicationError(
         failure.message,
         failure.kind.value,
+        _attempt_detail(),
         type=failure.kind.value,
         non_retryable=not failure.retryable,
     )
@@ -364,6 +370,7 @@ class QueryActivityInput:
     prefix_ref: str | None = None
     activity_options: ActivityOptions | None = None
     require_references: bool = False
+    parent_workflow_id: str | None = None
 
 
 def query_activity_input(
@@ -432,7 +439,11 @@ def activity_retry_policy(payload: QueryActivityInput) -> RetryPolicy:
 
 @dataclass
 class QueryActivityOutput:
-    """Activity result. Messages are a ref when a store is configured."""
+    """Activity result, or a safe terminal failure without bodies or references.
+
+    ``attempts`` counts activity executions, not the configured retry maximum.
+    A terminal SDK failure without attempt metadata reports zero (unknown).
+    """
 
     query_id: str
     prefix_hash: str
@@ -444,10 +455,12 @@ class QueryActivityOutput:
     messages_json: str | None = None
     output_ref: str | None = None
     resolved_output_mode: ResolvedOutputMode | None = None
+    failure_kind: str | None = None
+    failure_message: str | None = None
 
 
 def _permanent(message: str) -> ApplicationError:
-    return ApplicationError(message, "permanent", type="permanent", non_retryable=True)
+    return ApplicationError(message, "permanent", _attempt_detail(), type="permanent", non_retryable=True)
 
 
 async def _resolve_session(payload: QueryActivityInput) -> Session:
@@ -504,7 +517,7 @@ async def heartbeat_while(awaitable: Awaitable[_T], heartbeat_timeout: float | N
 
     async def beat() -> None:
         while True:
-            activity.heartbeat()
+            activity.heartbeat(_attempt_detail())
             await asyncio.sleep(min(heartbeat_timeout / 3, 30.0))
 
     task = asyncio.create_task(beat())
@@ -533,30 +546,15 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
     session = await _resolve_session(payload)
     output_type = session.output_types.get(payload.output_name)
     if output_type is None:
-        raise ApplicationError(
-            f"Output {payload.output_name!r} is not registered on this session",
-            "permanent",
-            type="permanent",
-            non_retryable=True,
-        )
+        raise _permanent(f"Output {payload.output_name!r} is not registered on this session")
     history: list[ModelMessage] | None = None
     if payload.history_ref is not None and payload.history_json is not None:
-        raise ApplicationError(
-            "Set only one of history_ref and history_json",
-            "permanent",
-            type="permanent",
-            non_retryable=True,
-        )
+        raise _permanent("Set only one of history_ref and history_json")
     if payload.history_json is not None:
         history = list(ModelMessagesTypeAdapter.validate_json(payload.history_json))
     elif payload.history_ref is not None:
         if _STORE is None:
-            raise ApplicationError(
-                "history_ref was set but this worker has no message store",
-                "permanent",
-                type="permanent",
-                non_retryable=True,
-            )
+            raise _permanent("history_ref was set but this worker has no message store")
         history = list(ModelMessagesTypeAdapter.validate_json(await _STORE.get(payload.history_ref)))
     query_settings = cast(ModelSettings, dict(payload.model_settings)) if payload.model_settings else None
     query: Query[Any] = Query(
@@ -597,7 +595,7 @@ async def _execute_query_activity(payload: QueryActivityInput) -> QueryActivityO
         output_json=output_json,
         output_type=output_name,
         cache_hit_tokens=result.cache_hit_tokens,
-        attempts=result.attempts,
+        attempts=activity.info().attempt if activity.in_activity() else result.attempts,
         messages_ref=messages_ref,
         messages_json=messages_json,
         output_ref=output_ref,
@@ -613,12 +611,13 @@ async def run_query_activity(payload: QueryActivityInput) -> QueryActivityOutput
 
 @dataclass
 class MapQueriesInput:
-    """Map configuration. Batch mode returns only transcript/output references."""
+    """Map configuration; failures raise unless explicitly returned as safe records."""
 
     queries: list[QueryActivityInput]
     batch_size: int | None = None
     child_concurrency: int = 4
     activity_options: ActivityOptions | None = None
+    on_query_failure: Literal["raise", "return"] = "raise"
 
 
 def activity_timeout_options(options: ActivityOptions | None) -> dict[str, Any]:
@@ -638,14 +637,77 @@ def child_workflow_id(prefix_hash: str, batch_index: int) -> str:
     return f"forkreduce:{parent_hash}:{prefix_hash}:batch:{batch_index}"
 
 
-async def _execute_activity(payload: QueryActivityInput, retry_policy: RetryPolicy) -> QueryActivityOutput:
-    return await workflow.execute_activity(
-        run_query_activity,
-        payload,
-        activity_id=activity_id(payload.prefix_hash, payload.query_id),
-        retry_policy=retry_policy,
-        **activity_timeout_options(payload.activity_options),
+_FAILURE_MESSAGES = {
+    "retryable_exhausted": "Query failed after retry attempts were exhausted.",
+    "permanent": "Query failed permanently.",
+    "budget": "Query exceeded its execution budget.",
+    "timeout": "Query activity timed out.",
+    "cancelled": "Query activity was cancelled.",
+    "application": "Query activity failed with an application error.",
+    "activity": "Query activity failed.",
+}
+
+
+def _failure_output(payload: QueryActivityInput, error: ActivityError) -> QueryActivityOutput:
+    cause = error.__cause__
+    attempts = 0
+    details = (
+        cause.details
+        if isinstance(cause, ApplicationError)
+        else cause.last_heartbeat_details if isinstance(cause, TimeoutError) else ()
     )
+    for detail in details:
+        if isinstance(detail, dict):
+            attempt = detail.get("forkreduce_attempt")
+            if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 0:
+                attempts = attempt
+    if is_cancelled_exception(error):
+        kind = "cancelled"
+    elif isinstance(cause, TimeoutError) or error.retry_state == RetryState.TIMEOUT:
+        kind = "timeout"
+    elif isinstance(cause, ApplicationError):
+        if cause.type in ("permanent", "budget", "cancelled"):
+            kind = cause.type or "application"
+        elif error.retry_state == RetryState.MAXIMUM_ATTEMPTS_REACHED:
+            kind = "retryable_exhausted"
+        else:
+            kind = "application"
+    else:
+        kind = "activity"
+    return QueryActivityOutput(
+        query_id=payload.query_id,
+        prefix_hash=payload.prefix_hash,
+        output_json=None,
+        output_type=None,
+        cache_hit_tokens=0,
+        attempts=attempts,
+        failure_kind=kind,
+        failure_message=_FAILURE_MESSAGES[kind],
+    )
+
+
+async def _execute_activity(
+    payload: QueryActivityInput,
+    retry_policy: RetryPolicy,
+    on_query_failure: Literal["raise", "return"] = "raise",
+) -> QueryActivityOutput:
+    if workflow.in_workflow():
+        parent = workflow.info().parent
+        payload = replace(payload, parent_workflow_id=parent.workflow_id if parent is not None else None)
+    try:
+        return await workflow.execute_activity(
+            run_query_activity,
+            payload,
+            activity_id=activity_id(payload.prefix_hash, payload.query_id),
+            retry_policy=retry_policy,
+            **activity_timeout_options(payload.activity_options),
+        )
+    except ActivityError as exc:
+        if on_query_failure == "raise" or (
+            workflow.in_workflow() and workflow.cancellation_reason() is not None
+        ):
+            raise
+        return _failure_output(payload, exc)
 
 
 @workflow.defn(name="forkreduce.query_batch")
@@ -665,7 +727,9 @@ class QueryBatchWorkflow:
             for query in inputs.queries
         ]
         outputs = list(
-            await asyncio.gather(*(_execute_activity(query, activity_retry_policy(query)) for query in queries))
+            await asyncio.gather(
+                *(_execute_activity(query, activity_retry_policy(query), inputs.on_query_failure) for query in queries)
+            )
         )
         if any(
             output.messages_json is not None
@@ -673,6 +737,7 @@ class QueryBatchWorkflow:
             or output.output_json is not None
             or (output.output_type is not None and output.output_ref is None)
             for output in outputs
+            if output.failure_kind is None
         ):
             raise _permanent("Batch activities must return transcript and output references")
         return outputs
@@ -695,7 +760,9 @@ class MapQueriesWorkflow:
         ]
         if config.batch_size is None:
             return list(
-                await asyncio.gather(*(_execute_activity(query, activity_retry_policy(query)) for query in queries))
+                await asyncio.gather(
+                    *(_execute_activity(query, activity_retry_policy(query), config.on_query_failure) for query in queries)
+                )
             )
         if isinstance(config.batch_size, bool) or not isinstance(config.batch_size, int) or config.batch_size < 1:
             raise _permanent("batch_size must be a positive integer")
@@ -713,7 +780,11 @@ class MapQueriesWorkflow:
             async with slots:
                 return await workflow.execute_child_workflow(
                     QueryBatchWorkflow.run,
-                    MapQueriesInput(queries=items, activity_options=config.activity_options),
+                    MapQueriesInput(
+                        queries=items,
+                        activity_options=config.activity_options,
+                        on_query_failure=config.on_query_failure,
+                    ),
                     id=child_workflow_id(items[0].prefix_hash, index),
                 )
 
