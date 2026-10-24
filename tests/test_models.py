@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 from pydantic import BaseModel
 from tests.support import Scripted, tool_result
@@ -77,3 +80,39 @@ async def test_query_model_settings_override_the_session() -> None:
     assert second["temperature"] == 0.7
     assert second["extra_body"] == {"b": 2}
     assert second["timeout"] == 5
+
+
+def test_core_without_openai_and_actionable_provider_error() -> None:
+    script = """
+import asyncio
+import importlib.abc
+import sys
+
+class NoOpenAI(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "openai" or fullname.startswith("openai."):
+            raise ModuleNotFoundError("OpenAI deliberately unavailable")
+
+sys.meta_path.insert(0, NoOpenAI())
+from pydantic import BaseModel
+from pydantic_ai.models.test import TestModel
+from forkreduce import Query, build, openai_compatible_model
+
+class Answer(BaseModel):
+    text: str
+
+async def main():
+    session = build(TestModel(custom_output_args={"text": "offline"}),
+                    documents="Synthetic evidence", instructions="Answer", outputs=[Answer], warmup=False)
+    result = await session.ask(Query(tail="Question", output=Answer))
+    assert result.output.text == "offline"
+    try:
+        openai_compatible_model("synthetic-model")
+    except ImportError as error:
+        assert "forkreduce[openai]" in str(error)
+    else:
+        raise AssertionError("Missing SDK must produce an installation hint")
+
+asyncio.run(main())
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=30)

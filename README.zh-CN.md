@@ -12,10 +12,12 @@ forkreduce 是一个基于 [Pydantic AI](https://ai.pydantic.dev/) 的 Python �
 需要 Python 3.11 或更高版本。
 
 ```bash
-pip install forkreduce
+pip install "forkreduce[openai]"
 ```
 
 Temporal 适配器是可选依赖：`pip install "forkreduce[temporal]"`。核心包不会导入它。
+
+基础安装改用不带厂商 SDK 的 `pydantic-ai-slim`。OpenAI 兼容 helper 使用 `[openai]`，需要完整 Pydantic AI 厂商依赖时使用 `[full]`。此前依赖传递安装获得其他厂商 SDK 的应用，须改装 `forkreduce[full]` 或显式安装所需 slim extra。未安装 OpenAI 时仍可导入核心和 TestModel；调用 helper 才抛带安装提示的 `ImportError`。依赖变更不影响哈希或默认执行行为。
 
 本 checkout 的源码版本是 **0.2.0**，修改版本元数据不等于发布。发布前安装本 checkout 请使用 `pip install -e .` 或 `pip install -e ".[temporal]"`；上面的命令安装 PyPI 当前已发布版本。
 

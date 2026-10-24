@@ -12,10 +12,12 @@ forkreduce is a small Python framework, built on [Pydantic AI](https://ai.pydant
 Requires Python 3.11 or newer.
 
 ```bash
-pip install forkreduce
+pip install "forkreduce[openai]"
 ```
 
 The Temporal adapter is optional: `pip install "forkreduce[temporal]"`. The core package never imports it.
+
+The base install uses `pydantic-ai-slim` without provider SDKs. Use `[openai]` for the OpenAI-compatible helper, or `[full]` for the Pydantic AI provider bundle. Applications that previously relied on transitive vendor SDKs must install `forkreduce[full]` or their chosen slim provider extra explicitly. Without OpenAI installed, core/TestModel imports still work and the helper raises an actionable `ImportError`. This dependency change does not change hashes or default execution behavior.
 
 The source version in this checkout is **0.2.0**. Updating metadata does not publish a package. To install this checkout before publication, use `pip install -e .` or `pip install -e ".[temporal]"`; the commands above install the version currently published on PyPI.
 

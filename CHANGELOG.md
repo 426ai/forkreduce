@@ -20,6 +20,8 @@
 
 ### Changed
 
+- Base dependency is now `pydantic-ai-slim>=2.57,<3`; `[openai]` installs its OpenAI support and `[full]` restores the complete `pydantic-ai` provider bundle. HTTPX is an explicit dependency for the existing transport API. CI covers slim/OpenAI/Temporal and full installations. Core imports do not require a provider SDK; calling the OpenAI helper without its extra raises an actionable `ImportError`. No hash or default execution change.
+
 - Reduce tails explicitly enumerate allowed input/fork IDs and per-question source mappings when `question_id` fields are present, including nested outputs and tree aliases. Document/block IDs are not reduce provenance IDs. Citation-repair tails repeat the single-block constraint.
 - English and Chinese documentation include the 2-attempt / 3-minute / 30-second-heartbeat recipe, plugin coexistence, batching/reference storage, and reasoning-token headroom. Primary-source links explain model/vendor forced-tool restrictions (HTTP 400 or silent `auto`, especially with thinking), exact Pydantic AI 2.61 profile semantics/defaults, and MiMo thinking's forced `temperature=1.0` / `top_p=0.95` despite requested zero temperature.
 
@@ -48,6 +50,8 @@ Public `QueryFailureKind` is exported from `forkreduce.contrib.temporal` as a `L
 | `unknown` | Ambiguous terminal application/SDK failure or failed child batch. |
 
 ### Upgrade notes
+
+- **Provider dependencies:** applications relying on previously transitive vendor SDKs must install `forkreduce[full]` or their provider's slim extra explicitly. `forkreduce[temporal]` continues to install the Temporal SDK; official Pydantic AI plugin users must satisfy that plugin's own optional dependencies.
 
 - **Cache identity:** the hash algorithm is unchanged. For unchanged schemas/instructions, the new default `output_mode="auto"` preserves the 0.1.1 tools hash when the effective profile supports forced output tools. Users whose profile forbids forcing, or whose active thinking prevents forcing, now default to prompted and get a different prefix/hash and a cold provider cache. Explicit tools/prompted retain their previous hashes. Adopting `Citation`, `CITATION_INSTRUCTIONS`, changed output descriptions, or the updated example schemas/instructions also changes hashes. Auto mode is frozen per session; a query thinking override that would flip it raises `OutputModeConflictError` before provider use—build a separate session.
 - **In-flight Temporal executions:** before deploying 0.2.0, stop admitting new work to the old task queue and let its running workflows/children/activities finish on the old worker code and converter. Keep referenced blobs available through retries and continuations. Then switch clients/workers together. If executions cannot be drained, isolate the new code on a new task queue or compatible worker version and replay representative old histories before routing existing work to it; converter roundtrips alone do not prove arbitrary old workflow-code replay compatibility.
