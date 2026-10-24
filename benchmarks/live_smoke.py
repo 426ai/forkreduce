@@ -14,7 +14,7 @@ import json
 import os
 import random
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "api": "chat",
         "rates": (0.30, 0.006, 1.20),
         "source": "https://api-docs.deepseek.com/quick_start/pricing",
+        "method_configs": {"forkreduce": {"max_output_tokens": 8192}},
     },
     "gpt-6.1-sol": {
         "api": "responses",
@@ -51,6 +52,10 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "api": "chat",
         "rates": (0.435, 0.0036, 0.87),
         "source": "https://mimo.mi.com/docs/en-US/pricing",
+        "method_configs": {
+            "forkreduce": {"output_mode": "prompted", "max_output_tokens": 8192},
+            "one_shot": {"max_output_tokens": 8192},
+        },
     },
 }
 CONFIG = MethodConfig(concurrency=1, max_output_tokens=2048)
@@ -91,7 +96,7 @@ def latest_runs(path: Path) -> list[dict[str, Any]]:
     return list(latest.values())
 
 
-def _model(name: str, ledger: Any, *, sticky: bool = True) -> Any:
+def _model(name: str, ledger: Any, *, sticky: bool = True, max_output_tokens: int = 2048) -> Any:
     from benchmarks.budget import BudgetModel
 
     settings: dict[str, Any] = {"timeout": 120}
@@ -119,7 +124,7 @@ def _model(name: str, ledger: Any, *, sticky: bool = True) -> Any:
         model,
         ledger,
         rates=rates_for(name),
-        max_output_tokens=2048,
+        max_output_tokens=max_output_tokens,
         label=name,
         # DeepSeek Chat does not explicitly promise a reasoning-inclusive cap;
         # reserve its official absolute 384K output ceiling instead.
@@ -234,15 +239,19 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
         raise ValueError("smoke_workload_changed")
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
     for name in names:
-        model = _model(name, ledger)
+        configs = {
+            method: replace(CONFIG, **MODEL_SPECS[name].get("method_configs", {}).get(method, {})) for method in METHODS
+        }
+        model = _model(name, ledger, max_output_tokens=max(config.max_output_tokens for config in configs.values()))
         jobs = [(contract, method) for contract in contracts for method in METHODS]
         random.Random(DEFAULT_SEED).shuffle(jobs)
         for contract, method in jobs:
             if (name, contract.id, method) in completed:
                 continue
             questions = select_questions(contract, 5)
+            config = configs[method]
             before = await ledger.snapshot()
-            result = await METHODS[method](contract, questions, model, CONFIG)
+            result = await METHODS[method](contract, questions, model, config)
             usage = summarize_usage(result.usage)
             after = await ledger.snapshot()
             sent = sum(r["status"] != "refused" for r in after["records"][len(before["records"]) :])
@@ -260,7 +269,7 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
                 ),
                 "sent_requests": sent,
                 "execution_status": "executed" if sent else "not_executed",
-                "config": asdict(CONFIG),
+                "config": asdict(config),
                 "metrics": score(contract, questions, result.answers),
                 "usage": usage,
                 "provider_usage": result.usage,

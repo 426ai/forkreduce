@@ -282,16 +282,76 @@ GPT unknown cache-population splits are conservatively priced at 1.25x normal
 input, not silently treated as free writes. The pinned prices/sources are in
 `live_smoke.MODEL_SPECS`; no full experiment is authorized by this command.
 
-All methods request temperature 0 (reasoning providers may ignore it; SDK warnings
-are not suppressed), identical schema and retry/repair limits, fork concurrency 1,
-and output cap 2,048 for this smoke. Short-document selection is the two
-shortest contracts with 2,000–7,999 proxy tokens in the prior seeded 20-contract
-sample; it does not inspect gold labels. This is pipeline/cache evidence, not a
+Methods request temperature 0 (reasoning providers may ignore it; SDK warnings
+are not suppressed), identical schema and retry/repair limits, and fork concurrency 1.
+The original smoke used a 2,048 output cap everywhere. The MiMo fix adds explicit
+`MODEL_SPECS["mimo-v2.6-pro"]["method_configs"]` overrides: prompted forkreduce
+with 8,192 output tokens and tools one-shot with 8,192. DeepSeek forkreduce also
+uses 8,192 after the compatibility run exposed reasoning-only truncation at 2,048;
+its tools mode and absolute billable-output reservation are unchanged. Other
+model/method settings remain original. The manifest records these differences; use a new
+output directory rather than rewriting an old workload manifest. Do not treat
+different output budgets as a controlled quality comparison. Short-document
+selection remains the two shortest contracts with 2,000–7,999 proxy tokens in
+the prior seeded 20-contract sample; it does not inspect gold labels. This is pipeline/cache evidence, not a
 representative accuracy estimate. Per-model reports avoid pooling model scores;
 combined `summary.csv` retains a row per model × method.
 JSONL retains every attempt; summaries select the latest attempt per model,
 contract and method. Non-executed safety-blocked cells have unknown accuracy,
 not fabricated zero-cost model results or ordinary failed model generations.
+
+## MiMo failure diagnosis
+
+`MethodConfig.output_mode` selects `"tools"` (default) or `"prompted"` for
+forkreduce and one-shot. Prompted mode uses the same `Answers` schema, question-ID,
+provenance, and citation validation; it is not a permissive JSON fallback.
+The retrieval `tool_agent` requires tools and rejects prompted mode before sending.
+
+Set `MethodConfig.raw_response_path` to opt into **failure-only** JSONL capture,
+including failures recovered by retries or citation repair. Each complete record
+is limited to 2,000 characters and contains finish reason, tool-call presence/name,
+visible arguments/text, reasoning-token count, stage, and JSON/schema or semantic
+failure classification. Request prompts, headers, thinking text, provider error
+bodies, and credentials are excluded; credential-shaped/live secret values are
+redacted. Long snippets may be incomplete JSON; classification occurs before
+truncation. Safe finish/tool summaries accompany ordinary usage even without raw
+capture. Capture paths should stay under ignored `benchmarks/results/`.
+
+The narrowly scoped diagnostic CLI below reuses the original two public CUAD
+contracts and five questions, allows only MiMo/DeepSeek, and shares a persistent
+**separate $0.60 ledger** across invocations. It stops on uncertain usage/transport,
+keeps full conservative reservations, disables SDK retries, and uses a 120-second
+provider timeout. A no-response request is not silently resent through the budget
+halt; investigate it before an explicit `--resume-after-correction REASON_CODE`.
+As with the smoke ledger, the cap uses published prices and provider token-bound
+assumptions, not an independently verified proxy invoice.
+
+```sh
+# Set OPENAI_BASE_URL and FORKREDUCE_BENCH_ALLOW_PAID=1 outside source control.
+# Key: PROXY_API_KEY, otherwise /home/box/.config/proxy_key; never a CLI argument.
+python -m benchmarks.mimo_fix --approve-paid-smoke --label baseline --capture-failures
+python -m benchmarks.mimo_fix --approve-paid-smoke --label larger-one-shot \
+  --methods one_shot --max-output-tokens 8192 --capture-failures
+python -m benchmarks.mimo_fix --approve-paid-smoke --label prompted-forks \
+  --methods forkreduce --output-mode prompted --max-output-tokens 8192 --capture-failures
+```
+
+Changing the mode/output cap is a benchmark configuration change, not a core
+forkreduce API change. Preserve baseline attempts and report repairs, retries,
+quality, cost, and latency rather than replacing failures with selected successes.
+
+`--recommended` applies the same per-model/method overrides as the live smoke
+(overriding mode/output-cap flags). The reduce prompt also includes an explicit
+question-ID to `fork:N` provenance mapping; it must replace inherited document or
+block IDs, not append them. Citation field descriptions and shared instructions
+explicitly require the entire verbatim quote to occur in the cited block, not just
+elsewhere in the contract; split quotes at block boundaries. Validation itself is
+unchanged. To repeat the chosen configuration through the diagnostic task ledger:
+
+```sh
+python -m benchmarks.mimo_fix --approve-paid-smoke --label confirm \
+  --recommended --capture-failures
+```
 
 ## Paid execution: only after separate approval
 

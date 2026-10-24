@@ -13,9 +13,9 @@ import time
 from dataclasses import replace
 from typing import Any
 
-from pydantic_ai import Agent, ToolOutput, capture_run_messages
+from pydantic_ai import Agent, PromptedOutput, ToolOutput, capture_run_messages
 from pydantic_ai.exceptions import UsageLimitExceeded
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart, ToolReturnPart, UserPromptPart
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart, UserPromptPart
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage, UsageLimits
 
@@ -39,6 +39,10 @@ def _validate_ids(output: Answers, questions: tuple[Question, ...]) -> None:
     if len(actual) != len(expected) or len(set(actual)) != len(actual) or set(actual) != set(expected):
         raise _IdsError("question_ids")
     output.answers.sort(key=lambda answer: expected.index(answer.question_id))
+
+
+def _last_response(messages: list[ModelMessage]) -> ModelResponse | None:
+    return next((message for message in reversed(messages) if isinstance(message, ModelResponse)), None)
 
 
 def _code(exc: BaseException) -> tuple[str, bool, bool]:
@@ -82,7 +86,8 @@ def _check_config(config: MethodConfig, questions: tuple[Question, ...]) -> None
     if len({q.id for q in questions}) != len(questions) or not questions:
         raise ValueError("invalid_questions")
     if (
-        config.concurrency < 1
+        config.output_mode not in {"tools", "prompted"}
+        or config.concurrency < 1
         or config.retries < 0
         or config.repair_rounds < 0
         or min(
@@ -127,10 +132,24 @@ class _ForkExecutor:
                                 sources = {q.id: f"fork:{index}" for index, q in enumerate(self.questions)}
                                 if any(a.source_ids != [sources[a.question_id]] for a in current.output.answers):
                                     raise _IdsError("reduce_provenance")
-                        except _IdsError:
+                        except _IdsError as exc:
+                            self.model.capture_failure(str(exc), response=_last_response(current.messages))
                             current.failure = Failure(FailureKind.VALIDATION, "question_ids", True, "question_ids")
                             current.output = None
+                        if (
+                            current.output is not None
+                            and self.config.raw_response_path is not None
+                            and CitationCheck()(current.output, documents=session.documents)
+                        ):
+                            self.model.capture_failure("citation_invalid", response=_last_response(current.messages))
                     problem = current.failure
+                    if problem is not None:
+                        self.model.capture_failure(
+                            _safe_failure(problem),
+                            response=(
+                                _last_response(current.messages) if problem.kind == FailureKind.VALIDATION else None
+                            ),
+                        )
                     if problem is not None and problem.kind == FailureKind.VALIDATION:
                         self.result.schema_failures += 1
                     if problem is None or not problem.retryable or attempt == self.config.retries:
@@ -154,6 +173,7 @@ async def _forkreduce(
         documents=document,
         instructions=INSTRUCTIONS,
         outputs=[Answers],
+        output_mode=config.output_mode,
         warmup=True,
         policy=Policy(concurrency=config.concurrency, retries=config.retries, retry_backoff=0),
         model_settings=_settings(config),
@@ -171,8 +191,10 @@ async def _forkreduce(
             instructions=(
                 question_prompt(questions) + "\nPreserve every question_id exactly once, including no-answer entries. "
                 "Merge only answers to the same question; never substitute another question's citations. "
-                "Keep verbatim quotes and block_ids. Every answer must cite the input item for its question "
-                "in source_ids, including answers with empty spans."
+                "Keep verbatim quotes and block_ids. Replace, do not union, any inherited source_ids. "
+                "For each question_id, source_ids must equal the list in this mapping, even for empty spans: "
+                + json.dumps({q.id: [f"fork:{index}"] for index, q in enumerate(questions)})
+                + ". Do not put contract/document ids or block_ids in source_ids."
             ),
         )
         .run()
@@ -259,6 +281,7 @@ async def _agent_call(
                 except Exception as exc:
                     history = list(captured) or history
                     code, retryable, schema = _code(exc)
+                    model.capture_failure(code, response=_last_response(history) if schema else None)
                     if schema:
                         result.schema_failures += 1
                     if not retryable or attempt == config.retries:
@@ -292,6 +315,8 @@ async def _agent_answer(
         return None, history
     check, repair = CitationCheck(), CitationRepair(max_rounds=config.repair_rounds)
     problems = check(output, documents=documents)
+    if problems:
+        model.capture_failure("citation_invalid", response=_last_response(history))
     for round_index in range(1, config.repair_rounds + 1):
         if not problems:
             break
@@ -308,6 +333,12 @@ async def _agent_answer(
             result.failures.append("repair_apply")
             break
         problems = check(output, documents=documents)
+        if problems:
+            token = model.stage.set("citation_repair")
+            try:
+                model.capture_failure("citation_invalid", response=_last_response(history))
+            finally:
+                model.stage.reset(token)
     if problems:
         result.failures.append("citation_invalid")
     return output, history
@@ -316,7 +347,11 @@ async def _agent_answer(
 def _agent(model: Model, config: MethodConfig) -> Agent[Any, Answers]:
     return Agent(
         model,
-        output_type=ToolOutput(Answers, name="Answers", max_retries=0),
+        output_type=(
+            ToolOutput(Answers, name="Answers", max_retries=0)
+            if config.output_mode == "tools"
+            else PromptedOutput(Answers)
+        ),
         instructions=INSTRUCTIONS,
         retries=0,
         model_settings=_settings(config),
@@ -425,7 +460,12 @@ async def _run(
     try:
         questions = tuple(questions)
         _check_config(config, questions)
-        await implementation(contract, questions, RecordingModel(model, result), config, result)
+        if name == "tool_agent" and config.output_mode == "prompted":
+            result.failures.append("tool_agent_prompted_unsupported")
+            return result
+        await implementation(
+            contract, questions, RecordingModel(model, result, failure_path=config.raw_response_path), config, result
+        )
         _validate_ids(result.answers, questions)
     except Exception as exc:
         result.failures.append(_code(exc)[0])
@@ -519,6 +559,8 @@ def offline_model() -> Model:
                         "source_ids": [],
                     }
                 )
+        if not info.output_tools:
+            return ModelResponse(parts=[TextPart(json.dumps({"answers": answers}))], usage=usage)
         output = next(tool for tool in info.output_tools if tool.name == "Answers")
         return ModelResponse(parts=[ToolCallPart(output.name, {"answers": answers})], usage=usage)
 

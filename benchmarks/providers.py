@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from pydantic_ai.models import Model
@@ -17,6 +18,7 @@ from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.profiles import ModelProfileSpec
 from pydantic_ai.settings import ModelSettings
 
+from benchmarks.diagnostics import append_failure, exception_record, failure_record, response_summary, safe_reason
 from benchmarks.schema import MethodResult
 
 CACHE_POLICY = {
@@ -178,6 +180,7 @@ def usage_record(response: Any, *, stage: str) -> dict[str, Any]:
         else count("cache_write_tokens", "cache_creation_input_tokens", "cache_write_tokens"),
         "usage_missing": missing or input_tokens is None or output_tokens is None,
         "details": details,
+        **response_summary(response),
         "stage": stage,
     }
 
@@ -185,39 +188,71 @@ def usage_record(response: Any, *, stage: str) -> dict[str, Any]:
 class RecordingModel(WrapperModel):
     """One private recorder per run; ContextVar keeps concurrent fork stages apart."""
 
-    def __init__(self, wrapped: Model, result: MethodResult) -> None:
+    def __init__(self, wrapped: Model, result: MethodResult, *, failure_path: str | Path | None = None) -> None:
         super().__init__(wrapped)
         self.result = result
+        self.failure_path = failure_path
         self.stage: ContextVar[str] = ContextVar("benchmark_stage", default="extraction")
+        self._response: ContextVar[Any] = ContextVar("benchmark_response", default=None)
+        self._request_failed: ContextVar[bool] = ContextVar("benchmark_request_failed", default=False)
+        self._expected_tools: dict[int, bool] = {}
+        self._failed_responses: list[Any] = []
+
+    def capture_failure(self, reason: str, *, classification: str | None = None, response: Any | None = None) -> None:
+        """Persist one bounded output per failed response, including recovered attempts.
+
+        Callers report schema, question-id, provenance, and citation failures. A
+        response may be supplied explicitly when a child task handled the request.
+        Request exceptions are captured at their source, never via stale history.
+        """
+        if self.failure_path is None or self._request_failed.get():
+            return
+        reason = safe_reason(reason)
+        if reason in {
+            "transport",
+            "context_overflow",
+            "user_error",
+            "unexpected",
+            "budget_exceeded",
+            "budget_refusal",
+            "provider_error",
+            "question_budget",
+        }:
+            return
+        if reason.startswith("http_"):
+            return
+        response = response if response is not None else self._response.get()
+        if response is None or any(previous is response for previous in self._failed_responses):
+            return
+        usage = usage_record(response, stage=self.stage.get())
+        record = failure_record(
+            response,
+            stage=self.stage.get(),
+            reason=reason,
+            reasoning_tokens=usage["reasoning_tokens"],
+            expected_tool=self._expected_tools.get(id(response)),
+            classification=classification,
+        )
+        append_failure(self.failure_path, record)
+        self._failed_responses.append(response)
 
     async def request(self, messages: Any, model_settings: Any, model_request_parameters: Any) -> Any:
+        if self.failure_path is not None:
+            self._response.set(None)
+            self._request_failed.set(False)
         try:
             response = await self.wrapped.request(messages, model_settings, model_request_parameters)
         except Exception as exc:
+            if self.failure_path is not None:
+                self._request_failed.set(True)
+                append_failure(self.failure_path, exception_record(exc, stage=self.stage.get()))
             self.result.metadata["requests_without_response"] = (
                 self.result.metadata.get("requests_without_response", 0) + 1
             )
-            # Provider bodies may reflect prompts or secrets. Retain only known
-            # parameter names for diagnosing compatibility failures.
-            body = str(getattr(exc, "body", "")).lower()
-            hints = [
-                name
-                for name in (
-                    "tool_choice",
-                    "thinking",
-                    "strict",
-                    "max_tokens",
-                    "max_completion_tokens",
-                    "temperature",
-                    "model_not_found",
-                    "schema",
-                    "reasoning_content",
-                )
-                if name in body
-            ]
-            if hints:
-                self.result.metadata.setdefault("provider_error_parameters", []).append(hints)
             raise
         # Account before any schema validation, output validators, tools, or retries.
         self.result.usage.append(usage_record(response, stage=self.stage.get()))
+        if self.failure_path is not None:
+            self._response.set(response)
+            self._expected_tools[id(response)] = bool(getattr(model_request_parameters, "output_tools", ()))
         return response

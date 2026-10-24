@@ -12,7 +12,7 @@ import pytest
 from benchmarks.methods import METHODS, chunk_document, offline_model
 from benchmarks.providers import provider_model, usage_record
 from benchmarks.schema import Answers, Contract, MethodConfig, Question, Span
-from pydantic_ai.messages import ModelResponse, ToolCallPart, UserPromptPart
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RequestUsage
@@ -37,13 +37,21 @@ def _prompts(messages: Any) -> list[str]:
 
 def _reply(info: Any, data: Any) -> ModelResponse:
     return ModelResponse(
-        parts=[ToolCallPart(next(t.name for t in info.output_tools if t.name == "Answers"), data)],
+        parts=(
+            [ToolCallPart(next(t.name for t in info.output_tools if t.name == "Answers"), data)]
+            if info.output_tools
+            else [TextPart(json.dumps(data))]
+        ),
         usage=RequestUsage(input_tokens=100, output_tokens=20, cache_read_tokens=60, cache_write_tokens=10),
     )
 
 
 def _scripted(
-    *, invalid_schema: bool = False, invalid_citations: bool = False, invalid_reduce: bool = False
+    *,
+    invalid_schema: bool = False,
+    invalid_citations: bool = False,
+    invalid_reduce: bool = False,
+    invalid_provenance: bool = False,
 ) -> tuple[FunctionModel, list[Any]]:
     calls: list[Any] = []
 
@@ -59,9 +67,9 @@ def _scripted(
                 part
                 for message in reversed(messages)
                 for part in reversed(message.parts)
-                if isinstance(part, ToolCallPart) and part.tool_name == "Answers"
+                if (isinstance(part, ToolCallPart) and part.tool_name == "Answers") or isinstance(part, TextPart)
             )
-            payload = previous.args_as_dict()
+            payload = previous.args_as_dict() if isinstance(previous, ToolCallPart) else json.loads(previous.content)
             for answer in payload["answers"]:
                 for citation in answer.get("spans", []):
                     citation["quote"] = "The agreement renews annually."
@@ -73,7 +81,7 @@ def _scripted(
             answers = []
             for source, body in re.findall(r"(?m)^id: (\S+)\n([^\n]+)", latest):
                 for answer in json.loads(body)["answers"]:
-                    answer["source_ids"] = [source]
+                    answer["source_ids"] = ["wrong_source"] if invalid_provenance else [source]
                     if invalid_reduce:
                         for citation in answer.get("spans", []):
                             citation["quote"] = "fabricated reduced citation"
@@ -101,6 +109,120 @@ def _scripted(
         return _reply(info, {"answers": answers})
 
     return FunctionModel(respond), calls
+
+
+def test_benchmark_output_controls_are_opt_in() -> None:
+    config = MethodConfig()
+    assert config.output_mode == "tools"
+    assert config.raw_response_path is None
+
+
+@pytest.mark.parametrize("name,requests", [("forkreduce", 3), ("one_shot", 1)])
+async def test_prompted_json_answers_preserve_ids_citations_and_usage(name: str, requests: int) -> None:
+    model, calls = _scripted()
+    result = await METHODS[name](CONTRACT, QUESTIONS, model, replace(CONFIG, output_mode="prompted"))
+    assert result.failures == []
+    assert result.schema_failures == result.retries == 0
+    assert [answer.question_id for answer in result.answers.answers] == ["renewal", "absent"]
+    assert result.answers.answers[0].spans[0].model_dump() == {
+        "quote": "The agreement renews annually.",
+        "block_id": "b1",
+    }
+    assert result.answers.answers[1].spans == []
+    assert len(result.usage) == len(calls) == requests
+    assert sum(row["input_tokens"] for row in result.usage) == 100 * requests
+    assert sum(row["cache_read_tokens"] for row in result.usage) == 60 * requests
+    assert all(info.output_tools == [] and info.function_tools == [] for _, info in calls)
+    if name == "forkreduce":
+        assert [answer.source_ids for answer in result.answers.answers] == [["fork:0"], ["fork:1"]]
+        assert result.usage[-1]["stage"] == "reduce"
+
+
+@pytest.mark.parametrize("name", ["forkreduce", "one_shot"])
+async def test_prompted_json_schema_retry_remains_explicit_and_billed(name: str) -> None:
+    model, calls = _scripted(invalid_schema=True)
+    result = await METHODS[name](CONTRACT, QUESTIONS, model, replace(CONFIG, output_mode="prompted"))
+    assert result.failures == []
+    assert result.schema_failures == result.retries == 1
+    assert len(result.usage) == len(calls)
+    assert all(info.output_tools == [] for _, info in calls)
+
+
+@pytest.mark.parametrize(
+    "name,invalid_citations,invalid_reduce",
+    [("forkreduce", True, False), ("one_shot", True, False), ("forkreduce", False, True)],
+)
+async def test_prompted_json_citations_receive_field_limited_repair(
+    name: str, invalid_citations: bool, invalid_reduce: bool
+) -> None:
+    model, calls = _scripted(invalid_citations=invalid_citations, invalid_reduce=invalid_reduce)
+    result = await METHODS[name](CONTRACT, QUESTIONS, model, replace(CONFIG, output_mode="prompted"))
+    assert result.failures == []
+    assert result.answers.answers[0].spans[0].quote == "The agreement renews annually."
+    assert result.answers.answers[1].spans == []
+    assert all("untrusted_repair_change" not in answer.source_ids for answer in result.answers.answers)
+    assert any(row["stage"] == "citation_repair" for row in result.usage)
+    assert len(result.usage) == len(calls)
+
+
+@pytest.mark.parametrize("name", ["forkreduce", "one_shot"])
+@pytest.mark.parametrize(
+    "text,code",
+    [
+        ("not JSON", "validation"),
+        ('{"answers":"invalid"}', "validation"),
+        ('{"answers":[{"question_id":"wrong"}]}', "question_ids"),
+        ('{"answers":[]}', "question_ids"),
+        ('{"answers":[{"question_id":"renewal"},{"question_id":"renewal"}]}', "question_ids"),
+        ('{"answers":[{"question_id":"renewal"},{"question_id":"extra"}]}', "question_ids"),
+    ],
+)
+async def test_prompted_json_invalid_output_never_enters_answers(name: str, text: str, code: str) -> None:
+    def respond(_messages: Any, info: Any) -> ModelResponse:
+        assert info.output_tools == []
+        return ModelResponse(parts=[TextPart(text)], usage=RequestUsage(input_tokens=100, output_tokens=20))
+
+    result = await METHODS[name](
+        CONTRACT,
+        QUESTIONS[:1],
+        FunctionModel(respond),
+        replace(CONFIG, output_mode="prompted", retries=0),
+    )
+    assert code in result.failures
+    assert result.answers.answers == []
+    assert result.schema_failures == 1
+    assert result.retries == 0
+    assert len(result.usage) == 1
+
+
+@pytest.mark.parametrize("name", ["forkreduce", "one_shot"])
+async def test_prompted_json_invalid_citations_are_not_accepted_without_repair(name: str) -> None:
+    model, _calls = _scripted(invalid_citations=True)
+    result = await METHODS[name](CONTRACT, QUESTIONS, model, replace(CONFIG, output_mode="prompted", repair_rounds=0))
+    assert "citation_invalid" in result.failures
+    assert result.retries == result.schema_failures == 0
+
+
+async def test_prompted_json_reduce_rejects_wrong_provenance() -> None:
+    model, calls = _scripted(invalid_provenance=True)
+    result = await METHODS["forkreduce"](CONTRACT, QUESTIONS, model, replace(CONFIG, output_mode="prompted", retries=0))
+    assert "question_ids" in result.failures
+    assert result.answers.answers == []
+    assert result.schema_failures == 1
+    assert result.retries == 0
+    assert len(result.usage) == len(calls) == 3
+
+
+async def test_tool_agent_rejects_prompted_output_before_request() -> None:
+    def unexpected(_messages: Any, _info: Any) -> ModelResponse:
+        raise AssertionError("unsupported mode must not call the model")
+
+    result = await METHODS["tool_agent"](
+        CONTRACT, QUESTIONS, FunctionModel(unexpected), replace(CONFIG, output_mode="prompted")
+    )
+    assert result.failures == ["tool_agent_prompted_unsupported"]
+    assert result.answers.answers == []
+    assert result.usage == []
 
 
 @pytest.mark.parametrize("name,requests", [("forkreduce", 3), ("one_shot", 1), ("tool_agent", 6)])
