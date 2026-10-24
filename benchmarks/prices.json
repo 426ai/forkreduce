@@ -1,0 +1,25 @@
+{
+  "currency": "USD",
+  "unit": "per_million_tokens",
+  "verified_at": "2026-10-24",
+  "models": {
+    "deepseek-flash": {
+      "input_miss": 0.30,
+      "input_hit": 0.006,
+      "cache_write": 0.30,
+      "output": 1.20,
+      "cache_policy": "automatic",
+      "source": "https://api-docs.deepseek.com/quick_start/pricing",
+      "notes": "Peak rates, conservative even outside peak hours. Automatic cache creation is billed as input miss, not an additional cache-write charge."
+    },
+    "claude-sonnet-4-6": {
+      "input_miss": 3.00,
+      "input_hit": 0.30,
+      "cache_write": 3.75,
+      "output": 15.00,
+      "cache_policy": "explicit",
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "notes": "Standard first-party global rates; five-minute cache writes. A write replaces base input billing for that token, never adds to it."
+    }
+  }
+}

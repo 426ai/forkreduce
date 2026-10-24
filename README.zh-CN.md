@@ -578,8 +578,8 @@ set_message_store(InMemoryMessageStore())
 从源码目录：
 
 ```bash
-pip install -e ".[dev]"
-ruff check src tests examples && ruff format --check src tests examples
+pip install -e ".[dev]" -r benchmarks/requirements.txt
+ruff check src tests examples benchmarks && ruff format --check src tests examples benchmarks
 mypy
 pytest
 ```
@@ -597,6 +597,12 @@ OPENAI_API_KEY=... OPENAI_MODEL=... OPENAI_BASE_URL=... python examples/run_live
 ```
 
 模型名也可以用环境变量 `FORKREDUCE_MODEL`。
+
+[CUAD 评测框架](benchmarks/README.md) 仅供源码目录运行，对比 fork/reduce、
+多步工具智能体与一次性全答。`python -m benchmarks estimate` 下载公开数据并离线估算成本；
+`python -m benchmarks smoke` 用本地 `FunctionModel` 演练三条路径。
+付费执行必须先获得预估费用批准，再显式启用。
+
 
 ## 发布
 

@@ -1,0 +1,2 @@
+# Install the repository first: python -m pip install -e '.[dev]'
+tiktoken>=0.8,<1
