@@ -4,19 +4,17 @@ from __future__ import annotations
 
 import pytest
 from pydantic import BaseModel
-from tests.support import Scripted, tool_result, user_text
+from tests.support import Scripted, tool_result
 
-from forkreduce import CitationCheck, CitationRepair, Query, build
+from forkreduce import Citation, CitationCheck, CitationRepair, Query, build
 from forkreduce.documents import Block, Document, coerce_documents
 from forkreduce.policy import Policy
 
 
-class Answer(BaseModel):
+class Answer(Citation):
     """Grounded answer."""
 
     text: str
-    quote: str
-    block_id: str
 
 
 class Item(BaseModel):
@@ -41,6 +39,46 @@ def test_whitespace_normalized_quote_matches() -> None:
     assert check(output, documents=documents) == []
 
 
+@pytest.mark.parametrize(
+    ("quote", "block_id", "code"),
+    [
+        ("The library opens at nine.", "closing", "quote_not_found"),
+        ("nine. It closes at five.", "hours", "quote_not_found"),
+        ("The library opens at nine.", "notice", "unknown_block"),
+    ],
+)
+def test_citation_requires_the_entire_quote_in_its_named_block(quote: str, block_id: str, code: str) -> None:
+    documents = coerce_documents(
+        Document(
+            doc_id="notice",
+            blocks=[
+                Block(block_id="hours", text=DOC),
+                Block(block_id="closing", text="It closes at five."),
+            ],
+        )
+    )
+    failures = CitationCheck()(Citation(quote=quote, block_id=block_id), documents=documents)
+    assert len(failures) == 1
+    assert failures[0].code == code
+    assert failures[0].block_id == block_id
+
+
+def test_evidence_split_into_separate_citations_is_valid() -> None:
+    class Evidence(BaseModel):
+        citations: list[Citation]
+
+    documents = coerce_documents(
+        [Block(block_id="hours", text=DOC), Block(block_id="closing", text="It closes at five.")]
+    )
+    evidence = Evidence(
+        citations=[
+            Citation(quote="opens at nine.", block_id="hours"),
+            Citation(quote="It closes at five.", block_id="closing"),
+        ]
+    )
+    assert CitationCheck()(evidence, documents=documents) == []
+
+
 def test_repair_copies_only_allowed_fields_on_nested_items() -> None:
     original = Bundle(items=[Item(note="keep-me", quote="missing", block_id="nope")])
     updated = Bundle(items=[Item(note="changed", quote="The library opens at nine.", block_id="hours")])
@@ -58,8 +96,7 @@ def test_repair_copies_only_allowed_fields_on_nested_items() -> None:
 @pytest.mark.asyncio
 async def test_repair_continues_the_branch_and_ignores_other_fields() -> None:
     def handler(messages, info, _n):  # type: ignore[no-untyped-def]
-        text = user_text(messages)
-        if "could not be located" in text:
+        if _n == 2:
             return tool_result(
                 info,
                 "Answer",
@@ -100,7 +137,8 @@ async def test_repair_continues_the_branch_and_ignores_other_fields() -> None:
     assert output.text == "original"
     assert output.quote == DOC
     assert result.results[0].needs_review is False
-    assert "When does it open?" in user_text(scripted.calls[1][0])
+    assert len(scripted.calls) == 2
+    assert result.reports[0].repair_rounds == 1
     assert result.reports[0].action == "repaired"
 
 

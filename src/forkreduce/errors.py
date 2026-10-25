@@ -37,3 +37,15 @@ class PrefixMismatchWarning(UserWarning):
     The call still runs. Provider prefix caches will miss, because the shared head of the
     prompt is no longer identical to the other branches.
     """
+
+
+class OutputModeConflictError(ForkReduceError):
+    """Query settings would change an auto session's frozen output mode."""
+
+
+class UnforcedToolsError(ForkReduceError):
+    """Explicit tools were requested where forcing is unavailable under strict policy."""
+
+
+class UnforcedToolsWarning(UserWarning):
+    """Explicit tools cannot be forced safely under the effective profile/settings."""

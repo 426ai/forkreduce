@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from forkreduce.documents import DocumentIndex
 from forkreduce.errors import ForkReduceError
 from forkreduce.query import CheckFailure, Query, QueryResult
+from forkreduce.schemas import CITATION_INSTRUCTIONS
 from forkreduce.textutil import normalize_whitespace
 
 _PATH_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\]")
@@ -63,12 +64,15 @@ class CitationCheck:
     Matching ignores differences in whitespace. The quote and block field names
     default to ``quote`` and ``block_id``. Every nested model that has both
     fields is checked.
+    Raw documents are not block-addressable and are explicitly rejected.
     """
 
     quote_field: str = "quote"
     block_field: str = "block_id"
 
     def __call__(self, output: Any, *, documents: DocumentIndex) -> list[CheckFailure]:
+        if documents.document_format == "raw":
+            raise ForkReduceError("CitationCheck requires document_format='blocks'; raw documents are not addressable")
         failures: list[CheckFailure] = []
         for path, node in _iter_citations(output, self.quote_field, self.block_field):
             quote = getattr(node, self.quote_field)
@@ -154,6 +158,9 @@ class CitationRepair:
             "Return the same output type.",
             "You may change only these fields: " + ", ".join(self.allowed_fields) + ".",
             "Keep every other field identical to your previous answer.",
+            CITATION_INSTRUCTIONS,
+            "When only citation fields may change, shorten the quote to a passage inside one block "
+            "or correct its block_id; do not change the output structure to split citations.",
             "",
             "Failures:",
         ]

@@ -10,6 +10,7 @@ from tests.support import Scripted, text_result, tool_result, user_text
 
 import forkreduce
 from forkreduce import (
+    CITATION_INSTRUCTIONS,
     END_MARKER,
     Block,
     Document,
@@ -198,31 +199,30 @@ async def test_tool_set_is_identical_for_every_query() -> None:
 
 
 @pytest.mark.asyncio
-async def test_prompted_mode_puts_schema_in_the_tail_only() -> None:
-    captured: dict[str, str] = {}
-
-    def handler(messages, info, _n):  # type: ignore[no-untyped-def]
-        captured["instructions"] = info.instructions or ""
-        captured["user"] = user_text(messages)
-        assert info.output_tools == []
-        assert info.allow_text_output
-        return text_result({"text": "ok", "quote": "alpha", "block_id": "b1"})
+@pytest.mark.parametrize("output_mode", ["tools", "prompted"])
+@pytest.mark.parametrize("valid", [True, False])
+async def test_json_text_requires_explicit_prompted_mode_and_valid_schema(output_mode: str, valid: bool) -> None:
+    def handler(_messages, _info, _n):  # type: ignore[no-untyped-def]
+        payload = {"text": "ok", "quote": "alpha", "block_id": "b1"} if valid else {"text": "missing citation"}
+        return text_result(payload)
 
     session = build(
         Scripted(handler).model(),
         documents="alpha",
         instructions="rules",
-        outputs=[Answer, Note],
-        output_mode="prompted",
+        outputs=[Answer],
+        output_mode=output_mode,
         warmup=False,
         policy=Policy(retries=0, retry_backoff=0),
     )
     result = await session.ask(Query(tail="Question?", output=Answer, id="p"))
-    assert result.output is not None
-    assert result.output.text == "ok"
-    assert "properties" not in captured["instructions"]
-    assert "Question?" in captured["user"]
-    assert '"quote"' in captured["user"] or "quote" in captured["user"]
+    if output_mode == "prompted" and valid:
+        assert result.failure is None
+        assert result.output is not None
+        assert result.output.text == "ok"
+    else:
+        assert result.output is None
+        assert result.failure is not None
 
 
 @pytest.mark.asyncio
@@ -383,3 +383,27 @@ def test_meta_renderer_is_part_of_the_prefix() -> None:
             meta_keys=["page"],
             meta_renderer=render,
         )
+
+
+@pytest.mark.parametrize("output_mode", ["tools", "prompted"])
+def test_citation_instructions_are_opt_in_and_change_session_identity(output_mode: str) -> None:
+    baseline = build(
+        _scripted().model(),
+        documents="alpha",
+        instructions="rules",
+        outputs=[Answer],
+        output_mode=output_mode,
+        warmup=False,
+    )
+    guided = build(
+        _scripted().model(),
+        documents="alpha",
+        instructions="rules " + CITATION_INSTRUCTIONS,
+        outputs=[Answer],
+        output_mode=output_mode,
+        warmup=False,
+    )
+    assert baseline.instructions == "rules"
+    assert baseline.prefix_hash != guided.prefix_hash
+    assert baseline.tool_specs == guided.tool_specs
+    assert baseline.rendered_documents == guided.rendered_documents

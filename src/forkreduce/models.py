@@ -10,12 +10,14 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
-from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.profiles import ModelProfileSpec
 from pydantic_ai.settings import ModelSettings
+
+if TYPE_CHECKING:
+    from pydantic_ai.models.openai import OpenAIChatModel
 
 # These change how the HTTP call is made. They are not part of the JSON body,
 # so they stay out of the Temporal execution fingerprint.
@@ -61,7 +63,11 @@ def openai_compatible_model(
     can change what the provider sees; see the README for which of those bust
     a prefix cache.
     """
-    from pydantic_ai.providers.openai import OpenAIProvider
+    try:
+        from pydantic_ai.models.openai import OpenAIChatModel
+        from pydantic_ai.providers.openai import OpenAIProvider
+    except ImportError as exc:
+        raise ImportError("OpenAI support requires `pip install 'forkreduce[openai]'` or 'forkreduce[full]'.") from exc
 
     from forkreduce.errors import ForkReduceError
 

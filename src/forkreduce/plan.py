@@ -9,9 +9,10 @@ from typing import Any
 
 from pydantic_ai.usage import RunUsage
 
-from forkreduce.checks import Check, CheckReport, Repair
+from forkreduce.checks import Check, CheckReport, CitationCheck, CitationRepair, Repair
 from forkreduce.context import ContextWarning
 from forkreduce.coverage import ReduceReport
+from forkreduce.errors import ForkReduceError
 from forkreduce.failures import Failure, FailureKind
 from forkreduce.followup import FollowupFn, RoundState
 from forkreduce.query import Query, QueryResult
@@ -100,6 +101,10 @@ class Plan:
         are still failing when repair stops: ``needs_review``, ``drop``, or
         ``fail``.
         """
+        if self._session.document_format == "raw" and (
+            isinstance(check, CitationCheck) or isinstance(repair, CitationRepair)
+        ):
+            raise ForkReduceError("Built-in citation checking and repair require document_format='blocks'")
         if on_failure is not None and on_failure not in {"needs_review", "drop", "fail"}:
             raise ValueError("on_failure must be 'needs_review', 'drop', or 'fail'")
         self._check = check
@@ -304,6 +309,7 @@ class Plan:
                 cache_hit_tokens=cache,
                 attempts=attempts,
                 elapsed_ms=elapsed,
+                feedback_retries_used=sum(part.feedback_retries_used for part in parts),
                 failure=None,
                 check_failures=list(problems),
                 context_warning=notice,

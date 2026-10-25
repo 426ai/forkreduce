@@ -6,13 +6,15 @@ import copy
 import inspect
 import json
 import time
-from collections.abc import Sequence
-from typing import Any, Literal, TypeVar, cast
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel
-from pydantic_ai import Agent, PromptedOutput, ToolOutput, capture_run_messages
+from pydantic_ai import Agent, PromptedOutput, StructuredDict, ToolOutput, capture_run_messages
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
+from pydantic_ai.models.instrumented import InstrumentationSettings
+from pydantic_ai.run import AgentRunResult
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RunUsage, UsageLimits
 
@@ -25,22 +27,50 @@ from forkreduce.context import (
     request_context_warning,
     request_text,
 )
-from forkreduce.documents import DocumentIndex, DocumentsInput, MetaRenderer, coerce_documents
-from forkreduce.errors import ForkReduceError, UnregisteredOutputError
+from forkreduce.documents import DocumentFormat, DocumentIndex, DocumentsInput, MetaRenderer, coerce_documents
+from forkreduce.errors import ForkReduceError, OutputModeConflictError, UnregisteredOutputError
 from forkreduce.executor import BudgetLedger, Executor, LocalExecutor, budget_action_failure
 from forkreduce.failures import Failure, classify_exception, wrong_output_failure
+from forkreduce.output_modes import (
+    OutputMode,
+    ResolvedOutputMode,
+    UnforcedToolsPolicy,
+    diagnose_unforced_tools,
+    effective_model_settings,
+    forced_tools_available,
+    resolve_output_mode,
+)
+from forkreduce.output_specs import (
+    DYNAMIC_OUTPUT_TOOL_DESCRIPTION,
+    DYNAMIC_OUTPUT_TOOL_NAME,
+    DYNAMIC_OUTPUT_TOOL_SCHEMA,
+    DynamicOutputs,
+    OutputSpec,
+)
 from forkreduce.policy import Policy
 from forkreduce.prefix import (
+    QUERY_SEPARATOR,
+    MessageLayout,
     history_matches_prefix,
     prefix_hash,
     prefix_messages,
     warn_if_prefix_mismatch,
 )
-from forkreduce.query import Query, QueryResult
+from forkreduce.query import OutputValidationContext, Query, QueryResult
 from forkreduce.stats import cache_hit_tokens, usage_from_messages
+from forkreduce.temporal_options import ActivityOptions
 
 T = TypeVar("T")
-OutputMode = Literal["tools", "prompted"]
+
+OutputValidator = Callable[[Any], Any | Awaitable[Any]] | Callable[[Any, OutputValidationContext], Any | Awaitable[Any]]
+"""Worker-local callback accepting output and optionally its query context."""
+
+
+class _FeedbackBudgetExceeded(Exception):
+    def __init__(self, failure: Failure) -> None:
+        super().__init__(failure.message)
+        self.failure = failure
+
 
 _REQUEST_LIMIT = UsageLimits(request_limit=1)
 
@@ -51,6 +81,8 @@ class Session:
     Build one with :func:`forkreduce.build`. Queries share ``instructions``,
     the rendered documents, and (in ``tools`` mode) the whole output tool set.
     The per-query text is only the tail.
+    ``activity_options`` configures only the optional Temporal adapter; duration
+    values are seconds and do not change local execution or prefix identity.
     """
 
     def __init__(
@@ -61,22 +93,47 @@ class Session:
         documents: DocumentIndex,
         output_types: dict[str, type[BaseModel]],
         output_mode: OutputMode,
+        resolved_output_mode: ResolvedOutputMode,
+        on_unforced_tools: UnforcedToolsPolicy,
         policy: Policy,
         warmup: bool,
         prefix_hash_value: str,
         tool_specs: list[dict[str, Any]],
         executor: Executor | None,
         model_settings: ModelSettings | None = None,
+        activity_options: ActivityOptions | None = None,
+        output_validator: OutputValidator | None = None,
+        dynamic_outputs: DynamicOutputs | None = None,
+        instrument: bool | InstrumentationSettings = False,
+        message_layout: MessageLayout = "split",
+        query_separator: str = QUERY_SEPARATOR,
+        dynamic_output_instructions: bool = True,
     ) -> None:
+        if not isinstance(query_separator, str):
+            raise ForkReduceError("query_separator must be a string")
+        if not isinstance(dynamic_output_instructions, bool):
+            raise ForkReduceError("dynamic_output_instructions must be a bool")
         self.model = model
         copied = cast(ModelSettings, dict(model_settings)) if model_settings else None
         self.model_settings: ModelSettings | None = copied
         self.instructions = instructions
         self.documents = documents
         self.rendered_documents = documents.rendered
+        self.document_format: DocumentFormat = documents.document_format
+        self.message_layout: MessageLayout = message_layout
+        self.query_separator = query_separator
+        self.dynamic_output_instructions = dynamic_output_instructions
         self.output_types = dict(output_types)
         self.output_mode: OutputMode = output_mode
+        self.resolved_output_mode: ResolvedOutputMode = resolved_output_mode
+        self.on_unforced_tools: UnforcedToolsPolicy = on_unforced_tools
+        self.dynamic_outputs = dynamic_outputs
+        self._forced_tools_available = forced_tools_available(model, effective_model_settings(model, copied))
         self.policy = policy
+        self.activity_options = activity_options
+        self.output_validator = output_validator
+        self._validator_with_context = _validator_accepts_context(output_validator)
+        self.instrument = instrument
         self.warmup = warmup
         self.prefix_hash = prefix_hash_value
         self.tool_specs = tool_specs
@@ -89,10 +146,12 @@ class Session:
             model,
             instructions=instructions,
             output_types=self.output_types,
-            output_mode=output_mode,
-            descriptions={
-                name: str(spec.get("description", "")) for name, spec in zip(output_types, tool_specs, strict=True)
-            },
+            output_mode=resolved_output_mode,
+            descriptions={str(spec["name"]): str(spec.get("description", "")) for spec in tool_specs},
+            output_feedback_retries=policy.output_feedback_retries,
+            output_validator=None,
+            dynamic_outputs=dynamic_outputs,
+            instrument=instrument,
         )
 
     @property
@@ -100,8 +159,16 @@ class Session:
         """Names of the output types registered on this session, in build order."""
         return list(self.output_types)
 
-    def require_output(self, output: type[Any]) -> str:
-        """Return the registered tool name or raise :class:`UnregisteredOutputError`."""
+    def require_output(self, output: type[Any] | OutputSpec) -> str:
+        """Return the output name, refusing any change to the frozen tool set."""
+        if isinstance(output, OutputSpec):
+            if self.resolved_output_mode == "tools" and self.dynamic_outputs != "generic_tool":
+                raise UnregisteredOutputError(
+                    "Dynamic OutputSpec cannot run on a frozen static-tools session. "
+                    "Build a dynamic session with dynamic_outputs='generic_tool', or choose "
+                    "dynamic_outputs='prompted' or output_mode='prompted'."
+                )
+            return output.name
         for name, registered in self.output_types.items():
             if registered is output:
                 return name
@@ -116,6 +183,7 @@ class Session:
     def prepare_query(self, query: Query[Any]) -> None:
         """Assign an id, reject unknown outputs, and warn on a broken continuation."""
         self.require_output(query.output)
+        self._check_output_mode(query, diagnose=False)
         if not query.id:
             self._ids += 1
             query.id = f"q{self._ids}"
@@ -123,24 +191,57 @@ class Session:
             query.history,
             self.rendered_documents,
             prefix_hash_value=self.prefix_hash,
+            message_layout=self.message_layout,
+            query_separator=self.query_separator,
         )
+
+    def _check_output_mode(self, query: Query[Any], *, diagnose: bool = True) -> None:
+        settings = effective_model_settings(self.model, self.model_settings, query.model_settings)
+        if self.output_mode == "auto":
+            actual = _resolve_session_output_mode(self.model, settings, self.output_types, self.dynamic_outputs)
+            if actual != self.resolved_output_mode:
+                raise OutputModeConflictError(
+                    f"Query settings would change the frozen output mode from {self.resolved_output_mode!r} "
+                    f"to {actual!r}. Build a separate session for these settings or choose an explicit output_mode.",
+                    code="output_mode_conflict",
+                )
+        elif diagnose and self.output_mode == "tools" and self._forced_tools_available:
+            if not forced_tools_available(self.model, settings):
+                diagnose_unforced_tools(self.on_unforced_tools)
 
     def history_for(self, query: Query[Any]) -> list[ModelMessage]:
         """Prefix messages, or a copy of the continuation history."""
         if query.history is None:
-            return prefix_messages(self.rendered_documents)
+            return prefix_messages(
+                self.rendered_documents,
+                message_layout=self.message_layout,
+                tail=self.render_tail(query) if self.message_layout == "single" else None,
+                query_separator=self.query_separator,
+            )
         return copy.deepcopy(query.history)
+
+    def _user_prompt_for(self, query: Query[Any]) -> str | None:
+        """Single initial requests already contain their tail in ``history_for``."""
+        if self.message_layout == "single" and query.history is None:
+            return None
+        return self.render_tail(query)
 
     def render_tail(self, query: Query[Any]) -> str:
         """Query text that follows the frozen prefix. Schema lives here in prompted mode."""
         name = self.require_output(query.output)
-        parts = [query.tail.rstrip(), "", f"Use the `{name}` output and no other output type."]
-        if self.output_mode == "prompted":
-            schema = json.dumps(
-                query.output.model_json_schema(),
-                sort_keys=True,
-                ensure_ascii=False,
-            )
+        dynamic = isinstance(query.output, OutputSpec)
+        if dynamic and not self.dynamic_output_instructions:
+            return query.tail
+        tool_name = DYNAMIC_OUTPUT_TOOL_NAME if dynamic and self.resolved_output_mode == "tools" else name
+        parts = [query.tail.rstrip(), "", f"Use the `{tool_name}` output and no other output type."]
+        if isinstance(query.output, OutputSpec) and query.output.description:
+            parts.append(query.output.description)
+        if self.resolved_output_mode == "prompted" or dynamic:
+            if isinstance(query.output, OutputSpec):
+                schema_value = query.output.json_schema
+            else:
+                schema_value = query.output.model_json_schema()
+            schema = json.dumps(schema_value, sort_keys=True, ensure_ascii=False)
             parts.append("Respond with a single JSON object matching this schema:")
             parts.append(schema)
         return "\n".join(parts)
@@ -174,13 +275,14 @@ class Session:
         return list(await asyncio.gather(*(self._executor.run_query(self, query) for query in pending)))
 
     async def run_once(self, query: Query[T]) -> QueryResult[T]:
-        """One model call, with no library-level retry.
+        """One execution attempt, including opt-in output-feedback requests.
 
         Budget is checked here. Validation and transport errors come back as
         ``result.failure`` instead of being raised, except for caller errors
         such as an unregistered output type.
         """
         self.require_output(query.output)
+        self._check_output_mode(query)
         if not query.id:
             self.prepare_query(query)
         notice = request_context_warning(self.policy, self.estimate_tokens(query))
@@ -196,18 +298,24 @@ class Session:
             started = time.perf_counter()
             messages: list[ModelMessage] = self.history_for(query)
             kwargs: dict[str, Any] = {}
-            if self.output_mode == "prompted":
+            if self.resolved_output_mode == "prompted" and not isinstance(query.output, OutputSpec):
                 kwargs["output_type"] = PromptedOutput(query.output, template=False)
             merged_settings = merge_model_settings(self.model_settings, query.model_settings)
             if merged_settings:
                 # Copy so a later mutation of the caller's dict cannot change
                 # this request, and so pydantic-ai's in-place edits stay local.
                 kwargs["model_settings"] = dict(merged_settings)
+            if (
+                self.policy.output_feedback_retries
+                or self.output_validator is not None
+                or isinstance(query.output, OutputSpec)
+            ):
+                return await self._run_with_feedback(query, messages, kwargs, started, notice)
             try:
                 with capture_run_messages() as captured:
                     try:
                         result = await self._agent.run(
-                            self.render_tail(query),
+                            self._user_prompt_for(query),
                             message_history=messages,
                             usage_limits=_REQUEST_LIMIT,
                             **kwargs,
@@ -241,16 +349,18 @@ class Session:
             hits = cache_hit_tokens(result.usage)
             transcript = list(result.all_messages())
             output = result.output
-            if not isinstance(output, query.output):
+            expected_type = dict if isinstance(query.output, OutputSpec) else query.output
+            if not isinstance(output, expected_type):
                 return QueryResult(
                     query_id=query.id or "",
                     output=None,
                     messages=transcript,
                     prefix_hash=self.prefix_hash,
+                    resolved_output_mode=self.resolved_output_mode,
                     usage=result.usage,
                     cache_hit_tokens=hits,
                     attempts=1,
-                    failure=wrong_output_failure(query.output.__name__, type(output).__name__),
+                    failure=wrong_output_failure(self.require_output(query.output), type(output).__name__),
                     round=query.round,
                     elapsed_ms=elapsed,
                     context_warning=notice,
@@ -260,6 +370,7 @@ class Session:
                 output=output,
                 messages=transcript,
                 prefix_hash=self.prefix_hash,
+                resolved_output_mode=self.resolved_output_mode,
                 usage=result.usage,
                 cache_hit_tokens=hits,
                 attempts=1,
@@ -268,6 +379,167 @@ class Session:
                 elapsed_ms=elapsed,
                 context_warning=notice,
             )
+
+    async def _run_with_feedback(
+        self,
+        query: Query[T],
+        messages: list[ModelMessage],
+        kwargs: dict[str, Any],
+        started: float,
+        notice: ContextWarning | None,
+    ) -> QueryResult[T]:
+        """Drive native validation retries, accounting at each request boundary.
+
+        The caller already reserved the first request and holds the token gate.
+        Never bill this bundle again in ``run_once``: a later request must see
+        every completed response before its own reservation is considered.
+        """
+        agent = self._agent
+        retries = self.policy.output_feedback_retries
+        validator = self.output_validator
+        context = (
+            OutputValidationContext(query_id=query.id or "", round=query.round, meta=copy.deepcopy(query.meta))
+            if validator is not None and self._validator_with_context
+            else None
+        )
+
+        async def validate_output(output: Any) -> Any:
+            if validator is None:
+                return output
+            if context is not None:
+                contextual = cast(Callable[[Any, OutputValidationContext], Any | Awaitable[Any]], validator)
+                validated = contextual(output, context)
+            else:
+                output_only = cast(Callable[[Any], Any | Awaitable[Any]], validator)
+                validated = output_only(output)
+            if inspect.isawaitable(validated):
+                validated = await validated
+            return validated
+
+        if isinstance(query.output, OutputSpec):
+            spec = query.output
+
+            async def validate_dynamic(output: Any) -> Any:
+                return await validate_output(spec.validate_output(output))
+
+            # Keep the entire registered tool list and the original instructions.
+            # Only this worker-local callback knows the per-query schema.
+            agent = _build_agent(
+                self.model,
+                instructions=self.instructions,
+                output_types=self.output_types,
+                output_mode=self.resolved_output_mode,
+                descriptions={str(item["name"]): str(item.get("description", "")) for item in self.tool_specs},
+                output_feedback_retries=retries,
+                output_validator=validate_dynamic,
+                dynamic_outputs=self.dynamic_outputs,
+                dynamic_query=True,
+                instrument=self.instrument,
+            )
+            kwargs.pop("output_type", None)
+        elif validator is not None:
+            # Validators are bound to this query, never attached to the shared
+            # agent. Prompted validators also require a fixed local output type
+            # because the SDK forbids overriding it per run with validators.
+            prompted = self.resolved_output_mode == "prompted"
+            name = self.require_output(query.output)
+            agent = _build_agent(
+                self.model,
+                instructions=self.instructions,
+                output_types={name: self.output_types[name]} if prompted else self.output_types,
+                output_mode=self.resolved_output_mode,
+                descriptions={str(item["name"]): str(item.get("description", "")) for item in self.tool_specs},
+                output_feedback_retries=retries,
+                output_validator=validate_output,
+                dynamic_outputs=self.dynamic_outputs,
+                instrument=self.instrument,
+            )
+            kwargs.pop("output_type", None)
+        usage = RunUsage()
+        requests = 0
+        completed: AgentRunResult[Any] | None = None
+        failure: Failure | None = None
+        with capture_run_messages() as captured:
+            try:
+                async with agent.iter(
+                    self._user_prompt_for(query),
+                    message_history=messages,
+                    usage=usage,
+                    usage_limits=UsageLimits(request_limit=retries + 1),
+                    **kwargs,
+                ) as run:
+                    node = run.next_node
+                    while not Agent.is_end_node(node):
+                        if Agent.is_model_request_node(node):
+                            if requests:
+                                problem = await self._budget.try_reserve()
+                                if problem is not None:
+                                    denied = budget_action_failure(problem, self.policy)
+                                    if denied is not None:
+                                        raise _FeedbackBudgetExceeded(denied)
+                                    await self._budget.force_reserve()
+                            requests += 1
+                            input_before = usage.input_tokens
+                            output_before = usage.output_tokens
+                            try:
+                                node = await run.next(node)
+                            finally:
+                                # Also retain billed tokens if a request raises.
+                                await self._budget.add_usage(
+                                    RunUsage(
+                                        input_tokens=usage.input_tokens - input_before,
+                                        output_tokens=usage.output_tokens - output_before,
+                                    )
+                                )
+                        else:
+                            node = await run.next(node)
+                    completed = run.result
+            except _FeedbackBudgetExceeded as exc:
+                failure = exc.failure
+            except Exception as exc:
+                failure = classify_exception(exc)
+        elapsed = (time.perf_counter() - started) * 1000
+        feedback_used = max(0, requests - 1)
+        usage.requests = requests
+        if failure is not None:
+            return self._empty_result(
+                query,
+                failure,
+                messages=list(captured) or messages,
+                elapsed_ms=elapsed,
+                usage=usage,
+                context_warning=notice,
+                feedback_retries_used=feedback_used,
+            )
+        assert completed is not None
+        output = completed.output
+        transcript = list(completed.all_messages())
+        expected_type = dict if isinstance(query.output, OutputSpec) else query.output
+        if not isinstance(output, expected_type):
+            return self._empty_result(
+                query,
+                wrong_output_failure(self.require_output(query.output), type(output).__name__),
+                messages=transcript,
+                elapsed_ms=elapsed,
+                usage=usage,
+                context_warning=notice,
+                feedback_retries_used=feedback_used,
+            )
+        return QueryResult(
+            query_id=query.id or "",
+            output=cast(T, output),
+            messages=transcript,
+            prefix_hash=self.prefix_hash,
+            resolved_output_mode=self.resolved_output_mode,
+            usage=usage,
+            cache_hit_tokens=cache_hit_tokens(usage),
+            attempts=1,
+            failure=None,
+            round=query.round,
+            elapsed_ms=elapsed,
+            context_warning=notice,
+            feedback_retries_used=feedback_used,
+        )
 
     def estimate_tokens(self, query: Query[Any]) -> int:
         """Estimated input tokens for one query, including the frozen prefix.
@@ -282,12 +554,18 @@ class Session:
                 tool_specs=self.tool_specs,
                 tail=self.render_tail(query),
                 history=query.history,
+                separator=self.query_separator if self.message_layout == "single" and query.history is None else "\n",
             )
         )
 
     def starts_with_prefix(self, messages: Sequence[ModelMessage]) -> bool:
         """Whether a transcript still begins with this session's documents."""
-        return history_matches_prefix(messages, self.rendered_documents)
+        return history_matches_prefix(
+            messages,
+            self.rendered_documents,
+            message_layout=self.message_layout,
+            query_separator=self.query_separator,
+        )
 
     async def reduce(
         self,
@@ -338,6 +616,7 @@ class Session:
         usage: RunUsage | None = None,
         attempts: int = 1,
         context_warning: ContextWarning | None = None,
+        feedback_retries_used: int = 0,
     ) -> QueryResult[Any]:
         recorded = usage if usage is not None else RunUsage()
         return QueryResult(
@@ -345,6 +624,7 @@ class Session:
             output=None,
             messages=messages if messages is not None else self.history_for(query),
             prefix_hash=self.prefix_hash,
+            resolved_output_mode=self.resolved_output_mode,
             usage=recorded,
             cache_hit_tokens=cache_hit_tokens(recorded),
             attempts=attempts,
@@ -352,6 +632,7 @@ class Session:
             round=query.round,
             elapsed_ms=elapsed_ms,
             context_warning=context_warning,
+            feedback_retries_used=feedback_retries_used,
         )
 
 
@@ -360,14 +641,23 @@ def build(
     *,
     documents: DocumentsInput,
     instructions: str,
-    outputs: Sequence[type[BaseModel]],
-    output_mode: OutputMode = "tools",
+    outputs: Sequence[type[BaseModel]] = (),
+    output_mode: OutputMode = "auto",
+    on_unforced_tools: UnforcedToolsPolicy = "warn",
     warmup: bool = True,
     policy: Policy | None = None,
     executor: Executor | None = None,
     model_settings: ModelSettings | None = None,
+    activity_options: ActivityOptions | None = None,
+    output_validator: OutputValidator | None = None,
+    dynamic_outputs: DynamicOutputs | None = None,
+    instrument: bool | InstrumentationSettings = False,
     meta_keys: Sequence[str] | None = None,
     meta_renderer: MetaRenderer | None = None,
+    document_format: DocumentFormat = "blocks",
+    message_layout: MessageLayout = "split",
+    query_separator: str = QUERY_SEPARATOR,
+    dynamic_output_instructions: bool = True,
 ) -> Session:
     """Freeze a shared prefix and the output tool set.
 
@@ -375,20 +665,75 @@ def build(
     session will ask for. Adding one later is refused: a new tool schema would
     invalidate the provider prefix cache.
 
-    ``output_mode="tools"`` (the default) registers every output as a tool on
-    every call. ``output_mode="prompted"`` keeps tools out of the prefix and
-    appends only the expected output's JSON schema to the query tail.
+    ``outputs`` may be empty for a dynamic-only session. ``dynamic_outputs``
+    registers one fixed permissive tool with ``"generic_tool"``, or selects
+    schema-in-tail output with ``"prompted"``. In auto mode, dynamic-only
+    sessions without a generic tool use prompted output; generic tools use
+    tools only when forcing is supported. Existing fixed-output auto sessions
+    retain their original selection. Per-query schemas never enter the hash.
+
+    ``output_mode="auto"`` (the default) freezes tools when the model profile
+    and effective thinking settings permit forced output tools, otherwise
+    prompted mode. Explicit ``"tools"`` registers every output on every call;
+    ``"prompted"`` appends only the expected output's JSON schema to the tail.
+    ``on_unforced_tools`` controls diagnostics for explicit tools when forcing
+    is unavailable: ``"warn"`` (default), ``"error"``, or ``"ignore"``.
 
     ``model_settings`` is sent on every call. A :class:`~forkreduce.query.Query`
     may override individual keys. Sampling parameters and timeouts do not change
     the frozen prefix. ``meta_keys`` or ``meta_renderer`` do: rendered block
     meta becomes part of the prefix and its hash. The default renders no meta.
+
+    ``document_format="raw"`` preserves block text exactly, joins it with two
+    newlines, and omits wrappers, titles, metadata and the end marker. Raw text
+    is not block-addressable and cannot use citation checks or repairs.
+    ``message_layout="single"`` puts the documents, :data:`QUERY_SEPARATOR` and
+    the initial query tail into one user part. Continuations append only a tail.
+    ``query_separator`` replaces that separator literally, including whitespace.
+    ``dynamic_output_instructions=False`` leaves an ``OutputSpec`` query's tail
+    untouched; the caller supplies any necessary schema or output instructions.
+    The defaults retain the original block rendering and split user parts.
+
+    ``activity_options`` sets Temporal-only activity timeouts and retry options.
+    Durations are seconds. It does not change local execution or the prefix;
+    leaving it unset preserves the five-minute activity timeout and retries
+    derived from ``policy``.
+
+    ``output_validator`` is a worker-local sync or async callback accepting the
+    output alone, or the output followed by :class:`OutputValidationContext`.
+    Return the validated output, or raise ``pydantic_ai.ModelRetry`` to send its
+    error back on this branch when ``policy.output_feedback_retries`` is enabled.
+    The callback is never serialized and does not affect the frozen prefix.
+
+    ``instrument`` is a worker-local Pydantic AI instrumentation setting, off by
+    default even when a global agent default is enabled. It applies to ordinary,
+    feedback and dynamic agents without changing hashes or execution fingerprints.
     """
-    if output_mode not in {"tools", "prompted"}:
-        raise ForkReduceError("output_mode must be 'tools' or 'prompted'")
-    if not outputs:
-        raise ForkReduceError("outputs must register at least one pydantic model")
-    index = coerce_documents(documents, meta_keys=meta_keys, meta_renderer=meta_renderer)
+    if message_layout not in ("split", "single"):
+        raise ForkReduceError("message_layout must be 'split' or 'single'")
+    if not isinstance(query_separator, str):
+        raise ForkReduceError("query_separator must be a string")
+    if not isinstance(dynamic_output_instructions, bool):
+        raise ForkReduceError("dynamic_output_instructions must be a bool")
+    if dynamic_outputs not in (None, "generic_tool", "prompted"):
+        raise ForkReduceError("dynamic_outputs must be 'generic_tool', 'prompted', or None")
+    if output_mode == "tools" and (dynamic_outputs == "prompted" or (not outputs and dynamic_outputs is None)):
+        raise ForkReduceError("Dynamic output_mode='tools' requires dynamic_outputs='generic_tool'")
+    if output_mode not in ("auto", "tools", "prompted"):
+        raise ForkReduceError("output_mode must be 'auto', 'tools', or 'prompted'")
+    if on_unforced_tools not in ("warn", "error", "ignore"):
+        raise ForkReduceError("on_unforced_tools must be 'warn', 'error', or 'ignore'")
+    settings = effective_model_settings(model, model_settings)
+    resolved = (
+        _resolve_session_output_mode(model, settings, outputs, dynamic_outputs)
+        if output_mode == "auto"
+        else output_mode
+    )
+    if output_mode == "tools" and not forced_tools_available(model, settings):
+        diagnose_unforced_tools(on_unforced_tools)
+    index = coerce_documents(
+        documents, document_format=document_format, meta_keys=meta_keys, meta_renderer=meta_renderer
+    )
     chosen = policy if policy is not None else Policy()
     output_types: dict[str, type[BaseModel]] = {}
     tool_specs: list[dict[str, Any]] = []
@@ -396,6 +741,8 @@ def build(
         if not inspect.isclass(output) or not issubclass(output, BaseModel):
             raise ForkReduceError(f"output {output!r} must be a pydantic BaseModel subclass")
         name = output.__name__
+        if name == DYNAMIC_OUTPUT_TOOL_NAME and dynamic_outputs == "generic_tool":
+            raise ForkReduceError(f"output name {name!r} is reserved for dynamic outputs")
         if name in output_types:
             raise ForkReduceError(f"duplicate output name {name!r}")
         description = inspect.getdoc(output) or f"Return a {name}."
@@ -407,11 +754,22 @@ def build(
                 "schema": output.model_json_schema(),
             }
         )
+    if dynamic_outputs == "generic_tool":
+        tool_specs.append(
+            {
+                "name": DYNAMIC_OUTPUT_TOOL_NAME,
+                "description": DYNAMIC_OUTPUT_TOOL_DESCRIPTION,
+                "schema": copy.deepcopy(DYNAMIC_OUTPUT_TOOL_SCHEMA),
+            }
+        )
     hashed = prefix_hash(
-        output_mode=output_mode,
+        output_mode=resolved,
         instructions=instructions,
         rendered_documents=index.rendered,
         tools=tool_specs,
+        document_format=document_format,
+        message_layout=message_layout,
+        query_separator=query_separator,
     )
     session = Session(
         model=model,
@@ -419,12 +777,21 @@ def build(
         documents=index,
         output_types=output_types,
         output_mode=output_mode,
+        resolved_output_mode=resolved,
+        on_unforced_tools=on_unforced_tools,
         policy=chosen,
         warmup=warmup,
         prefix_hash_value=hashed,
         tool_specs=tool_specs,
         executor=executor,
         model_settings=model_settings,
+        activity_options=activity_options,
+        output_validator=output_validator,
+        dynamic_outputs=dynamic_outputs,
+        instrument=instrument,
+        message_layout=message_layout,
+        query_separator=query_separator,
+        dynamic_output_instructions=dynamic_output_instructions,
     )
     notice = prefix_context_warning(
         chosen,
@@ -436,30 +803,87 @@ def build(
     return session
 
 
+def _validator_accepts_context(validator: OutputValidator | None) -> bool:
+    """Inspect once without invoking callbacks or swallowing their TypeErrors."""
+    if validator is None:
+        return False
+    try:
+        signature = inspect.signature(validator)
+    except (TypeError, ValueError):
+        # Some extension callables have no inspectable signature. Preserve the
+        # existing output-only invocation for those callbacks.
+        return False
+    positional = sum(
+        parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        for parameter in signature.parameters.values()
+    )
+    if positional < 2:
+        return False
+    try:
+        signature.bind(None, None)
+    except TypeError:
+        return False
+    return True
+
+
 def _build_agent(
     model: Model,
     *,
     instructions: str,
     output_types: dict[str, type[BaseModel]],
-    output_mode: OutputMode,
+    output_mode: ResolvedOutputMode,
     descriptions: dict[str, str],
+    output_feedback_retries: int = 0,
+    output_validator: Callable[[Any], Any | Awaitable[Any]] | None = None,
+    dynamic_outputs: DynamicOutputs | None = None,
+    dynamic_query: bool = False,
+    instrument: bool | InstrumentationSettings = False,
 ) -> Agent[None, Any]:
     if output_mode == "tools":
-        # max_retries=0 so a bad payload raises instead of spending a second
-        # model call inside pydantic-ai. forkreduce owns the retry budget.
+        # Native retries are opt-in; the default still raises after one payload.
         output_spec: Any = [
-            ToolOutput(cls, name=name, description=descriptions.get(name), max_retries=0)
+            ToolOutput(cls, name=name, description=descriptions.get(name), max_retries=output_feedback_retries)
             for name, cls in output_types.items()
         ]
+        if dynamic_outputs == "generic_tool":
+            output_spec.append(
+                ToolOutput(
+                    StructuredDict(copy.deepcopy(DYNAMIC_OUTPUT_TOOL_SCHEMA)),
+                    name=DYNAMIC_OUTPUT_TOOL_NAME,
+                    description=DYNAMIC_OUTPUT_TOOL_DESCRIPTION,
+                    max_retries=output_feedback_retries,
+                    strict=False,
+                )
+            )
     else:
         # template=False keeps the union schema out of the instruction prefix.
         # Each call passes its own PromptedOutput so the tail schema is the one
         # that gets validated.
-        output_spec = PromptedOutput(list(output_types.values()), template=False)
-    return Agent(
+        if dynamic_query or not output_types:
+            output_spec = PromptedOutput(StructuredDict(copy.deepcopy(DYNAMIC_OUTPUT_TOOL_SCHEMA)), template=False)
+        else:
+            output_spec = PromptedOutput(list(output_types.values()), template=False)
+    agent: Agent[None, Any] = Agent(
         model,
         output_type=output_spec,
         instructions=instructions,
-        retries=0,
+        retries=output_feedback_retries,
         name="forkreduce",
     )
+    agent.instrument = instrument
+    if output_validator is not None:
+        agent.output_validator(output_validator)
+    return agent
+
+
+def _resolve_session_output_mode(
+    model: Model,
+    settings: ModelSettings | None,
+    outputs: Sequence[type[BaseModel]] | dict[str, type[BaseModel]],
+    dynamic_outputs: DynamicOutputs | None,
+) -> ResolvedOutputMode:
+    if dynamic_outputs == "prompted" or (not outputs and dynamic_outputs != "generic_tool"):
+        return "prompted"
+    if dynamic_outputs == "generic_tool":
+        return "tools" if forced_tools_available(model, settings) else "prompted"
+    return resolve_output_mode(model, settings)
