@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
+from contextlib import nullcontext
 from typing import Any
 
 import httpx
 import openai
 import pytest
 from benchmarks.live_smoke import MODEL_SPECS, _model, method_config, output_mode_metadata
-from benchmarks.profiles import model_profile, output_mode_decision, profile_output_mode
+from benchmarks.methods import _settings
+from benchmarks.profiles import model_profile, output_mode_comparison, output_mode_decision, profile_output_mode
 from benchmarks.schema import Answers
 from pydantic_ai import Agent, PromptedOutput, ToolOutput, models
 from pydantic_ai.messages import (
@@ -20,6 +23,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.models.test import TestModel
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 
 
@@ -79,8 +83,130 @@ def test_measured_modes_and_caps_remain_explicitly_preserved(name: str, method: 
         )
 
 
+@pytest.mark.parametrize("name", list(MODEL_SPECS))
+@pytest.mark.parametrize("method", ["forkreduce", "one_shot", "tool_agent"])
+def test_actual_model_and_build_settings_mode_comparison(
+    monkeypatch: pytest.MonkeyPatch, name: str, method: str
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-placeholder")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://offline.invalid/v1")
+    config = method_config(name, method)
+    model = _model(name, None, max_output_tokens=config.max_output_tokens)
+    decision = output_mode_comparison(model, _settings(config))
+    expected_profile = "prompted" if name in {"mimo-v2.6-pro", "deepseek-flash"} else "tools"
+    expected_explicit = "prompted" if (name, method) == ("mimo-v2.6-pro", "forkreduce") else "tools"
+    assert decision["profile_output_mode"] == expected_profile
+    assert decision["framework_output_mode"] == expected_profile
+    assert decision["output_modes_equivalent"] is True
+    assert decision["framework_error_code"] is None
+    # Diagnostics must not replace historical tools overrides with profile-derived prompted.
+    assert config.output_mode == expected_explicit
+
+
+@pytest.mark.parametrize(
+    "settings,benchmark_mode,framework_mode,error_code",
+    [
+        ({"thinking": True}, "prompted", "prompted", None),
+        ({"thinking": False}, "tools", "tools", None),
+        ({"thinking": True, "openai_reasoning_effort": "none"}, "tools", "tools", None),
+        ({"thinking": False, "openai_reasoning_effort": "high"}, "prompted", "prompted", None),
+        ({"anthropic_thinking": {"type": "enabled", "budget_tokens": 1024}}, "tools", "prompted", None),
+        ({"google_thinking_config": {"thinking_budget": 1024}}, "tools", "prompted", None),
+        ({"google_thinking_config": {"thinking_level": "minimal"}}, "tools", "prompted", None),
+        ({"extra_body": {"thinking": {"type": "enabled"}}}, "tools", "prompted", None),
+        ({"extra_body": {"reasoning_effort": "high"}}, "tools", "prompted", None),
+        ({"extra_body": {"enable_thinking": True}}, "tools", "prompted", None),
+        ({"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}, "tools", "prompted", None),
+        ({"chat_template_kwargs": {"enable_thinking": True}}, "tools", "prompted", None),
+        (
+            {"openai_reasoning_effort": "none", "anthropic_thinking": {"type": "adaptive"}},
+            "tools",
+            "prompted",
+            None,
+        ),
+        ({"openai_reasoning_effort": "future"}, "prompted", None, "unknown_thinking_control"),
+        ({"extra_body": {"reasoning_switch": True}}, "tools", None, "unknown_thinking_control"),
+    ],
+)
+def test_framework_supported_setting_differences_remain_diagnostic(
+    settings: dict[str, Any], benchmark_mode: str, framework_mode: str | None, error_code: str | None
+) -> None:
+    profile = OpenAIModelProfile(supports_thinking=True, supports_forced_tool_choice_with_thinking=False)
+    model = TestModel(profile=profile)
+    decision = output_mode_comparison(model, settings)
+    assert decision["profile_output_mode"] == benchmark_mode
+    assert decision["framework_output_mode"] == framework_mode
+    assert decision["output_modes_equivalent"] is (benchmark_mode == framework_mode)
+    assert decision["framework_error_code"] == error_code
+
+
+@pytest.mark.parametrize(
+    "profile,settings,benchmark_mode,framework_mode",
+    [
+        (OpenAIModelProfile(supports_tools=False), {}, "tools", "prompted"),
+        (
+            OpenAIModelProfile(supports_thinking=False, supports_forced_tool_choice_with_thinking=False),
+            {"thinking": True},
+            "prompted",
+            "tools",
+        ),
+        (
+            OpenAIModelProfile(thinking_always_enabled=True, supports_forced_tool_choice_with_thinking=False),
+            {"openai_reasoning_effort": "none"},
+            "tools",
+            "prompted",
+        ),
+        (
+            OpenAIModelProfile(
+                supports_thinking=True,
+                thinking_enabled_by_default=True,
+                supports_forced_tool_choice_with_thinking=False,
+            ),
+            {"extra_body": {"thinking": {"type": "disabled"}}},
+            "prompted",
+            "tools",
+        ),
+    ],
+)
+def test_profile_restrictions_and_provider_disable_controls_are_not_equivalent(
+    profile: OpenAIModelProfile, settings: dict[str, Any], benchmark_mode: str, framework_mode: str
+) -> None:
+    decision = output_mode_comparison(TestModel(profile=profile), settings)
+    assert decision["profile_output_mode"] == benchmark_mode
+    assert decision["framework_output_mode"] == framework_mode
+    assert decision["output_modes_equivalent"] is False
+    assert decision["framework_error_code"] is None
+
+
+def test_comparison_shallow_merges_model_then_build_settings_without_exposing_them() -> None:
+    profile = OpenAIModelProfile(supports_thinking=True, supports_forced_tool_choice_with_thinking=False)
+    model_settings = {
+        "thinking": True,
+        "openai_reasoning_effort": "high",
+        "extra_body": {"reasoning_effort": "high"},
+        "extra_headers": {"Authorization": "offline-private-placeholder"},
+    }
+    build_settings = {
+        "thinking": False,
+        "openai_reasoning_effort": None,
+        "extra_body": {"enable_thinking": False},
+    }
+    model = TestModel(profile=profile, settings=model_settings)
+    before = output_mode_comparison(model)
+    assert before["profile_output_mode"] == before["framework_output_mode"] == "prompted"
+    after = output_mode_comparison(model, build_settings)
+    assert after["profile_output_mode"] == after["framework_output_mode"] == "tools"
+    assert after["thinking_active"] is False
+    assert after["output_modes_equivalent"] is True
+    assert model_settings["extra_body"] == {"reasoning_effort": "high"}
+    assert build_settings["extra_body"] == {"enable_thinking": False}
+    assert "offline-private-placeholder" not in json.dumps(after)
+    assert "extra_headers" not in after
+    assert "extra_body" not in after
+
+
 def _legacy_profile(name: str) -> OpenAIModelProfile | None:
-    # Pre-migration profile, solely to compare the previous SDK request bytes.
+    # Pre-profile-migration behavior, not a comparison of framework versions.
     if name != "deepseek-flash":
         return None
     return OpenAIModelProfile(
@@ -164,12 +290,24 @@ async def _wire(
                     ModelResponse(parts=parts, model_name=name, provider_name="openai"),
                     ModelRequest(parts=[ToolReturnPart("lookup", "Public result.", tool_call_id="prior")]),
                 ]
-            with models.override_allow_model_requests(True):
+            expected_warning = (
+                "Sampling parameters ['temperature'] are not supported when reasoning is enabled. "
+                "These settings will be ignored."
+            )
+            warning_context = (
+                pytest.warns(UserWarning, match=f"^{re.escape(expected_warning)}$")
+                if name in {"gpt-6.1-sol", "gpt-6-luna"}
+                else nullcontext()
+            )
+            with models.override_allow_model_requests(True), warning_context as emitted:
                 result = await agent.run(
                     "Return probe with no spans.",
                     message_history=messages,
                     model_settings={"max_tokens": config.max_output_tokens, "temperature": config.temperature},
                 )
+            if emitted is not None:
+                assert len(emitted) == 1
+                assert str(emitted[0].message) == expected_warning
             assert result.output.answers[0].question_id == "probe"
     assert len(captured) == 1
     return captured[0]

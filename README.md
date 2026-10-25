@@ -21,6 +21,22 @@ The base install uses `pydantic-ai-slim` without provider SDKs. Use `[openai]` f
 
 The source version in this checkout is **0.2.0**. Updating metadata does not publish a package. To install this checkout before publication, use `pip install -e .` or `pip install -e ".[temporal]"`; the commands above install the version currently published on PyPI.
 
+The source-tree [CUAD benchmark](benchmarks/README.md) requires
+`pip install -e ".[dev,openai]" -r benchmarks/requirements.txt`. Its v0.2 migration
+keeps explicit tools/prompted modes instead of adopting auto, and records
+`schema.FRAMEWORK_DEFAULTS` in new workload/manifests and run/probe records:
+static outputs (`output_spec=False`, `dynamic_outputs=None`), blocks/split,
+`output_feedback_retries=0`, `instrument=False`, and
+`on_unforced_tools="ignore"`. Ignore suppresses only the unforced-tools diagnostic;
+it does not change the mode or provider capability. No native feedback, additional
+requests, or paid execution is enabled. Existing mode overrides, token/request/tool
+budgets, and approval/ledger gates remain in force. New forkreduce metadata records
+the actual resolved mode and prefix hash. However, v0.2 reduce/repair tails change
+even when these switches stay off, so stable prefixes do not establish byte-identical
+comparability with historical results. CI keeps provider-free slim/Temporal coverage
+and runs all tests plus offline benchmark smoke in the full/OpenAI lane.
+
+
 ## Quick start
 
 Ask two questions about the same document (map), then merge the answers into a summary with provenance (reduce). This example calls a real model; first configure an OpenAI-compatible endpoint:

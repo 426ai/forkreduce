@@ -19,7 +19,7 @@ os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 
 from pydantic_ai import models  # noqa: E402
 
-from benchmarks.schema import MethodConfig  # noqa: E402
+from benchmarks.schema import FRAMEWORK_DEFAULTS, MethodConfig  # noqa: E402
 
 
 def _json(value: Any) -> str:
@@ -55,6 +55,7 @@ def _workload(args: argparse.Namespace, contracts: list[Any]) -> dict[str, Any]:
         "price_profile": args.price_profile,
         "methods": ["forkreduce", "tool_agent", "one_shot"],
         "method_config": asdict(_config(args)),
+        "framework_defaults": dict(FRAMEWORK_DEFAULTS),
         "contracts": [{"id": contract.id, "sha256": _digest(contract.text.encode())} for contract in contracts],
     }
 
@@ -154,8 +155,10 @@ async def run(args: argparse.Namespace) -> int:
                     "price_profile": args.price_profile,
                     "approved_estimate_sha256": args.approve_estimate,
                     "config": asdict(config),
+                    "framework_defaults": dict(FRAMEWORK_DEFAULTS),
                     "versions": {
-                        name: importlib.metadata.version(name) for name in ("forkreduce", "pydantic-ai", "tiktoken")
+                        name: importlib.metadata.version(name)
+                        for name in ("forkreduce", "pydantic-ai-slim", "openai", "tiktoken")
                     },
                     "metrics": score(contract, questions, result.answers),
                     "usage": usage,

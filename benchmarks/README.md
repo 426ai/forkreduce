@@ -2,15 +2,16 @@
 
 Source-tree-only evaluation of **one long contract + N questions**, not a claim that
 forkreduce wins. No dataset, provider responses, or credentials are checked in.
-The package version and core dependencies are unchanged; `benchmarks/` is excluded
-from the wheel by the existing explicit `src/forkreduce` wheel package selection.
+`benchmarks/` remains source-tree-only and is excluded from the wheel by the
+existing explicit `src/forkreduce` wheel package selection. The checkout now uses
+the forkreduce v0.2 API; historical results are retained without rewriting them.
 
 ## Install and run without paying
 
 From the repository root, Python 3.11+:
 
 ```sh
-python -m pip install -e '.[dev]' -r benchmarks/requirements.txt
+python -m pip install -e '.[dev,openai]' -r benchmarks/requirements.txt
 python -m benchmarks smoke
 python -m benchmarks estimate
 # Equivalent offline estimation path:
@@ -24,8 +25,10 @@ mypy
 `smoke` uses a local Pydantic AI `FunctionModel`, exercises all three real adapter
 paths (including search/read tools), scores a synthetic answerable and absent
 clause, and creates temporary Markdown/CSV/SVG reports. Synthetic model usage is
-only an accounting check, **not measured CUAD/provider performance**. CI installs
-only the additional tokenizer and runs offline tests/smoke. Neither smoke nor
+only an accounting check, **not measured CUAD/provider performance**. CI retains
+a provider-free slim/Temporal lane without benchmark dependencies/tests and a
+full/OpenAI lane that installs the tokenizer, runs every test, and runs this
+offline smoke. Installing an SDK does not authorize inference. Neither smoke nor
 estimate constructs a live provider, even if API credentials exist in the environment.
 
 `estimate` downloads the public CUAD archive and the local tokenizer vocabulary,
@@ -38,6 +41,67 @@ artifact SHA256 for later approval. `--contracts`, `--seed`, `--n`, `--cache-dir
 `--prices`, and `--output-dir` are configurable. Defaults are 20 contracts,
 seed **20261024**, and N = **5, 20, 41**: **180 logical runs**. Price/cache
 sensitivity cases are alternative estimates of these runs, not extra paid runs.
+
+### v0.2 execution and comparison contract
+
+The benchmark requirements install the checkout's `forkreduce[openai]` extra
+explicitly; `pydantic-ai-slim` does not otherwise install the OpenAI SDK. The
+full CI lane retains `[full]` coverage. Actual Anthropic runs additionally need
+`pydantic-ai-slim[anthropic]>=2.57,<3` (or the checkout's `[full]` extra); offline
+smoke/tests do not. Package versions in new grid records identify
+`pydantic-ai-slim`, not the optional `pydantic-ai` distribution. Benchmarks require
+slim >=2.61 for empty `reasoning_content` replay; the framework's >=2.57 floor
+is unchanged. Migration captures and verification use slim 2.61.0 / OpenAI 3.37.0;
+the original minimum-SDK capture remains separately preserved.
+
+`MethodConfig.output_mode` remains explicit `"tools"` or `"prompted"`; it does
+not adopt v0.2's new `build(output_mode="auto")` default. Profile recommendations
+still precede the existing per-model/method overrides, and retrieval stays
+tools-only. No modes, output caps, request/tool budgets, paid opt-ins, or ledger
+ceilings are relaxed by this migration.
+
+Every newly generated workload/manifest and run, availability, or MiMo diagnostic
+record includes `schema.FRAMEWORK_DEFAULTS` under `framework_defaults`:
+
+```json
+{
+  "output_spec": false,
+  "dynamic_outputs": null,
+  "document_format": "blocks",
+  "message_layout": "split",
+  "output_feedback_retries": 0,
+  "instrument": false,
+  "on_unforced_tools": "ignore"
+}
+```
+
+These are the benchmark's compatibility settings, not a statement that every
+framework default is identical. It keeps static `Answers` outputs (no
+`OutputSpec`), explicitly pins blocks/split, disables dynamic outputs,
+instrumentation and native output feedback, and passes
+`on_unforced_tools="ignore"` to the framework. **Ignore only disables the
+unforced-tools diagnostic; it neither changes the explicit mode nor adds forced
+tool capability.** Existing adapter retries and citation repairs remain bounded
+as before; native feedback adds no new requests, and this migration authorizes
+no paid calls.
+
+Live manifests/records compare the benchmark recommendation with the framework
+resolver using the actual model profile and shallow-merged model/build settings.
+`output_mode_resolution` includes `framework_output_mode`,
+`output_modes_equivalent`, and `framework_error_code`; this comparison does not
+override the measured method's mode. Forkreduce result metadata records the
+actual `resolved_output_mode` and `prefix_hash`, rather than inferring either
+from the requested configuration.
+
+Stable prefix hashes alone do **not** prove full request equivalence: v0.2 adds
+allowed fork-ID/per-question mappings to reduce tails and repeats the single-block
+citation constraint in repair tails. These are real prompt-byte differences
+even with new switches off. Historical results and the sample estimate below
+remain historical evidence, not newly reproduced v0.2 quality/cost/latency
+measurements. Do not pool them as a byte-identical controlled comparison. Use a
+new output directory and regenerate/reapprove estimates for the new workload
+snapshot; old approvals/manifests do not silently gain the compatibility fields.
+
 
 ## Data, attribution, and limitations
 

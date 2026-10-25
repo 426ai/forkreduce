@@ -1,2 +1,5 @@
-# Install the repository first: python -m pip install -e '.[dev]'
+# Install from the repository root; keep the provider SDK outside core dependencies.
+-e .[openai]
+# Empty reasoning_content replay requires the profile behavior added after 2.57.
+pydantic-ai-slim[openai]>=2.61,<3
 tiktoken>=0.8,<1

@@ -127,6 +127,7 @@ async def test_prompted_json_answers_preserve_ids_citations_and_usage(name: str,
     assert sum(row["input_tokens"] for row in result.usage) == 100 * requests
     assert sum(row["cache_read_tokens"] for row in result.usage) == 60 * requests
     assert all(info.output_tools == [] and info.function_tools == [] for _, info in calls)
+    assert result.metadata["resolved_output_mode"] == "prompted"
     if name == "forkreduce":
         assert [answer.source_ids for answer in result.answers.answers] == [["fork:0"], ["fork:1"]]
         assert result.usage[-1]["stage"] == "reduce"
@@ -232,6 +233,7 @@ async def test_all_methods_structured_no_answer_and_actual_tools(name: str, requ
     assert sum(row["cache_read_tokens"] for row in result.usage) == 100 * requests
     assert result.elapsed_seconds > 0
     assert result.concurrency == (3 if name == "forkreduce" else 1)
+    assert result.metadata["resolved_output_mode"] == "tools"
     if name == "tool_agent":
         assert result.metadata["tool_calls"] == {"search": 2, "read_section": 2}
     if name == "forkreduce":

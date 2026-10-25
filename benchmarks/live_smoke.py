@@ -22,12 +22,12 @@ from pydantic_ai import Agent, ToolOutput, models
 
 from benchmarks.data import DEFAULT_SEED, load_contracts, sample_contracts, select_questions
 from benchmarks.estimate import count_tokens, price_usage
-from benchmarks.methods import METHODS, _code
+from benchmarks.methods import METHODS, _code, _settings
 from benchmarks.metrics import score, summarize_usage
-from benchmarks.profiles import model_profile, output_mode_decision, profile_output_mode
+from benchmarks.profiles import model_profile, output_mode_comparison, output_mode_decision, profile_output_mode
 from benchmarks.providers import RecordingModel, provider_model
 from benchmarks.reporting import summarize_rows, write_reports
-from benchmarks.schema import Answers, MethodConfig, MethodResult
+from benchmarks.schema import FRAMEWORK_DEFAULTS, Answers, MethodConfig, MethodResult
 
 # Official Standard/peak USD per million tokens; sources are persisted with results.
 MODEL_SPECS: dict[str, dict[str, Any]] = {
@@ -76,10 +76,14 @@ def method_config(name: str, method: str, base: MethodConfig = CONFIG) -> Method
     )
 
 
-def output_mode_metadata(name: str, method: str, config: MethodConfig) -> dict[str, Any]:
+def output_mode_metadata(name: str, method: str, config: MethodConfig, model: Any | None = None) -> dict[str, Any]:
     overrides = MODEL_SPECS[name].get("method_configs", {}).get(method, {})
     return {
-        **output_mode_decision(model_profile(name)),
+        **(
+            output_mode_comparison(model, _settings(config))
+            if model is not None
+            else output_mode_decision(model_profile(name))
+        ),
         "output_mode": config.output_mode,
         "source": "method_configs"
         if "output_mode" in overrides
@@ -177,6 +181,7 @@ async def availability(directory: Path, ledger: Any, names: list[str]) -> None:
                 retries=0,
                 model_settings={"max_tokens": 2048, "temperature": 0},
             )
+            agent.instrument = False
             start = time.perf_counter()
             failure = None
             schema_ok = False
@@ -198,8 +203,9 @@ async def availability(directory: Path, ledger: Any, names: list[str]) -> None:
                 "requested_model": MODEL_SPECS[name].get("requested_model", name),
                 "attempt": 1 + sum(r["model"] == name and r["case"] == case for r in previous),
                 "api": MODEL_SPECS[name]["api"],
+                "framework_defaults": dict(FRAMEWORK_DEFAULTS),
                 "output_mode_resolution": {
-                    **output_mode_decision(model_profile(name)),
+                    **output_mode_comparison(model, {"max_tokens": 2048, "temperature": 0}),
                     "output_mode": "tools",
                     "source": "availability_probe",
                 },
@@ -235,16 +241,27 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
     previous = _rows(path)
     completed = {(r["model"], r["contract_id"], r["method"]) for r in previous if r["provider_usage"]}
     contracts = selected_contracts(cache)
+    configured_models = {
+        name: _model(
+            name,
+            ledger,
+            max_output_tokens=max(method_config(name, method).max_output_tokens for method in METHODS),
+        )
+        for name in MODEL_SPECS
+    }
     manifest = {
         "seed": DEFAULT_SEED,
         "n": 5,
         "config": asdict(CONFIG),
+        "framework_defaults": dict(FRAMEWORK_DEFAULTS),
         "models": MODEL_SPECS,
         "resolved_methods": {
             name: {
                 method: {
                     "config": asdict(method_config(name, method)),
-                    "output_mode_resolution": output_mode_metadata(name, method, method_config(name, method)),
+                    "output_mode_resolution": output_mode_metadata(
+                        name, method, method_config(name, method), configured_models[name]
+                    ),
                 }
                 for method in METHODS
             }
@@ -266,15 +283,14 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
         raise ValueError("smoke_workload_changed")
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
     for name in names:
-        configs = {method: method_config(name, method) for method in METHODS}
-        model = _model(name, ledger, max_output_tokens=max(config.max_output_tokens for config in configs.values()))
+        model = configured_models[name]
         jobs = [(contract, method) for contract in contracts for method in METHODS]
         random.Random(DEFAULT_SEED).shuffle(jobs)
         for contract, method in jobs:
             if (name, contract.id, method) in completed:
                 continue
             questions = select_questions(contract, 5)
-            config = configs[method]
+            config = method_config(name, method)
             before = await ledger.snapshot()
             result = await METHODS[method](contract, questions, model, config)
             usage = summarize_usage(result.usage)
@@ -295,7 +311,8 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
                 "sent_requests": sent,
                 "execution_status": "executed" if sent else "not_executed",
                 "config": asdict(config),
-                "output_mode_resolution": output_mode_metadata(name, method, config),
+                "framework_defaults": dict(FRAMEWORK_DEFAULTS),
+                "output_mode_resolution": output_mode_metadata(name, method, config, model),
                 "metrics": score(contract, questions, result.answers),
                 "usage": usage,
                 "provider_usage": result.usage,

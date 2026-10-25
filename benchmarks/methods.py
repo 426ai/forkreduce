@@ -21,7 +21,16 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 
 from benchmarks.budget import BudgetExceeded, BudgetHalted
 from benchmarks.providers import RecordingModel
-from benchmarks.schema import INSTRUCTIONS, Answers, Contract, MethodConfig, MethodResult, Question, question_prompt
+from benchmarks.schema import (
+    FRAMEWORK_DEFAULTS,
+    INSTRUCTIONS,
+    Answers,
+    Contract,
+    MethodConfig,
+    MethodResult,
+    Question,
+    question_prompt,
+)
 from forkreduce import CitationCheck, CitationRepair, Query, build
 from forkreduce.documents import Block, Document, DocumentIndex, coerce_documents
 from forkreduce.failures import Failure, FailureKind, classify_exception
@@ -125,6 +134,7 @@ class _ForkExecutor:
             try:
                 for attempt in range(self.config.retries + 1):
                     current = await session.run_once(query)
+                    self.result.metadata["resolved_output_mode"] = current.resolved_output_mode
                     if current.failure is None and current.output is not None:
                         try:
                             _validate_ids(current.output, expected)
@@ -174,11 +184,19 @@ async def _forkreduce(
         instructions=INSTRUCTIONS,
         outputs=[Answers],
         output_mode=config.output_mode,
+        on_unforced_tools="ignore",
+        dynamic_outputs=None,
+        document_format="blocks",
+        message_layout="split",
+        instrument=False,
         warmup=True,
-        policy=Policy(concurrency=config.concurrency, retries=config.retries, retry_backoff=0),
+        policy=Policy(
+            concurrency=config.concurrency, retries=config.retries, retry_backoff=0, output_feedback_retries=0
+        ),
         model_settings=_settings(config),
         executor=_ForkExecutor(result, model, config, questions),
     )
+    result.metadata.update(prefix_hash=session.prefix_hash, resolved_output_mode=session.resolved_output_mode)
     queries = [
         Query(tail=question_prompt((q,)), output=Answers, id=f"fork:{index}") for index, q in enumerate(questions)
     ]
@@ -345,7 +363,7 @@ async def _agent_answer(
 
 
 def _agent(model: Model, config: MethodConfig) -> Agent[Any, Answers]:
-    return Agent(
+    agent: Agent[Any, Answers] = Agent(
         model,
         output_type=(
             ToolOutput(Answers, name="Answers", max_retries=0)
@@ -356,6 +374,8 @@ def _agent(model: Model, config: MethodConfig) -> Agent[Any, Answers]:
         retries=0,
         model_settings=_settings(config),
     )
+    agent.instrument = False
+    return agent
 
 
 async def _one_shot(
@@ -455,11 +475,15 @@ async def _run(
     model: Model,
     config: MethodConfig,
 ) -> MethodResult:
-    result = MethodResult(concurrency=config.concurrency if name == "forkreduce" else 1, metadata={"method": name})
+    result = MethodResult(
+        concurrency=config.concurrency if name == "forkreduce" else 1,
+        metadata={"method": name, "framework_defaults": dict(FRAMEWORK_DEFAULTS)},
+    )
     started = time.perf_counter()
     try:
         questions = tuple(questions)
         _check_config(config, questions)
+        result.metadata["requested_output_mode"] = config.output_mode
         if name == "tool_agent" and config.output_mode == "prompted":
             result.failures.append("tool_agent_prompted_unsupported")
             return result

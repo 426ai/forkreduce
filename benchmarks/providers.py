@@ -84,10 +84,6 @@ def provider_model(
             settings=cast(ModelSettings, chosen),
         )
     if provider == "anthropic":
-        from anthropic import AsyncAnthropic
-        from pydantic_ai.models.anthropic import AnthropicModel
-        from pydantic_ai.providers.anthropic import AnthropicProvider
-
         if api != "chat":
             raise ValueError("anthropic_responses_unsupported")
         name = model_name or os.environ.get("ANTHROPIC_MODEL")
@@ -96,6 +92,10 @@ def provider_model(
             raise ValueError("anthropic_model_missing")
         if not key:
             raise ValueError("anthropic_credentials_missing")
+        from anthropic import AsyncAnthropic
+        from pydantic_ai.models.anthropic import AnthropicModel
+        from pydantic_ai.providers.anthropic import AnthropicProvider
+
         defaults = {
             "anthropic_cache_instructions": "5m",
             "anthropic_cache_tool_definitions": "5m",
@@ -237,6 +237,8 @@ class RecordingModel(WrapperModel):
         self._failed_responses.append(response)
 
     async def request(self, messages: Any, model_settings: Any, model_request_parameters: Any) -> Any:
+        actual_mode = model_request_parameters.output_mode
+        self.result.metadata["resolved_output_mode"] = "tools" if actual_mode == "tool" else actual_mode
         if self.failure_path is not None:
             self._response.set(None)
             self._request_failed.set(False)

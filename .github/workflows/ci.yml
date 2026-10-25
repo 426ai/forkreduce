@@ -37,8 +37,14 @@ jobs:
       - name: Tests
         env:
           PYDANTIC_AI_NO_BANNER: "1"
-        run: python -m pytest
+        run: |
+          if [ "${{ matrix.extras }}" = "temporal" ]; then
+            python -m pytest --ignore-glob='tests/test_bench_*.py'
+          else
+            python -m pytest
+          fi
       - name: Offline benchmark smoke (no provider requests)
+        if: matrix.extras != 'temporal'
         env:
           PYDANTIC_AI_NO_BANNER: "1"
         run: python -m benchmarks smoke

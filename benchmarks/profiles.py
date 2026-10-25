@@ -1,14 +1,30 @@
-"""Provider capabilities for benchmark models routed through an OpenAI proxy."""
+"""Provider profiles and historical output-mode decisions for benchmark models.
+
+The benchmark resolver is deliberately retained rather than delegated to the
+framework: only ``thinking`` and ``openai_reasoning_effort`` affect its decision.
+The framework additionally understands Anthropic/Google thinking controls and
+recognized reasoning controls in ``extra_body``/``chat_template_kwargs``; it
+rejects unknown conditional controls instead of treating them as defaults. It
+also honors ``supports_tools``, gates unified thinking on ``supports_thinking``,
+and treats always-enabled thinking as unavailable for conditional tool forcing.
+``output_mode_comparison`` records agreement for the actual model and effective
+settings without changing any measured method's explicit output-mode override.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, Literal, cast
 
+from pydantic_ai.models import Model
 from pydantic_ai.profiles import ModelProfile, merge_profile
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.deepseek import DeepSeekProvider
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
+
+from forkreduce.errors import ForkReduceError
+from forkreduce.output_modes import effective_model_settings, resolve_output_mode
 
 
 def model_profile(name: str) -> OpenAIModelProfile:
@@ -85,3 +101,30 @@ def profile_output_mode(
     profile: ModelProfile, settings: Mapping[str, Any] | None = None
 ) -> Literal["tools", "prompted"]:
     return cast(Literal["tools", "prompted"], output_mode_decision(profile, settings)["profile_output_mode"])
+
+
+def output_mode_comparison(model: Model, build_settings: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Compare both resolvers against identical actual profile and shallow settings.
+
+    Model settings are shallow-merged with build/agent settings using the same
+    precedence as framework sessions. Unknown conditional thinking controls are
+    reported by their framework error code, not hidden by a benchmark fallback.
+    This is diagnostic metadata only: explicit method output modes still win.
+    Settings are not returned because they may contain provider credentials.
+    """
+    settings = effective_model_settings(model, cast(ModelSettings | None, build_settings))
+    decision = output_mode_decision(model.profile, settings)
+    framework_mode = None
+    error_code = None
+    try:
+        framework_mode = resolve_output_mode(model, settings)
+    except ForkReduceError as exc:
+        if exc.code != "unknown_thinking_control":
+            raise
+        error_code = exc.code
+    return {
+        **decision,
+        "framework_output_mode": framework_mode,
+        "output_modes_equivalent": framework_mode == decision["profile_output_mode"],
+        "framework_error_code": error_code,
+    }

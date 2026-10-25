@@ -20,10 +20,10 @@ from benchmarks.budget import BudgetHalted, BudgetLedger
 from benchmarks.data import select_questions
 from benchmarks.estimate import price_usage
 from benchmarks.live_smoke import _model, method_config, output_mode_metadata, rates_for, selected_contracts
-from benchmarks.methods import METHODS
+from benchmarks.methods import METHODS, _settings
 from benchmarks.metrics import score, summarize_usage
-from benchmarks.profiles import model_profile, output_mode_decision
-from benchmarks.schema import MethodConfig
+from benchmarks.profiles import output_mode_comparison
+from benchmarks.schema import FRAMEWORK_DEFAULTS, MethodConfig
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -73,11 +73,12 @@ async def run(args: argparse.Namespace) -> None:
                     "method": method,
                     "n": 5,
                     "config": asdict(config),
+                    "framework_defaults": dict(FRAMEWORK_DEFAULTS),
                     "output_mode_resolution": (
-                        output_mode_metadata(args.model, method, config)
+                        output_mode_metadata(args.model, method, config, model)
                         if args.recommended
                         else {
-                            **output_mode_decision(model_profile(args.model)),
+                            **output_mode_comparison(model, _settings(config)),
                             "output_mode": config.output_mode,
                             "source": "cli",
                         }
