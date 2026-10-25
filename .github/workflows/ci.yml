@@ -20,6 +20,9 @@ jobs:
           cache: pip
       - name: Install
         run: python -m pip install -e ".[dev,${{ matrix.extras }}]" "pydantic-ai-slim[temporal]>=2.57,<3"
+      - name: Install benchmark dependencies
+        if: matrix.extras != 'temporal'
+        run: python -m pip install -r benchmarks/requirements.txt
       - name: Verify provider-free slim installation
         if: matrix.extras == 'temporal'
         run: |
@@ -27,11 +30,21 @@ jobs:
           python -c "from importlib.metadata import distributions; assert 'pydantic-ai' not in {d.metadata['Name'].lower().replace('_', '-') for d in distributions()}"
       - name: Ruff
         run: |
-          ruff check src tests examples
-          ruff format --check src tests examples
+          ruff check src tests examples benchmarks
+          ruff format --check src tests examples benchmarks
       - name: Type check
         run: mypy
       - name: Tests
         env:
           PYDANTIC_AI_NO_BANNER: "1"
-        run: python -m pytest
+        run: |
+          if [ "${{ matrix.extras }}" = "temporal" ]; then
+            python -m pytest --ignore-glob='tests/test_bench_*.py'
+          else
+            python -m pytest
+          fi
+      - name: Offline benchmark smoke (no provider requests)
+        if: matrix.extras != 'temporal'
+        env:
+          PYDANTIC_AI_NO_BANNER: "1"
+        run: python -m benchmarks smoke
