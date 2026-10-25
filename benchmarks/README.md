@@ -296,7 +296,14 @@ Keep both phases in the **same directory**. Never run simultaneous processes
 against one ledger.
 Restart skips successful availability cases and completed CUAD cases, retaining
 failed probe attempts. It never resets spending.
-`--models` selects a subset without changing the shared $3 ceiling.
+`--models` selects a subset; `--budget-usd` lowers the persistent ledger ceiling
+(default $3, must be finite, positive, and at most $3). Use the same ceiling and
+directory for both phases and every restart; an existing ledger rejects a changed
+ceiling. Historical spending in other directories must be deducted separately
+before selecting this ceiling. `--n` sets CUAD questions per contract (1–41,
+default 5), using the existing seeded category order. Estimate the selected scale
+and effective per-model/method settings before paying; reducing N changes the
+workload manifest and requires a new directory, not mixing with an older run.
 
 `provider_model(..., api="responses", settings={"prompt_cache_key": "...",
 "extra_headers": {...}})` selects `OpenAIResponsesModel`; the default remains

@@ -63,3 +63,30 @@ def test_cli_does_not_echo_credentials_in_exception(monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", ["benchmarks", "estimate"])
     assert main() == 2
     assert secret not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("budget", [float("nan"), float("inf"), -1.0, 0.0, 3.000000001])
+def test_live_smoke_rejects_invalid_ceiling_before_credentials(monkeypatch, tmp_path, budget):
+    from argparse import Namespace
+
+    from benchmarks.live_smoke import run as live_run
+
+    monkeypatch.setenv("FORKREDUCE_BENCH_ALLOW_PAID", "1")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    args = Namespace(approve_paid_smoke=True, budget_usd=budget, output_dir=tmp_path / "unused")
+    with pytest.raises(ValueError, match="smoke_budget_must_be_positive_and_at_most_three_usd"):
+        asyncio.run(live_run(args))
+    assert not args.output_dir.exists()
+
+
+@pytest.mark.parametrize("n", [0, -1, 42])
+def test_live_smoke_rejects_invalid_question_count_before_credentials(monkeypatch, n):
+    from argparse import Namespace
+
+    from benchmarks.live_smoke import run as live_run
+
+    monkeypatch.setenv("FORKREDUCE_BENCH_ALLOW_PAID", "1")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    args = Namespace(approve_paid_smoke=True, budget_usd=1.0, n=n)
+    with pytest.raises(ValueError, match="smoke_question_count_must_be_between_one_and_41"):
+        asyncio.run(live_run(args))

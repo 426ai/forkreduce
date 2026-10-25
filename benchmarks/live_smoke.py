@@ -11,6 +11,7 @@ import asyncio
 import csv
 import hashlib
 import json
+import math
 import os
 import random
 import time
@@ -236,7 +237,7 @@ def selected_contracts(cache: Path) -> list[Any]:
     return sorted(candidates, key=lambda c: (count_tokens(c.text), c.id))[:2]
 
 
-async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> None:
+async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str], *, n: int = 5) -> None:
     path = directory / "runs.jsonl"
     previous = _rows(path)
     completed = {(r["model"], r["contract_id"], r["method"]) for r in previous if r["provider_usage"]}
@@ -251,7 +252,7 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
     }
     manifest = {
         "seed": DEFAULT_SEED,
-        "n": 5,
+        "n": n,
         "config": asdict(CONFIG),
         "framework_defaults": dict(FRAMEWORK_DEFAULTS),
         "models": MODEL_SPECS,
@@ -272,7 +273,7 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
                 "id": c.id,
                 "proxy_tokens": count_tokens(c.text),
                 "sha256": hashlib.sha256(c.text.encode()).hexdigest(),
-                "question_ids": [q.id for q in select_questions(c, 5)],
+                "question_ids": [q.id for q in select_questions(c, n)],
             }
             for c in contracts
         ],
@@ -289,7 +290,7 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
         for contract, method in jobs:
             if (name, contract.id, method) in completed:
                 continue
-            questions = select_questions(contract, 5)
+            questions = select_questions(contract, n)
             config = method_config(name, method)
             before = await ledger.snapshot()
             result = await METHODS[method](contract, questions, model, config)
@@ -302,7 +303,7 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
                 "api": MODEL_SPECS[name]["api"],
                 "contract_id": contract.id,
                 "method": method,
-                "n": 5,
+                "n": n,
                 "seed": DEFAULT_SEED,
                 "attempt": 1
                 + sum(
@@ -353,6 +354,10 @@ async def cuad(directory: Path, cache: Path, ledger: Any, names: list[str]) -> N
 async def run(args: argparse.Namespace) -> None:
     if not args.approve_paid_smoke or os.environ.get("FORKREDUCE_BENCH_ALLOW_PAID") != "1":
         raise ValueError("paid_execution_disabled")
+    if not math.isfinite(args.budget_usd) or not 0 < args.budget_usd <= 3.0:
+        raise ValueError("smoke_budget_must_be_positive_and_at_most_three_usd")
+    if not 1 <= args.n <= 41:
+        raise ValueError("smoke_question_count_must_be_between_one_and_41")
     # Secrets are read only at runtime and never persisted in any manifest.
     if not os.environ.get("OPENAI_BASE_URL"):
         raise ValueError("smoke_base_url_missing")
@@ -363,7 +368,7 @@ async def run(args: argparse.Namespace) -> None:
     from benchmarks.budget import BudgetLedger
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    ledger = BudgetLedger(3.0, args.output_dir / "budget.json")
+    ledger = BudgetLedger(args.budget_usd, args.output_dir / "budget.json")
     await ledger.raise_uncertain_output_bound("deepseek-flash", 393216, rates_for("deepseek-flash"))
     if args.quarantine_bound_model:
         await ledger.quarantine_output_bound_model(args.quarantine_bound_model)
@@ -373,7 +378,7 @@ async def run(args: argparse.Namespace) -> None:
         if args.phase in ("availability", "all"):
             await availability(args.output_dir, ledger, args.models)
         if args.phase in ("cuad", "all"):
-            await cuad(args.output_dir, args.cache_dir, ledger, args.models)
+            await cuad(args.output_dir, args.cache_dir, ledger, args.models, n=args.n)
     snapshot = await ledger.snapshot()
     print(json.dumps({k: snapshot[k] for k in ("charged_usd", "remaining_usd", "measured_usd", "halted")}), flush=True)
 
@@ -382,6 +387,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=("availability", "cuad", "all"))
     parser.add_argument("--approve-paid-smoke", action="store_true")
+    parser.add_argument("--budget-usd", type=float, default=3.0, help="Persistent ledger ceiling, at most $3")
+    parser.add_argument("--n", type=int, default=5, help="CUAD questions per contract (1–41)")
     parser.add_argument(
         "--resume-after-correction",
         metavar="REASON_CODE",
