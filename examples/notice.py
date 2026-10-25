@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from forkreduce import Block, Document, Traced
+from forkreduce import CITATION_INSTRUCTIONS, Block, Citation, Document, Traced
 
 NOTICE = Document(
     doc_id="nb-lib-2026-per",
@@ -43,16 +43,14 @@ NOTICE = Document(
 INSTRUCTIONS = (
     "Answer only from the frozen notice. Cite a quote and its block_id. "
     "When merging, every row needs source_ids from the input list. "
-    "Do not invent titles, dates, or quantities."
+    "Do not invent titles, dates, or quantities. " + CITATION_INSTRUCTIONS
 )
 
 
-class Answer(BaseModel):
+class Answer(Citation):
     """One fact taken from the notice."""
 
     text: str
-    quote: str
-    block_id: str
 
 
 class Lead(BaseModel):

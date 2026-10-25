@@ -144,24 +144,26 @@ class LocalExecutor:
         elapsed = 0.0
         last: QueryResult[object] | None = None
         attempts = 0
+        feedback_retries = 0
         for attempt in range(self.policy.retries + 1):
             attempts = attempt + 1
             result = await session.run_once(query)
             usage = add_usage(usage, result.usage)
             cache += result.cache_hit_tokens
             elapsed += result.elapsed_ms
+            feedback_retries += result.feedback_retries_used
             last = result
             # A budget rejection happens before any model call.
             if result.attempts == 0:
-                return self._folded(result, usage, cache, elapsed, 0)
+                return self._folded(result, usage, cache, elapsed, 0, feedback_retries)
             if result.failure is None:
-                return self._folded(result, usage, cache, elapsed, attempts)
+                return self._folded(result, usage, cache, elapsed, attempts, feedback_retries)
             if not result.failure.retryable or attempt >= self.policy.retries:
-                return self._folded(result, usage, cache, elapsed, attempts)
+                return self._folded(result, usage, cache, elapsed, attempts, feedback_retries)
             if result.failure.kind.value == "transport":
                 await self._sleep(attempt + 1)
         assert last is not None
-        return self._folded(last, usage, cache, elapsed, attempts)
+        return self._folded(last, usage, cache, elapsed, attempts, feedback_retries)
 
     def _folded(
         self,
@@ -170,6 +172,7 @@ class LocalExecutor:
         cache: int,
         elapsed: float,
         attempts: int,
+        feedback_retries: int,
     ) -> QueryResult[object]:
         failure = result.failure.with_attempts(attempts) if result.failure is not None else None
         return replace(
@@ -179,6 +182,7 @@ class LocalExecutor:
             elapsed_ms=elapsed,
             attempts=attempts,
             failure=failure,
+            feedback_retries_used=feedback_retries,
         )
 
     async def _sleep(self, attempt: int) -> None:

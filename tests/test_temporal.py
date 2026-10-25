@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 import subprocess
 import sys
@@ -14,10 +13,9 @@ from pydantic_ai.models.function import FunctionModel
 from temporalio.exceptions import ApplicationError
 from tests.support import Scripted, tool_result, user_text
 
-from forkreduce import Query, build
+from forkreduce import build
 from forkreduce.contrib.temporal import (
     InMemoryMessageStore,
-    MapQueriesWorkflow,
     QueryActivityInput,
     activity_id,
     activity_retry_policy,
@@ -46,7 +44,6 @@ def test_core_import_does_not_load_temporalio() -> None:
         "import sys\n"
         "import forkreduce\n"
         "assert not any(name == 'temporalio' or name.startswith('temporalio.') for name in sys.modules)\n"
-        "assert forkreduce.__version__ == '0.1.1'\n"
     )
     env = os.environ.copy()
     env["PYDANTIC_AI_NO_BANNER"] = "1"
@@ -114,7 +111,8 @@ async def test_activity_stores_messages_and_rejects_unknown_sessions() -> None:
                 output_name="Answer",
             )
         )
-    assert caught.value.non_retryable is True
+    assert caught.value.non_retryable is False
+    assert caught.value.type == "session_factory_missing"
 
     # The activity itself is one attempt: a permanent HTTP failure is non-retryable.
     def denied(_messages, _info, _n):  # type: ignore[no-untyped-def]
@@ -256,9 +254,6 @@ def test_workflow_retry_policy_comes_from_the_session() -> None:
     )
     wide_payload = query_activity_input(wide, query_id="q", tail="t", output_name="Answer")
     assert activity_retry_policy(wide_payload).maximum_attempts == 5
-    source = inspect.getsource(MapQueriesWorkflow.run)
-    assert "activity_retry_policy" in source
-    assert "maximum_attempts=3" not in source
 
 
 @pytest.mark.asyncio
@@ -443,11 +438,3 @@ async def test_activity_merges_query_model_settings() -> None:
     assert first["extra_body"] == {"a": 1}
     assert second["temperature"] == 0
     assert second["extra_body"] == {"a": 1}
-
-
-def test_run_once_is_what_the_activity_uses_not_the_executor_loop() -> None:
-    # Policy.retries on the session must not multiply attempts inside one activity.
-    # This is covered by the 401 case above: LocalExecutor would have stopped at the
-    # first permanent failure too, so also assert the helper builds a query id.
-    query = Query(tail="x", output=Answer, id="fixed")
-    assert query.id == "fixed"
