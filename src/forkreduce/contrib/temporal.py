@@ -75,7 +75,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from forkreduce.documents import Document, DocumentFormat
     from forkreduce.errors import ForkReduceError
-    from forkreduce.failures import Failure
+    from forkreduce.failures import Failure, FailureKind
     from forkreduce.models import canonical_value, request_body_settings
     from forkreduce.output_modes import OutputMode, ResolvedOutputMode, UnforcedToolsPolicy
     from forkreduce.output_specs import DynamicOutputs, OutputSpec
@@ -439,7 +439,7 @@ def to_application_error(failure: Failure, *, feedback_retries_used: int = 0) ->
     if feedback_retries_used:
         detail["feedback_retries_used"] = feedback_retries_used
     return ApplicationError(
-        failure.message,
+        _APPLICATION_ERROR_MESSAGES[failure.kind],
         failure.kind.value,
         detail,
         type=failure.kind.value,
@@ -1010,6 +1010,12 @@ _FAILURE_MESSAGES: dict[QueryFailureKind, str] = {
     "timeout": "Query activity timed out.",
     "cancelled": "Query activity was cancelled.",
     "unknown": "Query failed without a query-level failure classification.",
+}
+_APPLICATION_ERROR_MESSAGES: dict[FailureKind, str] = {
+    FailureKind.VALIDATION: "Query failed with a validation error.",
+    FailureKind.TRANSPORT: "Query failed with a transport error.",
+    FailureKind.PERMANENT: _FAILURE_MESSAGES["permanent"],
+    FailureKind.BUDGET: _FAILURE_MESSAGES["budget"],
 }
 _FAILURE_TYPES = frozenset(
     {

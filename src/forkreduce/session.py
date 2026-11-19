@@ -205,9 +205,13 @@ class Session:
                     f"to {actual!r}. Build a separate session for these settings or choose an explicit output_mode.",
                     code="output_mode_conflict",
                 )
-        elif diagnose and self.output_mode == "tools" and self._forced_tools_available:
-            if not forced_tools_available(self.model, settings):
-                diagnose_unforced_tools(self.on_unforced_tools)
+        elif (
+            diagnose
+            and self.output_mode == "tools"
+            and self._forced_tools_available
+            and not forced_tools_available(self.model, settings)
+        ):
+            diagnose_unforced_tools(self.on_unforced_tools)
 
     def history_for(self, query: Query[Any]) -> list[ModelMessage]:
         """Prefix messages, or a copy of the continuation history."""
