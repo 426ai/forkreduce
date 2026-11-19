@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 — 2026-11-19
+
+### Fixed
+
+- Sanitize classified model failures at the Temporal boundary; retry, cancellation propagation, and failure metadata remain unchanged. This is not blanket protection for storage or factory errors, and it does not rewrite existing history.
+- CI-only: combine the existing `SIM102` condition in `Session._check_output_mode`; no runtime behavior change.
+
 ## 0.2.0 — 2026-10-25
 
 ### Added

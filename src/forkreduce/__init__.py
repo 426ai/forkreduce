@@ -35,7 +35,7 @@ from forkreduce.session import OutputValidator, Session, build
 from forkreduce.stats import UsageSummary
 from forkreduce.temporal_options import ActivityOptions
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "END_MARKER",
