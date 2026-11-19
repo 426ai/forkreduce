@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import asdict
 from datetime import timedelta
 from types import SimpleNamespace
@@ -26,7 +27,7 @@ from temporalio.worker import Replayer, Worker
 with workflow.unsafe.imports_passed_through():
     from pydantic import BaseModel
     from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
-    from pydantic_ai.exceptions import ModelHTTPError
+    from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
     from temporalio.client import WorkflowFailureError
     from tests.support import Scripted, tool_result
     from tests.test_temporal_runtime import sandbox_runner, server_options
@@ -401,6 +402,127 @@ def test_failure_details_preserve_kind_and_add_observed_attempt(monkeypatch) -> 
     monkeypatch.setattr(adapter.activity, "info", lambda: SimpleNamespace(attempt=3))
     error = adapter.to_application_error(Failure(FailureKind.TRANSPORT, "private", True))
     assert error.details == ("transport", {"forkreduce_attempt": 3})
+
+
+@pytest.mark.parametrize(
+    ("kind", "retryable"),
+    [
+        (FailureKind.VALIDATION, True),
+        (FailureKind.TRANSPORT, True),
+        (FailureKind.PERMANENT, False),
+        (FailureKind.BUDGET, False),
+    ],
+)
+def test_application_error_conversion_uses_safe_classification_message(
+    monkeypatch, kind: FailureKind, retryable: bool
+) -> None:  # type: ignore[no-untyped-def]
+    marker = "synthetic-conversion-error-sentinel"
+    monkeypatch.setattr(adapter.activity, "in_activity", lambda: True)
+    monkeypatch.setattr(adapter.activity, "info", lambda: SimpleNamespace(attempt=3))
+    failure = Failure(kind, marker, retryable, detail={"raw_error": marker})
+
+    error = adapter.to_application_error(failure, feedback_retries_used=2)
+
+    assert failure.message == marker
+    assert error.message == adapter._APPLICATION_ERROR_MESSAGES[kind]
+    assert marker not in str(error)
+    assert marker not in json.dumps(error.details)
+    assert error.type == kind.value
+    assert error.non_retryable is not retryable
+    assert error.details == (kind.value, {"forkreduce_attempt": 3, "feedback_retries_used": 2})
+    assert error.__cause__ is None and error.__context__ is None
+
+
+@pytest.mark.parametrize("batch_size", [None, 1])
+@pytest.mark.parametrize("mode", ["raise", "return"])
+async def test_model_error_sentinel_is_absent_from_temporal_logs_and_history(
+    caplog: pytest.LogCaptureFixture, batch_size: int | None, mode: str
+) -> None:
+    marker = "synthetic-template-parse-error-sentinel-71b4"
+    attempts: list[int] = []
+
+    def handler(_messages, _info, _n):  # type: ignore[no-untyped-def]
+        attempts.append(activity.info().attempt)
+        raise UnexpectedModelBehavior(marker)
+
+    session = build(
+        Scripted(handler).model(),
+        documents="Synthetic parsing evidence.",
+        instructions="Answer.",
+        outputs=[FailureAnswer],
+        warmup=False,
+        policy=Policy(retries=1, retry_backoff=0.001, max_backoff=0.001),
+    )
+    prefix = adapter.register_session(session)
+    adapter.set_message_store(adapter.InMemoryMessageStore() if batch_size else None)
+    caplog.set_level(logging.WARNING, logger="temporalio.activity")
+    try:
+        async with await WorkflowEnvironment.start_time_skipping(**server_options()) as env:
+            queue = f"safe-model-error-{uuid4()}"
+            async with Worker(
+                env.client,
+                task_queue=queue,
+                workflows=[adapter.MapQueriesWorkflow, adapter.QueryBatchWorkflow],
+                activities=[adapter.run_query_activity],
+                workflow_runner=sandbox_runner(),
+            ):
+                handle = await env.client.start_workflow(
+                    adapter.MapQueriesWorkflow.run,
+                    adapter.MapQueriesInput(
+                        queries=[
+                            adapter.query_activity_input(
+                                session, query_id="parse-error", tail="Question", output_name="FailureAnswer"
+                            )
+                        ],
+                        batch_size=batch_size,
+                        on_query_failure=mode,
+                    ),
+                    id=f"safe-model-error-{uuid4()}",
+                    task_queue=queue,
+                    execution_timeout=timedelta(seconds=30),
+                )
+                if mode == "return":
+                    result = (await asyncio.wait_for(handle.result(), 30))[0]
+                    assert result.failure_kind == "retryable_exhausted"
+                    assert result.failure_type == "validation"
+                    assert result.attempts == 2
+                    assert marker not in json.dumps(asdict(result))
+                else:
+                    with pytest.raises(WorkflowFailureError) as caught:
+                        await asyncio.wait_for(handle.result(), 30)
+                    cause: BaseException | None = caught.value
+                    while cause is not None and not isinstance(cause, ApplicationError):
+                        cause = cause.__cause__
+                    assert isinstance(cause, ApplicationError)
+                    assert cause.type == "validation"
+                    assert cause.non_retryable is False
+                    assert cause.details[0] == "validation"
+                    assert cause.details[1] == {"forkreduce_attempt": 2}
+                    assert marker not in str(caught.value)
+                    assert marker not in cause.message
+                    assert cause.__cause__ is None and cause.__context__ is None
+
+                history = await handle.fetch_history()
+                child_ids = [
+                    event.start_child_workflow_execution_initiated_event_attributes.workflow_id
+                    for event in history.events
+                    if event.HasField("start_child_workflow_execution_initiated_event_attributes")
+                ]
+                child_histories = [
+                    await env.client.get_workflow_handle(child_id).fetch_history() for child_id in child_ids
+                ]
+
+        histories = [history, *child_histories]
+        assert attempts == [1, 2]
+        assert any(
+            event.HasField("activity_task_failed_event_attributes") for item in histories for event in item.events
+        )
+        assert marker not in "\n".join(item.to_json() for item in histories)
+        assert "Completing activity as failed" in caplog.text
+        assert marker not in caplog.text
+    finally:
+        adapter.unregister_session(prefix)
+        adapter.set_message_store(None)
 
 
 async def test_activity_payload_carries_parent_workflow_identity(monkeypatch) -> None:  # type: ignore[no-untyped-def]
