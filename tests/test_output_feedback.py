@@ -375,6 +375,60 @@ async def test_repeated_truncation_and_partial_prompted_json_keep_output_truncat
     assert denied.failure.code == "budget_exceeded"
 
 
+@pytest.mark.asyncio
+async def test_truncation_detected_when_continuation_history_merges_adjacent_requests() -> None:
+    calls = 0
+
+    def respond(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        part = ToolCallPart("Answer", {"value": calls}) if info.output_tools else TextPart(json.dumps({"value": calls}))
+        return ModelResponse(
+            parts=[part],
+            finish_reason="length" if calls == 1 else "tool_call",
+            usage=RequestUsage(input_tokens=10, output_tokens=3),
+        )
+
+    base = build(
+        FunctionModel(respond),
+        documents="synthetic evidence",
+        instructions="Return a synthetic answer.",
+        outputs=[Answer],
+        output_mode="tools",
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0),
+    )
+    # Three adjacent ModelRequests trigger SDK request merging so len(captured) <= len(history).
+    merged_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(base.rendered_documents)]),
+        ModelRequest(parts=[UserPromptPart("synthetic extra request 1")]),
+        ModelRequest(parts=[UserPromptPart("synthetic extra request 2")]),
+    ]
+
+    plain_result = await base.ask(Query(tail="Continue.", output=Answer, history=merged_history, id="merged-plain"))
+    assert plain_result.output is None
+    assert plain_result.failure is not None
+    assert plain_result.failure.kind is FailureKind.VALIDATION
+    assert plain_result.failure.code == "output_truncated"
+
+    calls = 0
+    with_feedback = build(
+        FunctionModel(respond),
+        documents="synthetic evidence",
+        instructions="Return a synthetic answer.",
+        outputs=[Answer],
+        output_mode="tools",
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0, output_feedback_retries=1),
+    )
+    retried = await with_feedback.ask(
+        Query(tail="Continue.", output=Answer, history=merged_history, id="merged-feedback")
+    )
+    assert retried.failure is None
+    assert retried.output == Answer(value=2)
+    assert retried.feedback_retries_used == 1
+
+
 @pytest.mark.parametrize("mode", ["tools", "prompted"])
 @pytest.mark.asyncio
 async def test_budget_rejection_after_one_feedback_preserves_used_count(mode: str) -> None:

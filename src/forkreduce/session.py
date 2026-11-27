@@ -81,23 +81,27 @@ class _FeedbackBudgetExceeded(Exception):
 _REQUEST_LIMIT = UsageLimits(request_limit=1)
 
 
-def _latest_finish_reason(messages: Sequence[ModelMessage]) -> str | None:
-    for message in reversed(messages):
-        if isinstance(message, ModelResponse):
-            return message.finish_reason
-    return None
+def _response_count(messages: Sequence[ModelMessage]) -> int:
+    return sum(1 for message in messages if isinstance(message, ModelResponse))
+
+
+def _latest_finish_reason(messages: Sequence[ModelMessage], *, prior_responses: int = 0) -> str | None:
+    responses = [message for message in messages if isinstance(message, ModelResponse)]
+    if len(responses) <= prior_responses:
+        return None
+    return responses[-1].finish_reason
 
 
 def _classify_run_failure(
     exc: BaseException,
     captured: Sequence[ModelMessage],
-    history_len: int,
+    prior_responses: int,
 ) -> Failure:
     failure = classify_exception(exc)
     if (
         failure.kind is FailureKind.VALIDATION
         and failure.code != "output_truncated"
-        and _latest_finish_reason(captured[history_len:]) == "length"
+        and _latest_finish_reason(captured, prior_responses=prior_responses) == "length"
     ):
         return truncated_output_failure()
     return failure
@@ -343,6 +347,7 @@ class Session:
                 or isinstance(query.output, OutputSpec)
             ):
                 return await self._run_with_feedback(query, messages, kwargs, started, notice)
+            prior_responses = _response_count(messages)
             try:
                 with capture_run_messages() as captured:
                     try:
@@ -361,7 +366,7 @@ class Session:
                         await self._budget.add_usage(billed)
                         return self._empty_result(
                             query,
-                            _classify_run_failure(exc, captured, len(messages)),
+                            _classify_run_failure(exc, captured, prior_responses),
                             messages=transcript,
                             elapsed_ms=elapsed,
                             usage=billed,
@@ -380,7 +385,7 @@ class Session:
             await self._budget.add_usage(result.usage)
             hits = cache_hit_tokens(result.usage)
             transcript = list(result.all_messages())
-            if _latest_finish_reason(transcript[len(messages) :]) == "length":
+            if _latest_finish_reason(result.new_messages()) == "length":
                 return self._empty_result(
                     query,
                     truncated_output_failure(),
@@ -444,9 +449,13 @@ class Session:
             else None
         )
         captured_messages: list[list[ModelMessage]] = []
+        prior_responses = _response_count(messages)
 
         async def validate_output(output: Any) -> Any:
-            if captured_messages and _latest_finish_reason(captured_messages[-1][len(messages) :]) == "length":
+            if (
+                captured_messages
+                and _latest_finish_reason(captured_messages[-1], prior_responses=prior_responses) == "length"
+            ):
                 raise ModelRetry("Model output was truncated (finish_reason='length'); return a complete output.")
             if validator is None:
                 return output
@@ -542,7 +551,7 @@ class Session:
             except _FeedbackBudgetExceeded as exc:
                 failure = exc.failure
             except Exception as exc:
-                failure = _classify_run_failure(exc, captured, len(messages))
+                failure = _classify_run_failure(exc, captured, prior_responses)
         elapsed = (time.perf_counter() - started) * 1000
         feedback_used = max(0, requests - 1)
         usage.requests = requests
@@ -559,7 +568,7 @@ class Session:
         assert completed is not None
         output = completed.output
         transcript = list(completed.all_messages())
-        if _latest_finish_reason(transcript[len(messages) :]) == "length":
+        if _latest_finish_reason(completed.new_messages()) == "length":
             return self._empty_result(
                 query,
                 truncated_output_failure(),
