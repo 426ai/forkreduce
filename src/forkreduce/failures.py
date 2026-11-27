@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+import pydantic_ai.exceptions as _pydantic_ai_exceptions
 from pydantic import ValidationError
 from pydantic_ai.exceptions import (
     IncompleteToolCall,
@@ -22,6 +23,15 @@ from pydantic_ai.exceptions import (
     UnexpectedModelBehavior,
     UsageLimitExceeded,
     UserError,
+)
+
+_TRUNCATION_EXCEPTIONS: tuple[type[BaseException], ...] = tuple(
+    cls
+    for cls in (
+        IncompleteToolCall,
+        getattr(_pydantic_ai_exceptions, "OutputTokenLimitExceeded", None),
+    )
+    if isinstance(cls, type) and issubclass(cls, BaseException)
 )
 
 try:
@@ -109,7 +119,7 @@ def classify_exception(exc: BaseException) -> Failure:
             retryable=True,
             code="transport",
         )
-    if isinstance(exc, IncompleteToolCall):
+    if isinstance(exc, _TRUNCATION_EXCEPTIONS):
         return Failure(
             kind=FailureKind.VALIDATION,
             message=message,

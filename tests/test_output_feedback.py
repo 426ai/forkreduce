@@ -249,16 +249,18 @@ async def test_budgets_prevent_feedback_request_after_first_billed_response(mode
     assert (session._budget.input_tokens, session._budget.output_tokens) == (10, 3)
 
 
+@pytest.mark.parametrize("mode", ["tools", "prompted"])
 @pytest.mark.asyncio
-async def test_truncated_length_response_is_rejected_and_retried() -> None:
+async def test_truncated_length_response_is_rejected_and_retried(mode: str) -> None:
     calls = 0
 
     def respond(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         nonlocal calls
         calls += 1
+        part = ToolCallPart("Answer", {"value": calls}) if info.output_tools else TextPart(json.dumps({"value": calls}))
         return ModelResponse(
-            parts=[ToolCallPart("Answer", {"value": calls})],
-            finish_reason="length" if calls == 1 else "tool_call",
+            parts=[part],
+            finish_reason="length" if calls == 1 else ("tool_call" if info.output_tools else "stop"),
             usage=RequestUsage(input_tokens=10, output_tokens=3, cache_read_tokens=4),
         )
 
@@ -268,7 +270,7 @@ async def test_truncated_length_response_is_rejected_and_retried() -> None:
         documents="synthetic evidence",
         instructions="Return a synthetic answer.",
         outputs=[Answer],
-        output_mode="tools",
+        output_mode=mode,  # type: ignore[arg-type]
         output_validator=lambda out: out,
         warmup=False,
         policy=Policy(retries=0, retry_backoff=0, output_feedback_retries=1),
@@ -285,7 +287,7 @@ async def test_truncated_length_response_is_rejected_and_retried() -> None:
         documents="synthetic evidence",
         instructions="Return a synthetic answer.",
         outputs=[Answer],
-        output_mode="tools",
+        output_mode=mode,  # type: ignore[arg-type]
         warmup=False,
         policy=Policy(retries=0, retry_backoff=0, output_feedback_retries=1),
     )
@@ -301,7 +303,7 @@ async def test_truncated_length_response_is_rejected_and_retried() -> None:
         documents="synthetic evidence",
         instructions="Return a synthetic answer.",
         outputs=[Answer],
-        output_mode="tools",
+        output_mode=mode,  # type: ignore[arg-type]
         warmup=False,
         policy=Policy(retries=0, retry_backoff=0),
     )
@@ -311,6 +313,66 @@ async def test_truncated_length_response_is_rejected_and_retried() -> None:
     assert truncated.failure.kind is FailureKind.VALIDATION
     assert truncated.failure.code == "output_truncated"
     assert truncated.failure.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_repeated_truncation_and_partial_prompted_json_keep_output_truncated_code() -> None:
+    def always_truncated(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        part = ToolCallPart("Answer", {"value": 1}) if info.output_tools else TextPart('{"value": 1')
+        return ModelResponse(
+            parts=[part],
+            finish_reason="length",
+            usage=RequestUsage(input_tokens=10, output_tokens=3),
+        )
+
+    # Consecutive truncated responses exhausting feedback retries preserve output_truncated.
+    session = build(
+        FunctionModel(always_truncated),
+        documents="synthetic evidence",
+        instructions="Return a synthetic answer.",
+        outputs=[Answer],
+        output_mode="tools",
+        output_validator=lambda out: out,
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0, output_feedback_retries=1),
+    )
+    exhausted = await session.ask(Query(tail="Give the answer.", output=Answer, id="trunc-exhaust"))
+    assert exhausted.output is None
+    assert exhausted.failure is not None
+    assert exhausted.failure.kind is FailureKind.VALIDATION
+    assert exhausted.failure.code == "output_truncated"
+    assert exhausted.feedback_retries_used == 1
+
+    # Unparseable truncated prompted JSON preserves output_truncated without feedback retries.
+    prompted = build(
+        FunctionModel(always_truncated),
+        documents="synthetic evidence",
+        instructions="Return a synthetic answer.",
+        outputs=[Answer],
+        output_mode="prompted",
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0),
+    )
+    partial = await prompted.ask(Query(tail="Give the answer.", output=Answer, id="trunc-partial"))
+    assert partial.output is None
+    assert partial.failure is not None
+    assert partial.failure.kind is FailureKind.VALIDATION
+    assert partial.failure.code == "output_truncated"
+
+    # Budget rejection after first truncated response keeps budget_exceeded rather than output_truncated.
+    budgeted = build(
+        FunctionModel(always_truncated),
+        documents="synthetic evidence",
+        instructions="Return a synthetic answer.",
+        outputs=[Answer],
+        output_mode="tools",
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0, output_feedback_retries=1, budget=Budget(max_requests=1)),
+    )
+    denied = await budgeted.ask(Query(tail="Give the answer.", output=Answer, id="trunc-budget"))
+    assert denied.failure is not None
+    assert denied.failure.kind is FailureKind.BUDGET
+    assert denied.failure.code == "budget_exceeded"
 
 
 @pytest.mark.parametrize("mode", ["tools", "prompted"])

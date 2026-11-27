@@ -30,7 +30,13 @@ from forkreduce.context import (
 from forkreduce.documents import DocumentFormat, DocumentIndex, DocumentsInput, MetaRenderer, coerce_documents
 from forkreduce.errors import ForkReduceError, OutputModeConflictError, UnregisteredOutputError
 from forkreduce.executor import BudgetLedger, Executor, LocalExecutor, budget_action_failure
-from forkreduce.failures import Failure, classify_exception, truncated_output_failure, wrong_output_failure
+from forkreduce.failures import (
+    Failure,
+    FailureKind,
+    classify_exception,
+    truncated_output_failure,
+    wrong_output_failure,
+)
 from forkreduce.output_modes import (
     OutputMode,
     ResolvedOutputMode,
@@ -80,6 +86,21 @@ def _latest_finish_reason(messages: Sequence[ModelMessage]) -> str | None:
         if isinstance(message, ModelResponse):
             return message.finish_reason
     return None
+
+
+def _classify_run_failure(
+    exc: BaseException,
+    captured: Sequence[ModelMessage],
+    history_len: int,
+) -> Failure:
+    failure = classify_exception(exc)
+    if (
+        failure.kind is FailureKind.VALIDATION
+        and failure.code != "output_truncated"
+        and _latest_finish_reason(captured[history_len:]) == "length"
+    ):
+        return truncated_output_failure()
+    return failure
 
 
 class Session:
@@ -340,7 +361,7 @@ class Session:
                         await self._budget.add_usage(billed)
                         return self._empty_result(
                             query,
-                            classify_exception(exc),
+                            _classify_run_failure(exc, captured, len(messages)),
                             messages=transcript,
                             elapsed_ms=elapsed,
                             usage=billed,
@@ -359,7 +380,7 @@ class Session:
             await self._budget.add_usage(result.usage)
             hits = cache_hit_tokens(result.usage)
             transcript = list(result.all_messages())
-            if _latest_finish_reason(transcript) == "length":
+            if _latest_finish_reason(transcript[len(messages) :]) == "length":
                 return self._empty_result(
                     query,
                     truncated_output_failure(),
@@ -425,7 +446,7 @@ class Session:
         captured_messages: list[list[ModelMessage]] = []
 
         async def validate_output(output: Any) -> Any:
-            if captured_messages and _latest_finish_reason(captured_messages[-1]) == "length":
+            if captured_messages and _latest_finish_reason(captured_messages[-1][len(messages) :]) == "length":
                 raise ModelRetry("Model output was truncated (finish_reason='length'); return a complete output.")
             if validator is None:
                 return output
@@ -521,7 +542,7 @@ class Session:
             except _FeedbackBudgetExceeded as exc:
                 failure = exc.failure
             except Exception as exc:
-                failure = classify_exception(exc)
+                failure = _classify_run_failure(exc, captured, len(messages))
         elapsed = (time.perf_counter() - started) * 1000
         feedback_used = max(0, requests - 1)
         usage.requests = requests
@@ -538,7 +559,7 @@ class Session:
         assert completed is not None
         output = completed.output
         transcript = list(completed.all_messages())
-        if _latest_finish_reason(transcript) == "length":
+        if _latest_finish_reason(transcript[len(messages) :]) == "length":
             return self._empty_result(
                 query,
                 truncated_output_failure(),
