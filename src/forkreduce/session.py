@@ -10,11 +10,11 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel
-from pydantic_ai import Agent, PromptedOutput, StructuredDict, ToolOutput, capture_run_messages
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai import Agent, ModelRetry, PromptedOutput, StructuredDict, ToolOutput, capture_run_messages
+from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models import Model
 from pydantic_ai.models.instrumented import InstrumentationSettings
-from pydantic_ai.run import AgentRunResult
+from pydantic_ai.run import AgentRun, AgentRunResult
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RunUsage, UsageLimits
 
@@ -30,7 +30,13 @@ from forkreduce.context import (
 from forkreduce.documents import DocumentFormat, DocumentIndex, DocumentsInput, MetaRenderer, coerce_documents
 from forkreduce.errors import ForkReduceError, OutputModeConflictError, UnregisteredOutputError
 from forkreduce.executor import BudgetLedger, Executor, LocalExecutor, budget_action_failure
-from forkreduce.failures import Failure, classify_exception, wrong_output_failure
+from forkreduce.failures import (
+    Failure,
+    FailureKind,
+    classify_exception,
+    truncated_output_failure,
+    wrong_output_failure,
+)
 from forkreduce.output_modes import (
     OutputMode,
     ResolvedOutputMode,
@@ -73,6 +79,35 @@ class _FeedbackBudgetExceeded(Exception):
 
 
 _REQUEST_LIMIT = UsageLimits(request_limit=1)
+
+
+def _prior_run_ids(messages: Sequence[ModelMessage]) -> frozenset[str]:
+    return frozenset(message.run_id for message in messages if message.run_id is not None)
+
+
+def _new_run_messages(captured: Sequence[ModelMessage], prior_run_ids: frozenset[str]) -> list[ModelMessage]:
+    return [message for message in captured if message.run_id is not None and message.run_id not in prior_run_ids]
+
+
+def _latest_finish_reason(messages: Sequence[ModelMessage]) -> str | None:
+    for message in reversed(messages):
+        if isinstance(message, ModelResponse):
+            return message.finish_reason
+    return None
+
+
+def _classify_run_failure(
+    exc: BaseException,
+    new_messages: Sequence[ModelMessage],
+) -> Failure:
+    failure = classify_exception(exc)
+    if (
+        failure.kind is FailureKind.VALIDATION
+        and failure.code != "output_truncated"
+        and _latest_finish_reason(new_messages) == "length"
+    ):
+        return truncated_output_failure()
+    return failure
 
 
 class Session:
@@ -315,6 +350,7 @@ class Session:
                 or isinstance(query.output, OutputSpec)
             ):
                 return await self._run_with_feedback(query, messages, kwargs, started, notice)
+            prior_run_ids = _prior_run_ids(messages)
             try:
                 with capture_run_messages() as captured:
                     try:
@@ -333,7 +369,7 @@ class Session:
                         await self._budget.add_usage(billed)
                         return self._empty_result(
                             query,
-                            classify_exception(exc),
+                            _classify_run_failure(exc, _new_run_messages(captured, prior_run_ids)),
                             messages=transcript,
                             elapsed_ms=elapsed,
                             usage=billed,
@@ -352,6 +388,15 @@ class Session:
             await self._budget.add_usage(result.usage)
             hits = cache_hit_tokens(result.usage)
             transcript = list(result.all_messages())
+            if _latest_finish_reason(result.new_messages()) == "length":
+                return self._empty_result(
+                    query,
+                    truncated_output_failure(),
+                    messages=transcript,
+                    elapsed_ms=elapsed,
+                    usage=result.usage,
+                    context_warning=notice,
+                )
             output = result.output
             expected_type = dict if isinstance(query.output, OutputSpec) else query.output
             if not isinstance(output, expected_type):
@@ -406,8 +451,12 @@ class Session:
             if validator is not None and self._validator_with_context
             else None
         )
+        active_run: list[AgentRun[None, Any]] = []
+        prior_run_ids = _prior_run_ids(messages)
 
         async def validate_output(output: Any) -> Any:
+            if active_run and _latest_finish_reason(active_run[-1].new_messages()) == "length":
+                raise ModelRetry("Model output was truncated (finish_reason='length'); return a complete output.")
             if validator is None:
                 return output
             if context is not None:
@@ -441,7 +490,7 @@ class Session:
                 instrument=self.instrument,
             )
             kwargs.pop("output_type", None)
-        elif validator is not None:
+        elif validator is not None or retries:
             # Validators are bound to this query, never attached to the shared
             # agent. Prompted validators also require a fixed local output type
             # because the SDK forbids overriding it per run with validators.
@@ -472,6 +521,7 @@ class Session:
                     usage_limits=UsageLimits(request_limit=retries + 1),
                     **kwargs,
                 ) as run:
+                    active_run.append(run)
                     node = run.next_node
                     while not Agent.is_end_node(node):
                         if Agent.is_model_request_node(node):
@@ -501,7 +551,10 @@ class Session:
             except _FeedbackBudgetExceeded as exc:
                 failure = exc.failure
             except Exception as exc:
-                failure = classify_exception(exc)
+                new_messages = (
+                    active_run[-1].new_messages() if active_run else _new_run_messages(captured, prior_run_ids)
+                )
+                failure = _classify_run_failure(exc, new_messages)
         elapsed = (time.perf_counter() - started) * 1000
         feedback_used = max(0, requests - 1)
         usage.requests = requests
@@ -518,6 +571,16 @@ class Session:
         assert completed is not None
         output = completed.output
         transcript = list(completed.all_messages())
+        if _latest_finish_reason(completed.new_messages()) == "length":
+            return self._empty_result(
+                query,
+                truncated_output_failure(),
+                messages=transcript,
+                elapsed_ms=elapsed,
+                usage=usage,
+                context_warning=notice,
+                feedback_retries_used=feedback_used,
+            )
         expected_type = dict if isinstance(query.output, OutputSpec) else query.output
         if not isinstance(output, expected_type):
             return self._empty_result(
