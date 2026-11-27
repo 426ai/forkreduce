@@ -15,7 +15,9 @@ from typing import Any
 
 from pydantic import ValidationError
 from pydantic_ai.exceptions import (
+    IncompleteToolCall,
     ModelAPIError,
+    ModelContextWindowExceededError,
     ModelHTTPError,
     UnexpectedModelBehavior,
     UsageLimitExceeded,
@@ -71,6 +73,8 @@ class Failure:
 def classify_exception(exc: BaseException) -> Failure:
     """Map an exception from a model call onto a :class:`Failure`."""
     message = _short_message(exc)
+    if isinstance(exc, ModelContextWindowExceededError):
+        return _context_overflow_from_error(exc)
     if isinstance(exc, ModelHTTPError):
         overflow = _context_overflow_from_provider(exc)
         if overflow is not None:
@@ -105,6 +109,13 @@ def classify_exception(exc: BaseException) -> Failure:
             retryable=True,
             code="transport",
         )
+    if isinstance(exc, IncompleteToolCall):
+        return Failure(
+            kind=FailureKind.VALIDATION,
+            message=message,
+            retryable=True,
+            code="output_truncated",
+        )
     if isinstance(exc, (UnexpectedModelBehavior, ValidationError, UsageLimitExceeded)):
         return Failure(
             kind=FailureKind.VALIDATION,
@@ -125,6 +136,16 @@ def classify_exception(exc: BaseException) -> Failure:
         retryable=False,
         code="unexpected",
         detail={"exception_type": type(exc).__name__},
+    )
+
+
+def truncated_output_failure() -> Failure:
+    """The model ended a response at its output token limit."""
+    return Failure(
+        kind=FailureKind.VALIDATION,
+        message="Model output was truncated (finish_reason='length')",
+        retryable=True,
+        code="output_truncated",
     )
 
 
@@ -193,10 +214,8 @@ _OVERFLOW_MARKERS = (
 )
 
 
-def _context_overflow_from_provider(exc: ModelHTTPError) -> Failure | None:
+def _context_overflow_from_error(exc: ModelAPIError) -> Failure:
     text = _provider_error_text(exc)
-    if not any(marker in text.lower() for marker in _OVERFLOW_MARKERS):
-        return None
     reported, reported_limit = _reported_context_sizes(text)
     failure = context_overflow_failure(
         estimated_tokens=None,
@@ -204,12 +223,21 @@ def _context_overflow_from_provider(exc: ModelHTTPError) -> Failure | None:
         where="provider",
         reported_tokens=reported,
     )
-    failure.detail["status_code"] = exc.status_code
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        failure.detail["status_code"] = status_code
     return failure
 
 
-def _provider_error_text(exc: ModelHTTPError) -> str:
-    body = exc.body
+def _context_overflow_from_provider(exc: ModelHTTPError) -> Failure | None:
+    text = _provider_error_text(exc)
+    if not any(marker in text.lower() for marker in _OVERFLOW_MARKERS):
+        return None
+    return _context_overflow_from_error(exc)
+
+
+def _provider_error_text(exc: ModelAPIError) -> str:
+    body = getattr(exc, "body", None)
     if isinstance(body, str):
         rendered = body
     elif body is None:

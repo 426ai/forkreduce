@@ -249,6 +249,54 @@ async def test_budgets_prevent_feedback_request_after_first_billed_response(mode
     assert (session._budget.input_tokens, session._budget.output_tokens) == (10, 3)
 
 
+@pytest.mark.asyncio
+async def test_truncated_length_response_is_rejected_and_retried() -> None:
+    calls = 0
+
+    def respond(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        return ModelResponse(
+            parts=[ToolCallPart("Answer", {"value": calls})],
+            finish_reason="length" if calls == 1 else "tool_call",
+            usage=RequestUsage(input_tokens=10, output_tokens=3, cache_read_tokens=4),
+        )
+
+    # With feedback retries and validator: truncated output triggers native feedback retry.
+    session = build(
+        FunctionModel(respond),
+        documents="synthetic evidence",
+        instructions="Return a synthetic answer.",
+        outputs=[Answer],
+        output_mode="tools",
+        output_validator=lambda out: out,
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0, output_feedback_retries=1),
+    )
+    result = await session.ask(Query(tail="Give the answer.", output=Answer, id="trunc"))
+    assert result.failure is None
+    assert result.output == Answer(value=2)
+    assert result.feedback_retries_used == 1
+
+    # Without feedback retries or validator: truncated output fails with retryable output_truncated.
+    calls = 0
+    plain = build(
+        FunctionModel(respond),
+        documents="synthetic evidence",
+        instructions="Return a synthetic answer.",
+        outputs=[Answer],
+        output_mode="tools",
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0),
+    )
+    truncated = await plain.ask(Query(tail="Give the answer.", output=Answer, id="trunc-plain"))
+    assert truncated.output is None
+    assert truncated.failure is not None
+    assert truncated.failure.kind is FailureKind.VALIDATION
+    assert truncated.failure.code == "output_truncated"
+    assert truncated.failure.retryable is True
+
+
 @pytest.mark.parametrize("mode", ["tools", "prompted"])
 @pytest.mark.asyncio
 async def test_budget_rejection_after_one_feedback_preserves_used_count(mode: str) -> None:

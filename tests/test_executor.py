@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 from pydantic import BaseModel
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import IncompleteToolCall, ModelContextWindowExceededError, ModelHTTPError
 from tests.support import Scripted, tool_result, usage
 
 from forkreduce import Query, build
@@ -27,8 +27,10 @@ def _ok(info, text="ok"):  # type: ignore[no-untyped-def]
 def test_classify_http_and_validation() -> None:
     retryable = classify_exception(ModelHTTPError(status_code=429, model_name="m", body="slow"))
     permanent = classify_exception(ModelHTTPError(status_code=401, model_name="m", body="no"))
+    truncated = classify_exception(IncompleteToolCall("cut off"))
     assert retryable.kind is FailureKind.TRANSPORT and retryable.retryable
     assert permanent.kind is FailureKind.PERMANENT and not permanent.retryable
+    assert truncated.kind is FailureKind.VALIDATION and truncated.retryable and truncated.code == "output_truncated"
 
 
 @pytest.mark.asyncio
@@ -356,3 +358,42 @@ async def test_failed_validation_usage_is_billed() -> None:
     assert blocked.attempts == 0
     assert blocked.failure is not None
     assert blocked.failure.code == "budget_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_context_window_exceeded_error_is_permanent_and_not_retried() -> None:
+    exc = ModelContextWindowExceededError(
+        "synthetic-model",
+        "maximum context length is 32768 tokens; requested 40000 tokens",
+    )
+    classified = classify_exception(exc)
+    assert classified.kind is FailureKind.PERMANENT
+    assert not classified.retryable
+    assert classified.code == "context_overflow"
+    assert classified.detail["where"] == "provider"
+    assert classified.detail["limit"] == 32768
+    assert classified.detail["reported_tokens"] == 40000
+
+    calls = 0
+
+    def overflow(_messages, _info, _n):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        raise exc
+
+    session = build(
+        Scripted(overflow).model(),
+        documents="doc",
+        instructions="rules",
+        outputs=[Answer],
+        warmup=False,
+        policy=Policy(retries=3, retry_backoff=0),
+    )
+    result = await session.ask(Query(tail="go", output=Answer, id="overflow"))
+    assert calls == 1
+    assert result.attempts == 1
+    assert result.output is None
+    assert result.failure is not None
+    assert result.failure.kind is FailureKind.PERMANENT
+    assert result.failure.code == "context_overflow"
+    assert not result.failure.retryable
