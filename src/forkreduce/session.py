@@ -14,7 +14,7 @@ from pydantic_ai import Agent, ModelRetry, PromptedOutput, StructuredDict, ToolO
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models import Model
 from pydantic_ai.models.instrumented import InstrumentationSettings
-from pydantic_ai.run import AgentRunResult
+from pydantic_ai.run import AgentRun, AgentRunResult
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RunUsage, UsageLimits
 
@@ -81,27 +81,30 @@ class _FeedbackBudgetExceeded(Exception):
 _REQUEST_LIMIT = UsageLimits(request_limit=1)
 
 
-def _response_count(messages: Sequence[ModelMessage]) -> int:
-    return sum(1 for message in messages if isinstance(message, ModelResponse))
+def _prior_run_ids(messages: Sequence[ModelMessage]) -> frozenset[str]:
+    return frozenset(message.run_id for message in messages if message.run_id is not None)
 
 
-def _latest_finish_reason(messages: Sequence[ModelMessage], *, prior_responses: int = 0) -> str | None:
-    responses = [message for message in messages if isinstance(message, ModelResponse)]
-    if len(responses) <= prior_responses:
-        return None
-    return responses[-1].finish_reason
+def _new_run_messages(captured: Sequence[ModelMessage], prior_run_ids: frozenset[str]) -> list[ModelMessage]:
+    return [message for message in captured if message.run_id is not None and message.run_id not in prior_run_ids]
+
+
+def _latest_finish_reason(messages: Sequence[ModelMessage]) -> str | None:
+    for message in reversed(messages):
+        if isinstance(message, ModelResponse):
+            return message.finish_reason
+    return None
 
 
 def _classify_run_failure(
     exc: BaseException,
-    captured: Sequence[ModelMessage],
-    prior_responses: int,
+    new_messages: Sequence[ModelMessage],
 ) -> Failure:
     failure = classify_exception(exc)
     if (
         failure.kind is FailureKind.VALIDATION
         and failure.code != "output_truncated"
-        and _latest_finish_reason(captured, prior_responses=prior_responses) == "length"
+        and _latest_finish_reason(new_messages) == "length"
     ):
         return truncated_output_failure()
     return failure
@@ -347,7 +350,7 @@ class Session:
                 or isinstance(query.output, OutputSpec)
             ):
                 return await self._run_with_feedback(query, messages, kwargs, started, notice)
-            prior_responses = _response_count(messages)
+            prior_run_ids = _prior_run_ids(messages)
             try:
                 with capture_run_messages() as captured:
                     try:
@@ -366,7 +369,7 @@ class Session:
                         await self._budget.add_usage(billed)
                         return self._empty_result(
                             query,
-                            _classify_run_failure(exc, captured, prior_responses),
+                            _classify_run_failure(exc, _new_run_messages(captured, prior_run_ids)),
                             messages=transcript,
                             elapsed_ms=elapsed,
                             usage=billed,
@@ -448,14 +451,11 @@ class Session:
             if validator is not None and self._validator_with_context
             else None
         )
-        captured_messages: list[list[ModelMessage]] = []
-        prior_responses = _response_count(messages)
+        active_run: list[AgentRun[None, Any]] = []
+        prior_run_ids = _prior_run_ids(messages)
 
         async def validate_output(output: Any) -> Any:
-            if (
-                captured_messages
-                and _latest_finish_reason(captured_messages[-1], prior_responses=prior_responses) == "length"
-            ):
+            if active_run and _latest_finish_reason(active_run[-1].new_messages()) == "length":
                 raise ModelRetry("Model output was truncated (finish_reason='length'); return a complete output.")
             if validator is None:
                 return output
@@ -513,7 +513,6 @@ class Session:
         completed: AgentRunResult[Any] | None = None
         failure: Failure | None = None
         with capture_run_messages() as captured:
-            captured_messages.append(captured)
             try:
                 async with agent.iter(
                     self._user_prompt_for(query),
@@ -522,6 +521,7 @@ class Session:
                     usage_limits=UsageLimits(request_limit=retries + 1),
                     **kwargs,
                 ) as run:
+                    active_run.append(run)
                     node = run.next_node
                     while not Agent.is_end_node(node):
                         if Agent.is_model_request_node(node):
@@ -551,7 +551,10 @@ class Session:
             except _FeedbackBudgetExceeded as exc:
                 failure = exc.failure
             except Exception as exc:
-                failure = _classify_run_failure(exc, captured, prior_responses)
+                new_messages = (
+                    active_run[-1].new_messages() if active_run else _new_run_messages(captured, prior_run_ids)
+                )
+                failure = _classify_run_failure(exc, new_messages)
         elapsed = (time.perf_counter() - started) * 1000
         feedback_used = max(0, requests - 1)
         usage.requests = requests

@@ -429,6 +429,70 @@ async def test_truncation_detected_when_continuation_history_merges_adjacent_req
     assert retried.feedback_retries_used == 1
 
 
+@pytest.mark.asyncio
+async def test_truncation_detected_when_continuation_history_merges_adjacent_responses() -> None:
+    calls = 0
+
+    def respond(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        part = ToolCallPart("Answer", {"value": calls}) if info.output_tools else TextPart(json.dumps({"value": calls}))
+        return ModelResponse(
+            parts=[part],
+            finish_reason="length" if calls == 1 else "tool_call",
+            usage=RequestUsage(input_tokens=10, output_tokens=3),
+        )
+
+    session = build(
+        FunctionModel(respond),
+        documents="synthetic evidence",
+        instructions="Return a synthetic answer.",
+        outputs=[Answer],
+        output_mode="tools",
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0, output_feedback_retries=1),
+    )
+    # Two adjacent synthetic ModelResponses without provider/model metadata are merged by SDK.
+    merged_responses_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(session.rendered_documents)]),
+        ModelResponse(parts=[TextPart("synthetic prior part 1")]),
+        ModelResponse(parts=[TextPart("synthetic prior part 2")]),
+    ]
+
+    retried = await session.ask(
+        Query(tail="Continue.", output=Answer, history=merged_responses_history, id="merged-responses-feedback")
+    )
+    assert retried.failure is None
+    assert retried.output == Answer(value=2)
+    assert retried.feedback_retries_used == 1
+    assert calls == 2
+
+    # Validation exception after a truncated response with merged response history still reports output_truncated.
+    def invalid_truncated(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[ToolCallPart("Answer", {"value": "not-an-int"})],
+            finish_reason="length",
+            usage=RequestUsage(input_tokens=10, output_tokens=3),
+        )
+
+    plain = build(
+        FunctionModel(invalid_truncated),
+        documents="synthetic evidence",
+        instructions="Return a synthetic answer.",
+        outputs=[Answer],
+        output_mode="tools",
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0),
+    )
+    failed = await plain.ask(
+        Query(tail="Continue.", output=Answer, history=merged_responses_history, id="merged-responses-exc")
+    )
+    assert failed.output is None
+    assert failed.failure is not None
+    assert failed.failure.kind is FailureKind.VALIDATION
+    assert failed.failure.code == "output_truncated"
+
+
 @pytest.mark.parametrize("mode", ["tools", "prompted"])
 @pytest.mark.asyncio
 async def test_budget_rejection_after_one_feedback_preserves_used_count(mode: str) -> None:
