@@ -278,6 +278,22 @@ async def test_truncated_length_response_is_rejected_and_retried() -> None:
     assert result.output == Answer(value=2)
     assert result.feedback_retries_used == 1
 
+    # With feedback retries and no custom validator: truncated output still triggers native feedback retry.
+    calls = 0
+    feedback_only = build(
+        FunctionModel(respond),
+        documents="synthetic evidence",
+        instructions="Return a synthetic answer.",
+        outputs=[Answer],
+        output_mode="tools",
+        warmup=False,
+        policy=Policy(retries=0, retry_backoff=0, output_feedback_retries=1),
+    )
+    retried = await feedback_only.ask(Query(tail="Give the answer.", output=Answer, id="trunc-feedback-only"))
+    assert retried.failure is None
+    assert retried.output == Answer(value=2)
+    assert retried.feedback_retries_used == 1
+
     # Without feedback retries or validator: truncated output fails with retryable output_truncated.
     calls = 0
     plain = build(

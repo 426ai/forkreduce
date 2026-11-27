@@ -460,7 +460,7 @@ class Session:
                 instrument=self.instrument,
             )
             kwargs.pop("output_type", None)
-        elif validator is not None:
+        elif validator is not None or retries:
             # Validators are bound to this query, never attached to the shared
             # agent. Prompted validators also require a fixed local output type
             # because the SDK forbids overriding it per run with validators.
